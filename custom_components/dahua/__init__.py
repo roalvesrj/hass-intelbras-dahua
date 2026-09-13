@@ -47,8 +47,12 @@ from .const import (
     CONF_SCAN_INTERVAL,
     CONF_USE_RPC2,
     CONF_NVR_ACTIVE_DETERRENCE,
+    CONF_AUTHORIZED_PLATES,
+    CONF_AUTHORIZED_HOLD_TIME,
     DEFAULT_SCAN_INTERVAL,
+    DEFAULT_AUTHORIZED_HOLD_TIME,
     MIN_SCAN_INTERVAL,
+    EVENT_DAHUA_ANPR_RECOGNIZED,
 )
 from .dahua_utils import parse_event
 from .vto import DahuaVTOClient
@@ -166,6 +170,38 @@ def failure_backoff(base: timedelta, consecutive: int) -> timedelta:
     # polling every half hour is not the problem this is here to solve, and
     # backing "off" to something faster would be worse than doing nothing.
     return min(base * (2 ** doublings), max(POLL_BACKOFF_CAP, base))
+
+
+# Lighting_V2 lists a device's lights by index, and the index order is not the
+# same on every model. The device names each one in LightType, so it does not
+# have to be guessed.
+WHITE_LIGHT = "WhiteLight"
+MAX_LIGHTING_V2_LIGHTS = 4
+
+
+def illuminator_light_index(data: dict, channel: int, profile_mode) -> int:
+    """Which Lighting_V2 light index is the white illuminator on this device.
+
+    This was hardcoded to 0, and on most cameras 0 is the white light. On some
+    it is not: the HFW3449E-S-IL in #647 reports index 0 as `InfraredLight` and
+    the white light at 1. Driving 0 there turns the *infrared* emitter up and
+    down -- the write is accepted, the config changes, and the user sees nothing
+    happen, because infrared is invisible. The white light is never touched.
+
+    Only moves off 0 when the device positively says 0 is something other than
+    the white light, so a device that reports no LightType keeps exactly the
+    behaviour it has always had.
+    """
+    key = "table.Lighting_V2[{0}][{1}][{2}].LightType"
+    declared = data.get(key.format(channel, profile_mode, 0))
+    if declared is None or declared == WHITE_LIGHT:
+        return 0
+    for index in range(1, MAX_LIGHTING_V2_LIGHTS):
+        if data.get(key.format(channel, profile_mode, index)) == WHITE_LIGHT:
+            return index
+    # It says 0 is not the white light and names no other. Changing the index on
+    # that basis would be a guess, and the old behaviour is the better guess.
+    return 0
 
 
 def describe_update_failure(exception: BaseException) -> str:
@@ -1248,11 +1284,6 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
             event,
         )
 
-        # Put the event on the HA event bus
-        event["name"] = self.get_device_name()
-        event["DeviceName"] = self.get_device_name()
-        self.hass.bus.fire("dahua_event_received", event)
-
         # Check for license plate data in the event
         plate_info = dahua_utils.extract_plate_data(event)
         if plate_info and plate_info.get("plate"):
@@ -1267,11 +1298,34 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
                 plate_info["plate"],
                 event.get("Code"),
             )
+            # Dedicated event on Home Assistant event bus
+            anpr_event_data = {
+                "device_name": self.get_device_name(),
+                "channel": self._channel,
+                "plate": plate_info["plate"],
+                "raw_plate": plate_info.get("raw_plate"),
+                "confidence": plate_info.get("confidence"),
+                "vehicle_type": plate_info.get("vehicle_type"),
+                "vehicle_color": plate_info.get("vehicle_color"),
+                "vehicle_brand": plate_info.get("vehicle_brand"),
+                "vehicle_series": plate_info.get("vehicle_series"),
+                "direction": plate_info.get("direction"),
+                "is_authorized": self.is_plate_authorized(plate_info["plate"]),
+                "raw_event_code": event.get("Code"),
+                "timestamp": self._last_plate_timestamp,
+            }
+            self.hass.bus.fire(EVENT_DAHUA_ANPR_RECOGNIZED, anpr_event_data)
+
             for listener in self._plate_listeners:
                 try:
                     listener()
                 except Exception as ex:
                     _LOGGER.warning("Error calling plate listener: %s", ex)
+
+        # Put the event on the HA event bus
+        event["name"] = self.get_device_name()
+        event["DeviceName"] = self.get_device_name()
+        self.hass.bus.fire("dahua_event_received", event)
 
         # When there's an event start we'll update the a map x to the current timestamp in seconds for the event.
         # We'll reset it to 0 when the event stops.
@@ -1526,6 +1580,33 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         """Add a callback listener invoked when a new license plate event is parsed."""
         self._plate_listeners.append(listener)
 
+    def get_authorized_plates(self) -> list[str]:
+        """Return the list of configured authorized license plates (uppercase & normalized)."""
+        raw = self.config_entry.options.get(
+            CONF_AUTHORIZED_PLATES,
+            self.config_entry.data.get(CONF_AUTHORIZED_PLATES, ""),
+        )
+        return dahua_utils.parse_authorized_plates(raw)
+
+    def get_authorized_hold_time(self) -> int:
+        """Return the duration in seconds an authorized vehicle binary sensor stays active."""
+        try:
+            return int(self.config_entry.options.get(
+                CONF_AUTHORIZED_HOLD_TIME,
+                self.config_entry.data.get(
+                    CONF_AUTHORIZED_HOLD_TIME, DEFAULT_AUTHORIZED_HOLD_TIME
+                ),
+            ))
+        except (ValueError, TypeError):
+            return DEFAULT_AUTHORIZED_HOLD_TIME
+
+    def is_plate_authorized(self, plate: str | None) -> bool:
+        """Return True if the given plate matches any configured authorized plate."""
+        if not plate or plate == "unknown":
+            return False
+        norm = dahua_utils.normalize_plate(plate)
+        return norm in self.get_authorized_plates()
+
     def get_event_list(self) -> list:
         """
         Returns the list of events selected when configuring the camera in Home Assistant. For example:
@@ -1543,11 +1624,18 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         bri = self.data.get("table.Lighting[{0}][0].MiddleLight[0].Light".format(self._channel))
         return dahua_utils.dahua_brightness_to_hass_brightness(bri)
 
+    def get_illuminator_index(self) -> int:
+        """The Lighting_V2 light index this device puts its white light on."""
+        return illuminator_light_index(self.data, self._channel, self.get_profile_mode())
+
     def is_illuminator_on(self) -> bool:
         """Return true if the illuminator light is on"""
         # profile_mode 0=day, 1=night, 2=scene
-        profile_mode = self.get_profile_mode()       
-        return self.data.get("table.Lighting_V2[{0}][{1}][0].Mode".format(self._channel, profile_mode), "") == "Manual"
+        profile_mode = self.get_profile_mode()
+        index = self.get_illuminator_index()
+        return self.data.get(
+            "table.Lighting_V2[{0}][{1}][{2}].Mode".format(self._channel, profile_mode, index), ""
+        ) == "Manual"
 
     def is_flood_light_on(self) -> bool:
 
@@ -1567,7 +1655,11 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
     def get_illuminator_brightness(self) -> int:
         """Return the brightness of the illuminator light, as reported by the camera itself, between 0..255 inclusive"""
 
-        bri = self.data.get("table.Lighting_V2[{0}][0][0].MiddleLight[0].Light".format(self._channel))
+        bri = self.data.get(
+            "table.Lighting_V2[{0}][0][{1}].MiddleLight[0].Light".format(
+                self._channel, self.get_illuminator_index()
+            )
+        )
         return dahua_utils.dahua_brightness_to_hass_brightness(bri)
 
     def is_security_light_on(self) -> bool:
