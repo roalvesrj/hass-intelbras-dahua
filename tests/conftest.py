@@ -155,3 +155,19 @@ def _clear_cgi_config_absent():
     client_module._HOST_CGI_CONFIG_ABSENT.clear()
     yield
     client_module._HOST_CGI_CONFIG_ABSENT.clear()
+
+
+@pytest.fixture(autouse=True)
+def _clear_refused_controls():
+    """What a device has refused is learnt once, per channel and per control.
+
+    Same trap as the fixture above, with sharper teeth: one test that makes the
+    device answer 403 would leave every later test's press failing fast without
+    sending anything, and the mode select unavailable. That reads as the code
+    under test being broken.
+    """
+    from custom_components.dahua.refusals import forget
+
+    forget()
+    yield
+    forget()

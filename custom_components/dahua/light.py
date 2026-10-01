@@ -19,6 +19,7 @@ from . import (DahuaDataUpdateCoordinator, dahua_utils, entry_coordinators,
 from .const import DOMAIN
 from .entity import DahuaBaseEntity
 from .client import SECURITY_LIGHT_TYPE
+from .infrared import async_write_infrared_mode
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -57,7 +58,8 @@ async def async_setup_entry(hass: HomeAssistant, entry, async_add_entities):
         if coordinator.is_amcrest_doorbell():
             entities.append(AmcrestRingLight(coordinator, entry))
 
-        async_add_entities(entities)
+        async_add_entities(
+            entities, config_subentry_id=coordinator.subentry_id)
 
 
 class DahuaInfraredLight(DahuaBaseEntity, LightEntity):
@@ -107,23 +109,50 @@ class DahuaInfraredLight(DahuaBaseEntity, LightEntity):
         """Don't poll."""
         return False
 
+    @property
+    def extra_state_attributes(self):
+        """The mode and the level the device reports, whatever the state is.
+
+        Home Assistant only publishes `brightness` while a light is on, and this
+        light is on only when the mode is `Manual`. So on a camera left at `Auto`
+        -- which is what they ship as, and what thirteen of fifteen channels on a
+        DHI-NVR5464-16P-EI report -- the entity reads off with no brightness, and
+        there was no way to see either the level the camera is using or that it
+        is on `Auto` rather than `Off`.
+
+        `mode` is passed through as the device spells it, including a mode the
+        device chose that this integration never writes.
+        """
+        # Merged into the base's rather than returned alone. DahuaBaseEntity
+        # supplies `id` and `integration` here, and replacing the dict dropped
+        # both from every infrared light -- the shape of bug that reads as a
+        # working feature until somebody's template stops resolving.
+        return {
+            **(super().extra_state_attributes or {}),
+            "mode": self._coordinator.get_infrared_mode() or None,
+            "brightness_level": self._coordinator.get_infrared_level(),
+        }
+
+    async def _async_write_mode(self, enabled: bool, **kwargs) -> None:
+        """Turning this light on means Manual, and off means Off.
+
+        `Auto` is not reachable from a light entity, which is what the mode
+        select is for.
+        """
+        await async_write_infrared_mode(
+            self._coordinator,
+            "Manual" if enabled else "Off",
+            dahua_utils.hass_brightness_to_dahua_brightness(
+                kwargs.get(ATTR_BRIGHTNESS)),
+        )
+
     async def async_turn_on(self, **kwargs):
         """Turn the light on with the current brightness"""
-        hass_brightness = kwargs.get(ATTR_BRIGHTNESS)
-        dahua_brightness = dahua_utils.hass_brightness_to_dahua_brightness(hass_brightness)
-        channel = self._coordinator.get_channel()
-        await self._coordinator.client.async_set_lighting_v1(
-            channel, True, dahua_brightness, self._coordinator.get_infrared_profile())
-        await self.coordinator.async_refresh()
+        await self._async_write_mode(True, **kwargs)
 
     async def async_turn_off(self, **kwargs):
         """Turn the light off"""
-        hass_brightness = kwargs.get(ATTR_BRIGHTNESS)
-        dahua_brightness = dahua_utils.hass_brightness_to_dahua_brightness(hass_brightness)
-        channel = self._coordinator.get_channel()
-        await self._coordinator.client.async_set_lighting_v1(
-            channel, False, dahua_brightness, self._coordinator.get_infrared_profile())
-        await self.coordinator.async_refresh()
+        await self._async_write_mode(False, **kwargs)
 
 
 class DahuaIlluminator(DahuaBaseEntity, LightEntity):
@@ -1229,7 +1258,6 @@ class DahuaSecurityLight(DahuaBaseEntity, LightEntity):
 
     async def async_turn_on(self, **kwargs):
         """Turn the light on"""
-        channel = self._coordinator.get_channel()
         if self._coordinator.uses_recorder_deterrence():
             await self._coordinator.client.async_set_nvr_coaxial_control_state(
                 self._coordinator.get_channel_number(), SECURITY_LIGHT_TYPE, True
@@ -1237,20 +1265,40 @@ class DahuaSecurityLight(DahuaBaseEntity, LightEntity):
         elif self._coordinator.uses_rpc2_deterrence(SECURITY_LIGHT_TYPE):
             await self._coordinator.client.async_set_coaxial_control_state_rpc2(SECURITY_LIGHT_TYPE, True)
         else:
-            await self._coordinator.client.async_set_coaxial_control_state(channel, SECURITY_LIGHT_TYPE, True)
+            await self._coordinator.client.async_set_coaxial_control_state(
+                self._coordinator.get_security_light_control_channel(),
+                SECURITY_LIGHT_TYPE,
+                True,
+            )
         await self._coordinator.async_refresh()
 
     async def async_turn_off(self, **kwargs):
         """Turn the light off"""
-        channel = self._coordinator.get_channel()
         if self._coordinator.uses_recorder_deterrence():
             await self._coordinator.client.async_set_nvr_coaxial_control_state(
                 self._coordinator.get_channel_number(), SECURITY_LIGHT_TYPE, False
             )
         elif self._coordinator.uses_rpc2_deterrence(SECURITY_LIGHT_TYPE):
-            await self._coordinator.client.async_set_coaxial_control_state_rpc2(SECURITY_LIGHT_TYPE, False)
+            off_io = self._coordinator.get_security_light_off_io()
+            if off_io == 2:
+                await self._coordinator.client.async_set_coaxial_control_state_rpc2(
+                    SECURITY_LIGHT_TYPE, False
+                )
+            else:
+                await self._coordinator.client.async_set_coaxial_control_state_rpc2(
+                    SECURITY_LIGHT_TYPE, False, off_io
+                )
         else:
-            await self._coordinator.client.async_set_coaxial_control_state(channel, SECURITY_LIGHT_TYPE, False)
+            channel = self._coordinator.get_security_light_control_channel()
+            off_io = self._coordinator.get_security_light_off_io()
+            if off_io == 2:
+                await self._coordinator.client.async_set_coaxial_control_state(
+                    channel, SECURITY_LIGHT_TYPE, False
+                )
+            else:
+                await self._coordinator.client.async_set_coaxial_control_state(
+                    channel, SECURITY_LIGHT_TYPE, False, off_io
+                )
         await self._coordinator.async_refresh()
 
     @property

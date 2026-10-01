@@ -99,7 +99,16 @@ class DahuaRpc2Client:
             url = "{0}/RPC2".format(self._base)
 
         resp = await self._session.post(url, json=data)
-        resp_json = json.loads(await resp.text())
+        try:
+            resp_json = json.loads(await resp.text())
+        except ValueError as error:
+            # An HTML error page, a 503 body or a truncated answer is this read
+            # not coming back, not "this device does not speak RPC2". Raised as
+            # a connection error so rpc2_failure_is_permanent does not write the
+            # transport off for the host after two of them.
+            raise aiohttp.ClientConnectionError(
+                "Dahua RPC2 answered with a body that is not JSON"
+            ) from error
 
         if verify_result and resp_json['result'] is False:
             code, message = refusal_reason(resp_json)
@@ -383,14 +392,18 @@ class DahuaRpc2Client:
         }
 
     async def set_coaxial_control_state(
-        self, channel: int, dahua_type: int, enabled: bool
+        self, channel: int, dahua_type: int, enabled: bool, off_io: int = 2
     ) -> dict:
         """Control a directly connected camera's deterrence output."""
         return await self.request(
             method="CoaxialControlIO.control",
             params={
                 "channel": channel,
-                "info": [{"Type": dahua_type, "IO": 1 if enabled else 2, "TriggerMode": 2}],
+                "info": [{
+                    "Type": dahua_type,
+                    "IO": 1 if enabled else off_io,
+                    "TriggerMode": 2,
+                }],
             },
         )
 
@@ -425,6 +438,40 @@ class DahuaRpc2Client:
                 # Losing the door's result to a failed cleanup would be worse
                 # than leaking the object, so this never raises.
                 _LOGGER.debug("accessControl.destroy failed", exc_info=True)
+
+    async def async_vto_call(self, number: str) -> dict:
+        """Ring a room from a VTO, the way the VTO's own web page does.
+
+        Read out of the web interface of a DHI-VTO2211G-WP-S2 on 4.810.0000000.0.R
+        (the phone icon under Device Setting) and replayed against it:
+
+            VideoTalkPhone.factory.instance   params null, result is the object
+            VideoTalkPhone.beginCall          on that object
+
+        `isTestCall: true` is added by that page to every call it makes. What it
+        changes is not known: with it, the main monitor and both extensions of the
+        room rang and showed the VTO's camera, the same as a press of the button.
+        The object id came back as a plain integer.
+
+        There is deliberately no destroy here, unlike openDoor. The web page
+        destroys this object only once the call is over (endCall, then destroy),
+        and destroying it straight after beginCall has not been tried: it may
+        well hang up the call this exists to start. The caller logs out instead,
+        which on that VTO left the call ringing.
+        """
+        if not self._session_id:
+            await self.login()
+        made = await self.request(
+            method="VideoTalkPhone.factory.instance", params=None)
+        object_id = made.get("result")
+        if isinstance(object_id, bool) or not isinstance(object_id, int) or object_id <= 0:
+            raise ConnectionError(
+                "Dahua RPC2 VideoTalkPhone.factory.instance returned no object")
+        return await self.request(
+            method="VideoTalkPhone.beginCall",
+            object_id=object_id,
+            params={"number": number, "type": "normal", "isTestCall": True},
+        )
 
     async def get_coaxial_control_io_status(self, channel: int) -> CoaxialControlIOStatus:
         """ async_get_coaxial_control_io_status returns the the current state of the speaker and white light. """

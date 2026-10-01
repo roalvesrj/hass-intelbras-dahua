@@ -324,6 +324,14 @@
             },
             "day_night_mode": {
                 "name": "Day/Night Mode"
+            },
+            "infrared_mode": {
+                "name": "Infrared Mode",
+                "state": {
+                    "auto": "Auto",
+                    "manual": "Manual",
+                    "off": "Off"
+                }
             }
         },
         "sensor": {
@@ -371,6 +379,15 @@
         "cancel_call_refused": {
             "message": "The doorbell would not cancel the call: {reason}"
         },
+        "infrared_write_already_refused": {
+            "message": "{device} has already refused to change its infrared light, so Home Assistant did not ask again. Its mode and level are still read and shown. Reload the integration entry to try again after changing anything on the device."
+        },
+        "infrared_write_ignored": {
+            "message": "{device} accepted the infrared change and did not make it: asked for {wanted}, still reports {reported}. A recorder can answer OK for a camera it will not pass the setting on to."
+        },
+        "infrared_write_refused": {
+            "message": "{device} would not change its infrared light: {reason}"
+        },
         "ivs_rule_write_failed": {
             "message": "Could not change that IVS rule: {reason}"
         },
@@ -379,6 +396,21 @@
         },
         "no_vto_connection_for_service": {
             "message": "{device} has no doorbell connection to cancel a call on. This service works on a VTO doorbell, once its event connection is up."
+        },
+        "open_door_needs_a_doorbell": {
+            "message": "{device} is not a doorbell, so it has no door to open. This service works on a VTO."
+        },
+        "siren_already_refused": {
+            "message": "{device} has already refused to operate its siren, so Home Assistant did not ask again. Reload the integration entry to try again after changing anything on the device."
+        },
+        "siren_refused": {
+            "message": "{device} would not operate its siren: {reason}"
+        },
+        "vto_call_needs_a_doorbell": {
+            "message": "{device} is not a doorbell, so it cannot ring a room. This service works on a VTO."
+        },
+        "vto_call_refused": {
+            "message": "The doorbell would not call room {room}: {reason}"
         }
     },
     "issues": {

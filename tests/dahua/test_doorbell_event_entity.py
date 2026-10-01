@@ -22,8 +22,15 @@ from custom_components.dahua import event as event_module
 from custom_components.dahua.const import EVENT, PLATFORMS
 from custom_components.dahua.event import DahuaDoorbellEvent, async_setup_entry
 
+from . import adds_entities
+
 
 class _Coordinator:
+    # The platforms file each channel's entities under its own subentry, so they
+    # read this on every entity they add. None is a single camera, and is what
+    # `async_add_entities` wants for an entry that has no subentries.
+    subentry_id = None
+
     def __init__(self, doorbell=True, timestamp=0):
         self._doorbell = doorbell
         self._timestamp = timestamp
@@ -78,7 +85,7 @@ async def test_a_doorbell_gets_one():
     coordinator = _Coordinator(doorbell=True)
     hass = type("H", (), {"data": {}})()
     await async_setup_entry(hass, type("E", (), {"entry_id": "e1",
-                          "runtime_data": {0: coordinator}})(), added.extend)
+                          "runtime_data": {0: coordinator}})(), adds_entities(added))
 
     assert len(added) == 1
     assert isinstance(added[0], DahuaDoorbellEvent)
@@ -90,7 +97,7 @@ async def test_a_camera_does_not():
     coordinator = _Coordinator(doorbell=False)
     hass = type("H", (), {"data": {}})()
     await async_setup_entry(hass, type("E", (), {"entry_id": "e1",
-                          "runtime_data": {0: coordinator}})(), added.extend)
+                          "runtime_data": {0: coordinator}})(), adds_entities(added))
 
     assert added == []
 
@@ -272,3 +279,35 @@ def test_a_plate_listener_can_be_dropped_too():
     drop()
 
     assert c._plate_listeners == [kept]
+
+
+# --- being added, and being removed ------------------------------------------
+#
+# Everything above drives the listener mechanics on the coordinator directly. The
+# entity's own `async_added_to_hass` was never called, so what it does with the remover
+# it is handed had no test -- which is the half that #842 was about.
+
+async def test_it_subscribes_when_added_and_lets_go_when_removed():
+    """The remover goes to `async_on_remove` rather than being discarded. Whether a key
+    has listeners decides whether `_dispatch_event` reports that code at all, so a
+    callback left behind answers "yes, something reads this" for an entity that is
+    gone."""
+    coordinator = _Coordinator()
+    entity = _entity(coordinator)
+
+    await entity.async_added_to_hass()
+
+    key = coordinator.get_event_key("DoorbellPressed")
+    assert key in coordinator._dahua_event_listeners, "never subscribed"
+
+    assert entity._on_remove, "registered nothing to undo the subscription"
+    for undo in list(entity._on_remove):
+        undo()
+
+    assert coordinator._dahua_event_listeners == {}, (
+        "the callback outlived the entity")
+
+
+def test_the_doorbell_event_is_pushed_not_polled():
+    """It exists because an event arrived; there is nothing to poll for."""
+    assert _entity(_Coordinator()).should_poll is False

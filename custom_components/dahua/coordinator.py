@@ -29,6 +29,7 @@ from homeassistant.helpers import area_registry as ar
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from . import dahua_utils
+from . import refusals
 from .client import DahuaClient, rpc2_refusal_is_a_stale_login
 from .rpc2 import Rpc2MethodRefused
 from .const import (
@@ -143,6 +144,7 @@ def failure_backoff(base: timedelta, consecutive: int) -> timedelta:
 # same on every model. The device names each one in LightType, so it does not
 # have to be guessed.
 WHITE_LIGHT = "WhiteLight"
+INFRARED_LIGHT = "InfraredLight"
 
 MAX_LIGHTING_V2_LIGHTS = 4
 
@@ -172,6 +174,102 @@ def illuminator_brightness_bank(data: dict, channel: int, profile_mode, light_in
         if key in data:
             return bank
     return LIGHT_BRIGHTNESS_BANKS[0]
+
+def infrared_brightness_bank(data: dict, channel: int, profile) -> str:
+    """Which brightness bank this channel's infrared emitter really uses.
+
+    The v1 `Lighting` table has the same problem the v2 one had, and the fix for
+    v2 (#652, `illuminator_brightness_bank`) never reached it: `MiddleLight[0].Light`
+    was hardcoded in the write and in both readers.
+
+    Measured on a DHI-NVR5464-16P-EI, channel 3:
+
+        table.Lighting[3][0].FarLight[0].Light=50
+        table.Lighting[3][0].NearLight[0].Light=50
+        table.Lighting[3][0].Mode=Auto          <- and no MiddleLight at all
+
+    while channel 6 of the same recorder has MiddleLight and no other bank. So
+    naming the wrong one makes the device answer 200 with the body "Error", which
+    read as success, and makes the level read as nothing at all.
+
+    Falls back to MiddleLight when the device names none, which is what every
+    caller did before this existed.
+    """
+    for bank in LIGHT_BRIGHTNESS_BANKS:
+        key = "table.Lighting[{0}][{1}].{2}[0].Light".format(channel, profile, bank)
+        if key in data:
+            return bank
+    return LIGHT_BRIGHTNESS_BANKS[0]
+
+
+def infrared_v2_row(data: dict, channel: int, profile_mode):
+    """(profile, index, bank) for this channel's infrared emitter in Lighting_V2.
+
+    None when the device serves no such row, which is the signal to use the v1
+    `Lighting` table instead.
+
+    **Why this exists.** Measured on a DHI-NVR5464-16P-EI, with every write setting
+    a field to the value it already held:
+
+        Lighting_V2[11][0][0].Mode  (LightType=InfraredLight)   200 'OK'
+        Lighting_V2[1][0][0].Mode   (LightType=InfraredLight)   200 'OK'
+        Lighting[11][0].Mode                                    403 'Authority:check failure.'
+        Lighting[1][0].Mode                                     403 'Authority:check failure.'
+
+    and then with a real change, which is the part that settles it: v2
+    `Mode` moved `ZoomPrio` -> `Manual` and read back `Manual`. So on that recorder
+    the infrared emitter is writable through v2 and refused through v1, and the
+    integration only ever wrote v1. Twelve of its fifteen channels have no v2 row
+    and keep the old path, where the refusal is real.
+
+    The index is found by what the device calls the row rather than assumed,
+    exactly as `illuminator_light_index` does for the white light: channel 11
+    reports index 0 as `InfraredLight` and 1 as `WhiteLight`. The bank comes from
+    the row too -- channel 11's infrared carries `NearLight` and `FarLight` while
+    channel 1's carries `MiddleLight`.
+
+    The live profile is tried first and then 0, the same fallback
+    `infrared_profile` uses, because a device can serve nine profiles (channel 11
+    reports 0 through 8) and the poll only holds the one it reads.
+    """
+    for profile in dict.fromkeys([str(profile_mode), "0"]):
+        for index in range(MAX_LIGHTING_V2_LIGHTS):
+            base = "table.Lighting_V2[{0}][{1}][{2}].".format(channel, profile, index)
+            if data.get(base + "LightType") != INFRARED_LIGHT:
+                continue
+            bank = next((candidate for candidate in LIGHT_BRIGHTNESS_BANKS
+                         if base + candidate + "[0].Light" in data),
+                        LIGHT_BRIGHTNESS_BANKS[0])
+            return (profile, index, bank)
+    return None
+
+
+def infrared_transport(v2_row, v1_refused: bool) -> str:
+    """Which lighting table to drive this channel's infrared through: "v1" or "v2".
+
+    v1 unless the device has refused it outright for this channel *and* serves a
+    v2 row to fall back to.
+
+    **The order matters and the obvious rule is wrong.** The first version of this
+    preferred v2 wherever a v2 row existed, which decides from what a device
+    *reports it has*. Measured on a DHI-NVR5464-16P-EI that is right -- v1 is
+    refused there and v2 works. But #647 carries a directly connected
+    IPC-T5442TM-AS-6mm reporting three v2 InfraredLight rows while its v1 table is
+    presumably accepted, and that issue's whole complaint is "the CGI values change
+    and the physical LEDs do not". Moving every camera that merely reports a v2 row
+    onto a table nobody has verified drives its emitter is that complaint, shipped.
+
+    Deciding from what the device *accepts* keeps every working camera where it is
+    and only moves the ones that have actually refused. It is also the shape this
+    codebase has arrived at independently three times -- `_HOST_CGI_CONFIG_ABSENT`,
+    `_RPC2_TABLE_UNAVAILABLE` and `refusals` all learn from a refusal rather than
+    from a claim -- while the fifteen capabilities still gated on a model string are
+    the recurring bug class (#570, #676, #690).
+    """
+    if v1_refused and v2_row is not None:
+        return "v2"
+    return "v1"
+
 
 SMART_MOTION_ROW = re.compile(r"^table\.SmartMotionDetect\[(\d+)\]")
 
@@ -379,6 +477,20 @@ RECENT_EVENT_COUNT = 10
 # 9 is documented by myhomeiot/DahuaVTO as the failed counterpart.
 DOORBELL_STATE_EVENTS = {8: "DoorUnlocked", 9: "DoorUnlockFailed"}
 
+# BackKeyLight States that are known, documented above, and simply not a ring.
+#
+# These were warned about as though nobody had ever seen them, which is the
+# opposite of what the warning is for: it exists to surface a doorbell reporting
+# its ring as a number we cannot read, and a number we can already name is not
+# that. #872 is a VTO2311R-WP reporting 5 during the call teardown -- after
+# HungupPhone, Hangup and IgnoreInvite, immediately before idle -- on a press
+# that had already raised the sensor from States 1 and 2. Nothing was missed and
+# the reporter was asked for it anyway.
+#
+# Deliberately not merged into DOORBELL_STATE_EVENTS: these raise no event of
+# their own. They are only reasons not to complain.
+DOORBELL_KNOWN_QUIET_STATES = frozenset({4, 5, 6, 7, 11})
+
 def doorbell_state(event: dict):
     """The BackKeyLight State as an int, or None if it did not say.
 
@@ -491,11 +603,23 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
     # they fail on the attribute rather than on anything they are testing.
     _channel_config: dict = {}
 
+    # Which subentry of the entry this channel is, or None for a single camera.
+    # Declared on the class for the same reason as the line above: a great many
+    # tests build a coordinator with object.__new__, and the platforms read this
+    # on every entity they add.
+    subentry_id: str = None
+
+    # Same reason, and None rather than {} because a dict here would be one dict
+    # shared by every coordinator in the process: eleven channels of a recorder
+    # would pool their counts and the field would name no channel in particular.
+    _events_without_listener: dict = None
+
     """Class to manage fetching data from the API."""
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry, events: list, address: str, port: int, rtsp_port: int,
                  username: str, password: str, name: str, channel: int,
-                 use_https: bool = None, channel_config: dict = None) -> None:
+                 use_https: bool = None, channel_config: dict = None,
+                 subentry_id: str = None) -> None:
         """Initialize the coordinator.
 
         `channel_config` is this channel's own settings, which is a subentry's
@@ -506,6 +630,7 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         entries were merged. See `channel_option`.
         """
         self._channel_config = dict(channel_config or {})
+        self.subentry_id = subentry_id
         # Self signed certs are used over HTTPS so we'll disable SSL verification.
         # connector_owner=False keeps the shared pool alive when this session closes.
         self._session = ClientSession(
@@ -689,8 +814,18 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         """ Stop anything we need to stop """
         await _release_host_stream(self)
         if self._vto_task is not None:
-            self._vto_task.cancel()
+            task = self._vto_task
             self._vto_task = None
+            # Close the transport before cancelling: the task is parked on
+            # `await protocol.disconnected`, and cancelling a task does not
+            # close an asyncio transport. Leaving it open leaks the socket to
+            # port 5000, its event subscription and its keep-alive for an entry
+            # that no longer exists, once per reload.
+            client = getattr(self, "_vto_client", None)
+            if client is not None:
+                client.close()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
         await self._close_session()
 
     async def _close_session(self) -> None:
@@ -800,7 +935,10 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         typed into the reauth dialog is refused along with everything else.
         That is the loop in #729: reauth asked for, reauth impossible.
         """
-        refusals = async_record_host_auth_refusal(self._address)
+        # Per entry, so a recorder's channels refusing in the same instant count
+        # once rather than once each.
+        refusals = async_record_host_auth_refusal(
+            self._address, self.config_entry.entry_id)
         if refusals < MAX_AUTH_REFUSALS:
             _LOGGER.debug(
                 "Authentication refused by %s (%d of %d). Not treating it as a wrong password yet",
@@ -888,7 +1026,7 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
                 await self._async_probe_direct_deterrence()
                 if self._wanted_by(LIGHT, SWITCH) and not self.uses_rpc2_deterrence():
                     try:
-                        coaxial_channel = self._channel_number if self.uses_recorder_deterrence() else 1
+                        coaxial_channel = self.get_coaxial_status_channel()
                         await self.client.async_get_coaxial_control_io_status(coaxial_channel)
                         self._supports_coaxial_control = True
                     except PROBE_REFUSED as probe_error:
@@ -1136,7 +1274,14 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
                 except Exception as exception:
                     # I believe this API is missing on some cameras so we'll just ignore it and move on
                     _LOGGER.debug("Could not get preset position", exc_info=exception)
-                    return None
+                    # The preset select reads this key. Carrying the last value
+                    # stops a refusal from resetting the select to "0".
+                    previous = (getattr(self, "data", None) or {}).get(
+                        "status.PresetID"
+                    )
+                    if previous is None:
+                        return None
+                    return {"status.PresetID": previous}
 
             # Figure out which APIs we need to call and then fan out and gather the results
             # Motion detection state is read by the camera entity as well as
@@ -1167,12 +1312,14 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
             #
             # The two conditions stay as they were: reads_coaxial_status explains
             # why the RPC2 branch keeps its own.
-            coaxial_channel = self._channel_number if self.uses_recorder_deterrence() else 1
             if self.uses_rpc2_deterrence() and self._wanted_by(LIGHT, SWITCH):
                 coros.append(asyncio.ensure_future(
-                    self._async_coaxial_status(coaxial_channel)
+                    self._async_coaxial_status(
+                        self.get_rpc2_coaxial_status_channel()
+                    )
                 ))
             elif self._supports_coaxial_control and self.reads_coaxial_status():
+                coaxial_channel = self.get_coaxial_status_channel()
                 coros.append(
                     asyncio.ensure_future(
                         self._async_coaxial_status(coaxial_channel)
@@ -1410,6 +1557,17 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
 
             listeners = self._dahua_event_listeners.get(event_key)
             if not listeners:
+                # The event arrived, was decided to belong to this channel, and
+                # updates nothing. Worth counting rather than dropping in silence:
+                # the timestamp a binary sensor reads is written below this line, so
+                # a sensor that exists while its key is absent here is a sensor that
+                # can never move, and from the outside that is indistinguishable
+                # from the device having stopped sending. It is the reading #825 has
+                # been unable to get: the event reaches the bus either way.
+                counts = self._events_without_listener
+                if counts is None:
+                    counts = self._events_without_listener = {}
+                counts[event_key] = counts.get(event_key, 0) + 1
                 continue
 
             if action == "Start":
@@ -1543,7 +1701,15 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
             # listening.
             if not isinstance(data, dict):
                 data = {}
-            object_type = data.get("Object", {}).get("ObjectType", "").lower()
+            # `or {}` rather than a default, because the key being present with a
+            # null is not the same as the key being absent: `.get("Object", {})`
+            # returns None for `"Object": null` and the next `.get` raises. The
+            # device does send nulls -- `"Track": None` is in this module's own
+            # example payload -- and a CrossLine event that detected no object is
+            # exactly when it would. Same reasoning as the isinstance guard above,
+            # which #475 added for the other half of this.
+            object_type = (data.get("Object") or {}).get("ObjectType", "")
+            object_type = (object_type or "").lower()
             codes = []
 
             # Always include the original CrossLine/CrossRegion if a listener exists
@@ -1603,9 +1769,13 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         Logged once per state per device, because a doorbell reports its state
         on every call and a warning per ring would be worse than the bug.
         """
-        if numeric_state in DOORBELL_STATE_EVENTS or numeric_state == 0:
+        if (numeric_state in DOORBELL_STATE_EVENTS
+                or numeric_state in DOORBELL_KNOWN_QUIET_STATES
+                or numeric_state == 0):
             # 8 and 9 are the unlock results, handled separately; 0 is idle,
-            # which is the normal way a call ends.
+            # which is the normal way a call ends; and the quiet set is the
+            # documented states that are not rings, which there is nothing to
+            # report about.
             return
         # getattr, like the other per-coordinator state: plenty of tests build a
         # coordinator with object.__new__ and set only what they are about, and
@@ -1619,7 +1789,8 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         _LOGGER.warning(
             "%s reported doorbell call state %r, which this integration does "
             "not recognise, so no button press was raised. Known states are "
-            "1 and 2 for ringing, 8 and 9 for unlock, 0 for idle. If the "
+            "1 and 2 for ringing, 8 and 9 for unlock, 0 for idle, and "
+            "4, 5, 6, 7 and 11 for call handling that is not a ring. If the "
             "doorbell was ringing when this appeared, please report this state "
             "number at %s so it can be added",
             self.get_device_name(), raw_state, ISSUE_URL,
@@ -1911,6 +2082,8 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
             sources.append("Model fallback: starts with IP8M-2796E")
         if m.startswith("IPC-COLOR4M-TZ"):
             sources.append("Model fallback: starts with IPC-COLOR4M-TZ")
+        if m.startswith("PTZ3E10X-T180"):
+            sources.append("Model fallback: starts with PTZ3E10X-T180")
         if sources:
             return sources
         failures = list(getattr(self, "_security_light_detection_failures", []))
@@ -1963,6 +2136,9 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
             # alternating red/blue active-deterrence LEDs, despite the CGI
             # status field calling the output WhiteLight.
             or m.startswith("IPC-COLOR4M-TZ")
+            # Both sensor channels alias one shared warning-light circuit.
+            # Keep a CGI fallback when the RPC2 capability probe is unavailable.
+            or m.startswith("PTZ3E10X-T180")
         )
 
     def is_doorbell(self) -> bool:
@@ -2149,6 +2325,14 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         select.py, and that reads `Lighting_V2` rather than the coaxial status.
         """
         if self.is_amcrest_doorbell():
+            return False
+        # Both sensor channels on this camera address one chassis-wide warning
+        # circuit. Keep one entity on the primary channel rather than exposing
+        # two controls that race the same output.
+        if (
+            str(getattr(self, "model", "")).upper().startswith("PTZ3E10X-T180")
+            and getattr(self, "_channel", 0) != 0
+        ):
             return False
         if self.uses_recorder_deterrence():
             return self.supports_nvr_active_deterrence()
@@ -2383,19 +2567,107 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         """This channel's Day/Night mode by name, or None."""
         return day_night_color_name(self.data, self._channel)
 
-    def is_infrared_light_on(self) -> bool:
-        """ returns true if the infrared light is on """
+    def get_infrared_mode(self) -> str:
+        """This channel's infrared lighting mode, exactly as the device reports it.
+
+        `Manual`, `Auto` and `Off` are the three the integration writes. A device
+        may report others it chose itself -- a DHI-NVR5464-16P-EI answers
+        `ZoomPrio` on two of fifteen channels -- and those are passed through
+        rather than flattened, because a caller checking whether a write landed
+        has to be able to see that it did not.
+
+        Read from Lighting_V2 when this channel has a row there, because that is
+        the table the write goes to and the two can disagree -- a channel can
+        report `ZoomPrio` in v2 and something else in v1. Reading one and writing
+        the other is how a control reports a state it is not setting.
+
+        Empty when this channel reports no lighting at all.
+        """
+        if self.infrared_uses_lighting_v2():
+            profile, index, _bank = self.get_infrared_v2_row()
+            return self.data.get(
+                "table.Lighting_V2[{0}][{1}][{2}].Mode".format(
+                    self._channel, profile, index), "")
         return self.data.get(
             "table.Lighting[{0}][{1}].Mode".format(
-                self._channel, self.get_infrared_profile()), "") == "Manual"
+                self._channel, self.get_infrared_profile()), "")
+
+    def is_infrared_light_on(self) -> bool:
+        """ returns true if the infrared light is on """
+        return self.get_infrared_mode() == "Manual"
+
+    def get_infrared_bank(self) -> str:
+        """The brightness bank this channel's infrared emitter uses."""
+        if self.infrared_uses_lighting_v2():
+            return self.get_infrared_v2_row()[2]
+        return infrared_brightness_bank(
+            self.data, self._channel, self.get_infrared_profile())
+
+    def get_infrared_v2_row(self):
+        """(profile, index, bank) for infrared in Lighting_V2, or None.
+
+        None means this channel has no v2 row and the v1 `Lighting` table is all
+        there is. On the recorder this was measured on, the channels that do have
+        one are writable through it while v1 is refused outright.
+        """
+        return infrared_v2_row(self.data, self._channel, self.get_profile_mode())
+
+    def infrared_uses_lighting_v2(self) -> bool:
+        """Whether this channel's infrared is driven through Lighting_V2.
+
+        Only once the v1 table has been refused for this channel, and only when the
+        device serves a v2 row to fall back to. See `infrared_transport` for why it
+        is not simply "v2 wherever a v2 row exists".
+        """
+        row = self.get_infrared_v2_row()
+        if row is None:
+            # No fallback exists, so the answer is v1 whatever the store says.
+            # Short-circuited rather than asked: this is the common case -- thirteen
+            # of the measured recorder's fifteen channels and every camera serving
+            # only the v1 table -- and asking would make a read of the mode depend
+            # on the refusal store, and through it on the device address. That is
+            # not hypothetical: it broke five tests in test_infrared_profile.py,
+            # which build the real coordinator with object.__new__ and never set
+            # _address, and it would equally affect any caller holding a
+            # half-constructed coordinator.
+            return False
+        return infrared_transport(
+            row, refusals.is_refused(self, refusals.INFRARED_V1)) == "v2"
+
+    def get_infrared_level(self):
+        """The infrared level on the device's own 0..100 scale, or None.
+
+        Home Assistant publishes a light's `brightness` only while that light is
+        on, and this light is on only when the mode is `Manual`. A camera on
+        `Auto` is illuminating at this level and reads off, so the level has to be
+        readable separately or it cannot be shown at all.
+
+        None rather than a number when the channel reports none, so the attribute
+        says "not known" instead of claiming the emitter is at zero.
+        """
+        if self.infrared_uses_lighting_v2():
+            profile, index, bank = self.get_infrared_v2_row()
+            level = self.data.get(
+                "table.Lighting_V2[{0}][{1}][{2}].{3}[0].Light".format(
+                    self._channel, profile, index, bank))
+        else:
+            level = self.data.get(
+                "table.Lighting[{0}][{1}].{2}[0].Light".format(
+                    self._channel, self.get_infrared_profile(),
+                    self.get_infrared_bank()))
+        if level is None or level == "":
+            return None
+        try:
+            return int(level)
+        except (TypeError, ValueError):
+            return None
 
     def get_infrared_brightness(self) -> int:
         """Return the brightness of this light, as reported by the camera itself, between 0..255 inclusive"""
 
-        bri = self.data.get(
-            "table.Lighting[{0}][{1}].MiddleLight[0].Light".format(
-                self._channel, self.get_infrared_profile()))
-        return dahua_utils.dahua_brightness_to_hass_brightness(bri)
+        level = self.get_infrared_level()
+        return dahua_utils.dahua_brightness_to_hass_brightness(
+            None if level is None else str(level))
 
     def get_illuminator_index(self) -> int:
         """The Lighting_V2 light index this device puts its white light on."""
@@ -2534,6 +2806,51 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
                 return "0"
         return config or "0"
 
+    def describe_video_profile_shape(self) -> str:
+        """Which of the three VideoInMode shapes this channel is in, by name.
+
+        `read_profile_mode` already tells these apart to decide which profile is live.
+        This says the same thing in a form a log line can use, because the shape also
+        decides whether `set_video_profile_mode` can work at all: that service writes
+        `VideoInMode[ch].Config[0]`, which only selects the profile in the ordinary
+        shape.
+
+        Measured on one DHI-NVR5464, all three shapes at once on different channels of
+        the same recorder, which is why this is read per channel and not per model:
+
+            ch0       Config[0]=0  ConfigEx=None   ordinary
+            ch1       Config[0]=0  ConfigEx=Day    the IL shape
+            ch9       Config[0]=2  ConfigEx=None   general profile management
+
+        Returns "ordinary", "general", "configex", or "unknown" when nothing has been
+        polled yet.
+        """
+        data = self.data or {}
+
+        def field(name):
+            return data.get(
+                "table.VideoInMode[{0}].{1}".format(self._channel, name))
+
+        config = field("Config[0]")
+        config_ex = field("ConfigEx")
+        if config is None and config_ex is None:
+            return "unknown"
+        if config == "2":
+            return "general"
+        if config_ex is not None and str(config_ex).strip().lower() in ("day", "night"):
+            return "configex"
+        return "ordinary"
+
+    def video_profile_mode_is_writable(self) -> bool:
+        """Whether writing Config[0] actually selects the profile on this channel.
+
+        True for the ordinary shape and for a channel nothing has been read from yet,
+        because refusing on an unknown is worse than trying: the write is what the
+        service has always done and some devices this has never been measured on may
+        well answer it.
+        """
+        return self.describe_video_profile_shape() in ("ordinary", "unknown")
+
     async def async_detect_lighting_support(self) -> bool:
         """Does this channel have an infrared light?
 
@@ -2561,6 +2878,38 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
     def get_channel(self) -> int:
         """returns the channel index of this camera. 0 based. Channel index 0 is channel number 1"""
         return self._channel
+
+    def is_ptz3e10x_t180(self) -> bool:
+        """Return whether this is the verified dual-sensor T180 family."""
+        return self.model.upper().startswith("PTZ3E10X-T180")
+
+    def get_coaxial_status_channel(self) -> int:
+        """Return the CGI channel that reports coaxial deterrence state."""
+        if self.uses_recorder_deterrence():
+            return self._channel_number
+        if self.is_ptz3e10x_t180():
+            return 2
+        return 1
+
+    def get_rpc2_coaxial_status_channel(self) -> int:
+        """Return the RPC2 channel that reports direct deterrence state."""
+        if self.is_ptz3e10x_t180():
+            return 1
+        return 0
+
+    def get_security_light_control_channel(self) -> int:
+        """Return the CGI channel that controls the security light."""
+        if self.uses_recorder_deterrence():
+            return self._channel_number
+        if self.is_ptz3e10x_t180():
+            return 1
+        return self._channel
+
+    def get_security_light_off_io(self) -> int:
+        """Return the device-specific IO value that disables the light."""
+        if not self.uses_recorder_deterrence() and self.is_ptz3e10x_t180():
+            return 0
+        return 2
 
     def is_nvr_channel(self) -> bool:
         """Return whether this entry represents a camera channel on an NVR.
@@ -2690,7 +3039,9 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         """
         try:
             if self.uses_rpc2_deterrence():
-                return await self.client.async_get_coaxial_control_io_status_rpc2()
+                return await self.client.async_get_coaxial_control_io_status_rpc2(
+                    channel
+                )
             return await self.client.async_get_coaxial_control_io_status(channel)
         except Rpc2MethodRefused as refused:
             if rpc2_refusal_is_a_stale_login(refused):
@@ -2709,7 +3060,7 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
             else:
                 _LOGGER.debug("%s still refuses coaxial status over RPC2 (%s)",
                               self._address, refused)
-            return None
+            return self._previous_coaxial_status()
         except ClientResponseError as error:
             if error.status not in CAPABILITY_REFUSED:
                 raise
@@ -2726,7 +3077,24 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
                 _LOGGER.debug(
                     "%s still refuses coaxial status for channel %s (HTTP %s)",
                     self._address, channel, error.status)
-            return None
+            return self._previous_coaxial_status()
+
+    def _previous_coaxial_status(self) -> dict | None:
+        """The last siren and white light reading, so a refusal holds it.
+
+        The entities reading these say they keep their last value on a refusal,
+        but the poll builds its data from scratch and the gather drops a None,
+        so without this the siren switch read "off" for that cycle while the
+        device was on. Only this read's own keys are carried, never every
+        status key, or a stale value would overwrite a fresh one from another
+        coroutine in the same gather. None when there is nothing to hold, which
+        is what the gather already skips.
+        """
+        previous = getattr(self, "data", None) or {}
+        keys = ("status.status.Speaker", "status.status.WhiteLight",
+                "status.Speaker", "status.WhiteLight")
+        carried = {key: previous[key] for key in keys if key in previous}
+        return carried or None
 
     async def _async_fetch_privacy_mode(self) -> dict:
         """ Poll the privacy mode state, keeping the last known value on failure """

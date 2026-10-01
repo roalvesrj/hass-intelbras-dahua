@@ -8,6 +8,9 @@ from custom_components.dahua import DahuaDataUpdateCoordinator, entry_coordinato
 from . import dahua_utils
 from .const import DOMAIN
 from .entity import DahuaBaseEntity
+from .infrared import (
+    MODE_BY_OPTION, OPTION_BY_MODE, async_write_infrared_mode,
+    infrared_write_is_refused)
 from .model_profiles import is_sdt4e425
 
 _LOGGER = logging.getLogger(__package__)
@@ -62,7 +65,11 @@ async def async_setup_entry(hass: HomeAssistant, entry, async_add_devices):
         if coordinator.supports_day_night_color():
             devices.append(DahuaDayNightModeSelect(coordinator, entry))
 
-        async_add_devices(devices)
+        if coordinator.supports_infrared_light():
+            devices.append(DahuaInfraredModeSelect(coordinator, entry))
+
+        async_add_devices(
+            devices, config_subentry_id=coordinator.subentry_id)
 
 
 
@@ -129,6 +136,73 @@ class DahuaDoorbellLightSelect(DahuaBaseEntity, SelectEntity):
     @property
     def unique_id(self):
         return self._attr_unique_id
+
+
+class DahuaInfraredModeSelect(DahuaBaseEntity, SelectEntity):
+    """The infrared light's mode: automatic, manual, or off.
+
+    The light entity can only say on or off, and what it writes is `Manual` or
+    `Off`. `Auto` is what a camera ships on and what thirteen of fifteen channels
+    on a DHI-NVR5464-16P-EI report, and from a light entity it is indistinguishable
+    from `Off`: the emitter is illuminating every night and the entity reads off.
+    Nothing in Home Assistant could see that, or hand a channel back to the
+    camera's own judgement once something had written `Manual`.
+
+    The options are slugs rather than the device's own capitalised words because
+    Home Assistant looks a label up under
+    `entity.select.infrared_mode.state.<option>`, and that lookup only works for a
+    slug. The device's spelling is what goes on the wire.
+    """
+
+    _attr_translation_key = "infrared_mode"
+
+    _attr_options = list(MODE_BY_OPTION)
+
+    def __init__(self, coordinator: DahuaDataUpdateCoordinator, config_entry):
+        super().__init__(coordinator, config_entry)
+        self._coordinator = coordinator
+
+    @property
+    def unique_id(self):
+        return self._coordinator.get_serial_number() + "_infrared_mode"
+
+    @property
+    def available(self) -> bool:
+        """Unavailable once the device has refused a write outright.
+
+        This entity exists only to write. A recorder that answers
+        `Authority:check failure` to every `Lighting` write -- measured on a
+        DHI-NVR5464-16P-EI, on every channel and over both transports -- gives it
+        nothing to do, and a dropdown that always throws is worse than no
+        dropdown.
+
+        The light entity stays available on purpose: its `mode` and
+        `brightness_level` are read off the same table and are correct, so the
+        reading half of this is still useful where the writing half is not.
+        """
+        return (super().available
+                and not infrared_write_is_refused(self._coordinator))
+
+    @property
+    def current_option(self):
+        """The mode the device reports, or None when it is not one of the three.
+
+        A device can report a mode of its own: this recorder answers `ZoomPrio`
+        on two channels. Home Assistant rejects a `current_option` outside
+        `options`, so that shows as unknown here rather than as one of the three
+        the camera is not in. The light entity's `mode` attribute still names it.
+        """
+        return OPTION_BY_MODE.get(self._coordinator.get_infrared_mode())
+
+    async def async_select_option(self, option: str) -> None:
+        mode = MODE_BY_OPTION.get(option)
+        if mode is None:
+            return
+        # The level the camera is already using, so selecting a mode does not
+        # quietly change the brightness as well. Full only when it reports none.
+        level = self._coordinator.get_infrared_level()
+        await async_write_infrared_mode(
+            self._coordinator, mode, 100 if level is None else level)
 
 
 class DahuaCameraPresetPositionSelect(DahuaBaseEntity, SelectEntity):

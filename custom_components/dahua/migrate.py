@@ -54,8 +54,12 @@ from homeassistant.config_entries import ConfigSubentry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers import issue_registry as ir
 
-from .const import CONF_ADDRESS, CONF_CHANNEL, DOMAIN
+from . import ISSUE_SIBLINGS_REMAIN
+from .const import (CHANNEL_OPTION_KEYS, CONF_ADDRESS, CONF_CHANNEL, CONF_PORT,
+                    DOMAIN)
+from .host import normalize_address
 
 _LOGGER: logging.Logger = logging.getLogger(__package__)
 
@@ -72,6 +76,30 @@ BACKED_UP = (
 CHANNEL_SUBENTRY = "channel"
 
 
+def _channel_settings(entry) -> dict:
+    """What this channel is actually configured with, not what it was added with.
+
+    A subentry's data is where a merged recorder keeps one channel's own answers,
+    and `channel_option` reads it before the entry's options. Copying only
+    `entry.data` therefore did not just fail to carry the user's later changes: it
+    made the add-time value *shadow* them, permanently, for every key stored in
+    both. A channel whose events were changed from VideoMotion to SmartMotionHuman
+    in Configure went back to VideoMotion at migration and could not be corrected
+    through the entry's options again, and an empty selection was lost the same way.
+
+    Only the per-channel keys are overlaid. A host-wide option left here would be
+    frozen onto each channel instead of continuing to follow the host.
+
+    Reported by alpha520098 on #825, who also identified the key set.
+    """
+    settings = dict(entry.data)
+    settings.update({
+        key: value for key, value in (entry.options or {}).items()
+        if key in CHANNEL_OPTION_KEYS
+    })
+    return settings
+
+
 def _channel_of(entry) -> int:
     """This entry's channel index, as an int whatever it was stored as.
 
@@ -86,6 +114,20 @@ def _channel_of(entry) -> int:
 
 def _address_of(entry) -> str:
     return (entry.data.get(CONF_ADDRESS) or "").strip().rstrip("/").lower()
+
+
+def _port_of(entry) -> str:
+    """Which of the device behind an address this entry is.
+
+    Two Dahua boxes can sit behind one IP on different ports -- a bridge
+    forwarding 80/554 to one and 81/555 to another, which the rest of the
+    integration already treats as two devices (client.py's device_key). Grouping
+    by address alone folded the second device's channel 0 onto the first device's
+    subentry, so its configuration was dropped and its entities were re-parented
+    to the wrong camera. The default stands in for an entry that predates the
+    field, which is what it was using.
+    """
+    return str(entry.data.get(CONF_PORT) or "80")
 
 
 def _subentry_unique_id(address: str, channel: int) -> str:
@@ -124,13 +166,30 @@ async def async_merge_channel_entries(hass: HomeAssistant) -> None:
     """
     entries = hass.config_entries.async_entries(DOMAIN)
 
-    by_address: dict[str, list] = {}
+    by_host: dict[tuple[str, str], list] = {}
     for entry in entries:
+        if entry.disabled_by is not None:
+            # Left exactly as it is, and not counted towards whether this host
+            # needs merging. Disabling an entry is how somebody parks a channel
+            # whose camera has gone without throwing its history away, and
+            # folding it in would undo that in two different ways.
+            #
+            # It would be silently re-enabled: its entities would move onto the
+            # survivor, which is enabled, so a camera the user switched off starts
+            # polling again with nothing said.
+            #
+            # Worse, the survivor is the lowest channel and nothing here looked at
+            # `disabled_by`, so a disabled channel 0 *became* the survivor: every
+            # other channel's entities would be moved onto a disabled entry, which
+            # Home Assistant never sets up, and the other entries are then removed.
+            # A whole recorder goes dark on upgrade, and only the registry copies
+            # taken above are the way back.
+            continue
         address = _address_of(entry)
         if address:
-            by_address.setdefault(address, []).append(entry)
+            by_host.setdefault((address, _port_of(entry)), []).append(entry)
 
-    hosts = {address: group for address, group in by_address.items()
+    hosts = {host: group for host, group in by_host.items()
              if len(group) > 1}
     if not hosts:
         return
@@ -146,7 +205,7 @@ async def async_merge_channel_entries(hass: HomeAssistant) -> None:
         "inside Home Assistant, so keep them until you are happy",
         len(hosts), backup)
 
-    for address, group in hosts.items():
+    for (address, _port), group in hosts.items():
         try:
             await _async_merge_host(hass, address, group)
         except Exception:  # pylint: disable=broad-except
@@ -190,7 +249,7 @@ async def _async_merge_host(hass: HomeAssistant, address: str, group: list) -> N
             subentry_for[entry.entry_id] = existing[unique_id]
             continue
         subentry = ConfigSubentry(
-            data=dict(entry.data),
+            data=_channel_settings(entry),
             subentry_type=CHANNEL_SUBENTRY,
             title=entry.title or "Channel %d" % channel,
             unique_id=unique_id,
@@ -263,6 +322,7 @@ async def _async_merge_host(hass: HomeAssistant, address: str, group: list) -> N
         return
 
     removed = 0
+    removed_hosts = set()
     for entry in ordered[1:]:
         left = er.async_entries_for_config_entry(entities, entry.entry_id)
         if left:
@@ -275,6 +335,21 @@ async def _async_merge_host(hass: HomeAssistant, address: str, group: list) -> N
             continue
         await hass.config_entries.async_remove(entry.entry_id)
         removed += 1
+        # The address as the removal hook spelled it, not the lowercased group
+        # key: normalize_address keeps the case, and the issue id is built from
+        # its own normalization. Deleting the lowercased id left a mixed-case
+        # host's card standing.
+        removed_hosts.add(normalize_address(entry.data.get(CONF_ADDRESS)))
+
+    for removed_host in removed_hosts:
+        # These removals are the merge's, not the user's, but each one runs the
+        # same removal hook a manual deletion does. That hook sees the surviving
+        # entry as a sibling and raises the "more Dahua entries still use
+        # <address>" card -- whose fix removes every entry at the address, which
+        # is the recorder this merge has just finished creating. Nothing is left
+        # to offer, so the card it just raised is withdrawn.
+        ir.async_delete_issue(
+            hass, DOMAIN, ISSUE_SIBLINGS_REMAIN.format(removed_host))
 
     _LOGGER.warning(
         "%s is now one Dahua entry with %d channels: %d entities moved and %d "

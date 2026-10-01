@@ -43,7 +43,8 @@ async def async_setup_entry(hass: HomeAssistant, entry, async_add_devices):
         if coordinator.supports_profile_mode():
             sensors.append(DahuaProfileSensor(coordinator, entry))
 
-        async_add_devices(sensors)
+        async_add_devices(
+            sensors, config_subentry_id=coordinator.subentry_id)
 
 
 class DahuaFirmwareVersionSensor(DahuaBaseEntity, SensorEntity):
@@ -138,11 +139,28 @@ class DahuaLicensePlateSensor(DahuaEventDrivenEntity, SensorEntity):
 
     @property
     def extra_state_attributes(self):
-        return self._coordinator.get_last_plate_data()
+        """The plate's own fields, on top of what every entity here reports.
+
+        Returned alone until now, so `id` and `integration` were missing from this
+        sensor and only this one. Merged rather than replaced, and `or {}` because
+        get_last_plate_data returns None before the first plate.
+        """
+        return {
+            **(super().extra_state_attributes or {}),
+            **(self._coordinator.get_last_plate_data() or {}),
+        }
 
     async def async_added_to_hass(self):
-        """Connect to dispatcher listening for entity data notifications."""
-        self._coordinator.add_plate_listener(self.schedule_update_ha_state)
+        """Listen for a plate, and stop listening when removed.
+
+        The remover has to be kept. add_plate_listener returns it for exactly this
+        reason, and the authorized vehicle sensor next door uses it; this caller was
+        missed. Without it the callback outlives the entity, so every reload leaves
+        another dead one in the list and each ANPR plate then logs "Error calling plate
+        listener" once per reload the entry has ever had.
+        """
+        self.async_on_remove(
+            self._coordinator.add_plate_listener(self.schedule_update_ha_state))
 
     @property
     def should_poll(self) -> bool:

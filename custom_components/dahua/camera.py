@@ -15,6 +15,7 @@ from custom_components.dahua import DahuaDataUpdateCoordinator, entry_coordinato
 from custom_components.dahua import dahua_utils
 from custom_components.dahua.entity import DahuaBaseEntity
 from custom_components.dahua.model_profiles import is_sdt4e425
+from custom_components.dahua.rpc2 import Rpc2MethodRefused
 from custom_components.dahua.vto import CancelCallRefused
 
 from .const import (
@@ -44,6 +45,7 @@ SERVICE_ENABLE_ALL_IVS_RULES = "enable_all_ivs_rules"
 SERVICE_ENABLE_IVS_RULE = "enable_ivs_rule"
 SERVICE_VTO_OPEN_DOOR = "vto_open_door"
 SERVICE_VTO_CANCEL_CALL = "vto_cancel_call"
+SERVICE_VTO_CALL = "vto_call"
 SERVICE_SET_DAY_NIGHT_MODE = "set_video_in_day_night_mode"
 SERVICE_REBOOT = "reboot"
 SERVICE_GOTO_PRESET_POSITION = "goto_preset_position"
@@ -109,7 +111,8 @@ async def async_setup_entry(hass: HomeAssistant, config_entry, async_add_entitie
                             unique_suffix=f"{unique_prefix}{stream_name}",
                         )
                     )
-            async_add_entities(entities)
+            async_add_entities(
+                entities, config_subentry_id=coordinator.subentry_id)
         else:
             max_streams = coordinator.get_max_streams()
             # Note the stream_index is 0 based. The main stream is index 0
@@ -121,7 +124,8 @@ async def async_setup_entry(hass: HomeAssistant, config_entry, async_add_entitie
                             stream_index,
                             config_entry,
                         )
-                    ]
+                    ],
+                    config_subentry_id=coordinator.subentry_id,
                 )
 
     # Registered once for the platform rather than once per channel:
@@ -234,6 +238,14 @@ async def async_setup_entry(hass: HomeAssistant, config_entry, async_add_entitie
         SERVICE_VTO_CANCEL_CALL,
         {},
         "async_vto_cancel_call"
+    )
+
+    platform.async_register_entity_service(
+        SERVICE_VTO_CALL,
+        {
+            vol.Required("room"): vol.All(str, vol.Strip, vol.Length(min=1)),
+        },
+        "async_vto_call"
     )
 
     platform.async_register_entity_service(
@@ -401,6 +413,29 @@ class DahuaCamera(DahuaBaseEntity, Camera):
         """Return the entity unique ID."""
         return self._unique_id
 
+    @property
+    def entity_registry_enabled_default(self) -> bool:
+        """Only the main stream is enabled to begin with.
+
+        Every stream the device can serve gets an entity, whether or not it is
+        enabled on the device, because which ones exist cannot be known without
+        asking and asking costs a request per channel. Most people watch one stream
+        per camera, so on an eleven channel recorder serving three streams each that
+        was thirty three camera entities to go and delete by hand -- which the README
+        said to do, in as many words.
+
+        Created but not enabled is the difference: the entity is still listed, and
+        anyone pointing a card at a sub stream turns it on once. Derived from the
+        stream index rather than stored in `_attr_entity_registry_enabled_default`,
+        so there is one place it can be wrong and it can be read off an instance
+        without the entity machinery.
+
+        This is consulted only when an entity is first registered, so nothing that
+        already exists changes: an existing sub stream camera stays exactly as its
+        owner left it.
+        """
+        return self._stream_index == 0
+
     async def async_camera_image(self, width: int | None = None, height: int | None = None):
         """Return a still image response from the camera, or None if it refused.
 
@@ -465,7 +500,8 @@ class DahuaCamera(DahuaBaseEntity, Camera):
         """ Handles the service call from SERVICE_SET_INFRARED_MODE to set infrared mode and brightness """
         channel = self._logical_channel
         await self._coordinator.client.async_set_lighting_v1_mode(
-            channel, mode, brightness, self._coordinator.get_infrared_profile())
+            channel, mode, brightness, self._coordinator.get_infrared_profile(),
+            self._coordinator.get_infrared_bank())
         await self._coordinator.async_refresh()
 
     async def async_set_illuminator_mode(self, mode: str, brightness: int):
@@ -528,7 +564,25 @@ class DahuaCamera(DahuaBaseEntity, Camera):
         if any(substring in model for substring in ['NVR4108HS', 'IPC-Color4K']):
             await self._coordinator.client.async_set_night_switch_mode(channel, mode)
         else:
+            # Say so before writing, rather than leaving #458 as "Unknown error".
+            # VideoInMode comes in three shapes and Config[0] only selects the profile
+            # in one of them, so on the other two this write is either refused by the
+            # device or accepted and ignored. The shape is read per channel from the
+            # last poll, because one recorder carries all three at once.
+            if not self._coordinator.video_profile_mode_is_writable():
+                _LOGGER.warning(
+                    "Setting the video profile on %s channel %s may not take effect: "
+                    "its VideoInMode is the %s shape, and this writes Config[0], which "
+                    "only selects the profile in the ordinary shape. See issue #458",
+                    self._coordinator.get_device_name(), channel,
+                    self._coordinator.describe_video_profile_shape(),
+                )
             await self._coordinator.client.async_set_video_profile_mode(channel, mode)
+        # The profile decides which Lighting row every light command writes to,
+        # and the poll is what reads it back. Without this the next light
+        # command in the same poll window is written to the row the camera is
+        # not rendering from, where the device accepts and ignores it.
+        await self._coordinator.async_refresh()
 
     async def async_adjustfocus(self, focus: str, zoom: str):
         """ Handles the service call from SERVICE_SET_INFRARED_MODE to set zoom and focus """
@@ -576,6 +630,19 @@ class DahuaCamera(DahuaBaseEntity, Camera):
 
     async def async_vto_open_door(self, door_id: int):
         """ Handles the service call from SERVICE_VTO_OPEN_DOOR """
+        # The service is offered on every camera entity, and the Open Door
+        # button is only created on a doorbell; aimed at anything else the CGI
+        # endpoint is not there and the user gets a raw HTTP error. The sibling
+        # cancel-call service says which device it is for, so this one does too.
+        # getattr because tests build stand-in coordinators without the method.
+        is_doorbell = getattr(self._coordinator, "is_doorbell", None)
+        if is_doorbell is not None and not is_doorbell():
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="open_door_needs_a_doorbell",
+                translation_placeholders={
+                    "device": self._coordinator.get_device_name()},
+            )
         await self._coordinator.client.async_access_control_open_door(door_id)
 
     async def async_vto_cancel_call(self):
@@ -600,6 +667,31 @@ class DahuaCamera(DahuaBaseEntity, Camera):
                 translation_domain=DOMAIN,
                 translation_key="cancel_call_refused",
                 translation_placeholders={"reason": str(refused)},
+            ) from refused
+
+    async def async_vto_call(self, room: str):
+        """ Handles the service call from SERVICE_VTO_CALL to ring a room from a VTO """
+        # Offered on every camera entity, like open door, and for the same reason
+        # it says so when aimed at something that is not a doorbell rather than
+        # leaving the user an RPC2 refusal from a camera that has no VideoTalkPhone.
+        is_doorbell = getattr(self._coordinator, "is_doorbell", None)
+        if is_doorbell is not None and not is_doorbell():
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="vto_call_needs_a_doorbell",
+                translation_placeholders={
+                    "device": self._coordinator.get_device_name()},
+            )
+        try:
+            await self._coordinator.client.async_vto_call(room)
+        except Rpc2MethodRefused as refused:
+            # The device's own reason, code and message, is the useful part: a
+            # room it does not know and a login it will not take read the same
+            # from here otherwise.
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="vto_call_refused",
+                translation_placeholders={"room": room, "reason": str(refused)},
             ) from refused
 
     async def async_set_service_set_channel_title(self, text1: str, text2: str):
