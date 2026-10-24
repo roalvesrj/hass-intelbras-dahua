@@ -20,6 +20,7 @@ from aiohttp import ClientConnectionError, ClientResponseError
 
 from custom_components.dahua import DahuaDataUpdateCoordinator
 from custom_components.dahua.diagnostics import _capabilities_block
+from custom_components.dahua.rpc2 import Rpc2MethodRefused, Rpc2TableAbsent
 
 
 def _coordinator():
@@ -55,6 +56,72 @@ def test_a_404_is_an_answer_too():
 
     assert c._probe_refusals["ptz_position"]["answered"] is True
     assert c._probe_refusals["ptz_position"]["status"] == 404
+
+
+def test_an_rpc2_refusal_is_an_answer_too():
+    """An RPC2 refusal carries a code rather than an HTTP status, and it is the
+    device answering: this firmware does not serve that method or table."""
+    c = _coordinator()
+
+    c._note_probe_refusal(
+        "cloud_upgrade",
+        Rpc2MethodRefused(
+            "Dahua RPC2 method configManager.getConfig returned result=false",
+            code=268959743,
+            message="Unknown error",
+        ),
+    )
+
+    refusal = c._probe_refusals["cloud_upgrade"]
+    assert refusal["answered"] is True
+    assert refusal["status"] == 268959743
+
+
+def test_a_reply_with_no_table_is_an_answer_too():
+    """⭐⭐ THE THIRD SHAPE, and it has neither a status nor a code: the call
+    SUCCEEDED and the table simply was not in the reply.
+
+    @kmich measured what judging that by the absence of a status cost (#1114).
+    `get_cloud_upgrade_info` raised a bare `ValueError` when a device replied
+    without `_DHCloudUpgrade_`, this filed it as silence, and
+    `probes_that_did_not_answer` then reported `cloud_upgrade` for ever. On
+    all seventeen of his entries, VTH, IPC and NVR alike, that kept the
+    leftover-rows card from ever appearing.
+    """
+    c = _coordinator()
+
+    c._note_probe_refusal(
+        "cloud_upgrade",
+        Rpc2TableAbsent("Dahua RPC2 response is missing the _DHCloudUpgrade_ table"),
+    )
+
+    refusal = c._probe_refusals["cloud_upgrade"]
+    assert refusal["answered"] is True
+    # ⚠ And no invented status. The device answered; it did not answer WITH
+    # a code, and reporting one would be a reading nobody took.
+    assert refusal["status"] is None
+    assert refusal["error"] == "Rpc2TableAbsent"
+
+
+def test_a_table_absent_probe_is_not_reported_as_unanswered():
+    """The consequence, asserted where the card actually reads it."""
+    c = _coordinator()
+
+    c._note_probe_refusal("cloud_upgrade", Rpc2TableAbsent("no table"))
+
+    assert "cloud_upgrade" not in c.probes_that_did_not_answer()
+
+
+def test_a_bare_value_error_is_still_silence():
+    """⚠ The fix is a class saying `answered`, not "ValueError now counts".
+    A `ValueError` from anywhere else still says nothing about the device, and
+    treating every one of them as an answer would lose the distinction this
+    file exists for."""
+    c = _coordinator()
+
+    c._note_probe_refusal("cloud_upgrade", ValueError("something else entirely"))
+
+    assert c._probe_refusals["cloud_upgrade"]["answered"] is False
 
 
 # --- the device did not answer ----------------------------------------------

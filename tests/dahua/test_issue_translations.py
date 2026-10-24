@@ -26,15 +26,52 @@ ISSUE_PLACEHOLDERS = {
     "siblings_remain": {"address", "count"},
     "removal_broke_things": {"removed", "dependents", "names"},
     "channel_not_added": {"address", "channel", "reason"},
+    "webrtc_cannot_play": {"address", "channels", "count"},
+    "motion_not_pushed": {"address", "channels"},
+    # Title only, as siblings_remain above: the flow fills its own form, and it
+    # recomputes the list rather than reading it out of the issue's data.
+    "leftover_rows": {"name", "count"},
 }
 FIX_FLOW_PLACEHOLDERS = {"address", "entries", "port"}
-SIBLINGS_FLOW_PLACEHOLDERS = {
-    "address",
-    "count",
-    "titles",
-    "removed",
-    "dependents_note",
-}
+
+PACKAGE = TRANSLATIONS.parent
+
+
+def _form_placeholders(class_name: str) -> set:
+    """The keys a repair flow's own `async_show_form` supplies.
+
+    Read from `repairs.py` rather than listed here. This was a hand-written set
+    and it went stale the moment the form gained a placeholder: the string and
+    the code agreed, and the test disagreed with both. A literal list of what
+    another file does is a second source of truth, and the whole point of this
+    file is that there should be one.
+    """
+    tree = ast.parse((PACKAGE / "repairs.py").read_text(encoding="utf-8"))
+    flow = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ClassDef) and node.name == class_name
+    )
+    for node in ast.walk(flow):
+        if not isinstance(node, ast.Call):
+            continue
+        for keyword in node.keywords:
+            if keyword.arg != "description_placeholders":
+                continue
+            return {
+                key.value
+                for key in keyword.value.keys
+                if isinstance(key, ast.Constant) and isinstance(key.value, str)
+            }
+    raise AssertionError(
+        "%s no longer passes description_placeholders to async_show_form. If the "
+        "form moved, point this at the new place: without it every placeholder "
+        "check below passes vacuously." % class_name
+    )
+
+
+SIBLINGS_FLOW_PLACEHOLDERS = _form_placeholders("RemoveSiblingsRepairFlow")
+LEFTOVER_FLOW_PLACEHOLDERS = _form_placeholders("RemoveLeftoverRowsRepairFlow")
 
 
 def _placeholders(text: str) -> set:
@@ -162,6 +199,12 @@ def test_no_text_uses_a_placeholder_the_code_does_not_supply(key):
     ), f"unsupplied: {used - ISSUE_PLACEHOLDERS[key]}"
 
 
+def test_the_placeholders_were_really_read_from_the_code():
+    """A derivation that quietly returned nothing would make the next test pass
+    whatever the string said."""
+    assert {"address", "count", "titles", "removed"} <= SIBLINGS_FLOW_PLACEHOLDERS
+
+
 def test_the_siblings_flow_only_uses_its_own_placeholders():
     """The one that caught a real bug: the confirm text named {removed}, which
     async_show_form did not supply, so it would have rendered literally."""
@@ -170,6 +213,31 @@ def test_the_siblings_flow_only_uses_its_own_placeholders():
     assert (
         used <= SIBLINGS_FLOW_PLACEHOLDERS
     ), f"unsupplied: {used - SIBLINGS_FLOW_PLACEHOLDERS}"
+
+
+def test_the_leftover_placeholders_were_really_read_from_the_code():
+    assert {"name", "count", "entities"} <= LEFTOVER_FLOW_PLACEHOLDERS
+
+
+def test_the_leftover_flow_only_uses_its_own_placeholders():
+    """Same trap as the siblings flow, and it matters more here: this card
+    names the entities it is about to delete, so a placeholder that renders
+    literally would ask somebody to confirm a list they cannot see."""
+    step = EN["issues"]["leftover_rows"]["fix_flow"]["step"]["confirm"]
+    used = _placeholders(step["title"]) | _placeholders(step["description"])
+    assert (
+        used <= LEFTOVER_FLOW_PLACEHOLDERS
+    ), f"unsupplied: {used - LEFTOVER_FLOW_PLACEHOLDERS}"
+
+
+def test_the_leftover_card_lists_what_it_will_remove():
+    """Not decoration. The one irreversible action a repair card can take is
+    deleting registry rows, and the #827 merge card did exactly that while
+    describing something else. The entity list has to be on the screen."""
+    step = EN["issues"]["leftover_rows"]["fix_flow"]["step"]["confirm"]
+
+    assert "{entities}" in step["description"]
+    assert "cannot be undone" in step["description"]
 
 
 def test_the_siblings_issue_is_fixable_and_the_notice_is_not():

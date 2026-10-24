@@ -26,9 +26,10 @@ from aiohttp import ClientError, ClientResponseError, TCPConnector
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import issue_registry as ir
 
-from .client import clear_host_cache
+from .client import clear_host_cache, rpc2_refusal_is_a_stale_login
 from .const import CONF_ADDRESS, CONF_PORT, CONF_USE_HTTPS, DOMAIN
 from .dahua_utils import parse_event
+from .rpc2 import Rpc2MethodRefused
 
 _LOGGER: logging.Logger = logging.getLogger(__package__)
 
@@ -58,6 +59,10 @@ EVENT_STREAM_SHORT_RETRY_SECONDS = 10
 # device that ran out of connections stays out of connections, because each
 # attempt costs it another one. Back off instead, to this ceiling.
 EVENT_STREAM_MAX_RETRY_SECONDS = 600
+
+# A single CGI request returns every recorder channel currently in ordinary
+# motion. Two seconds matches the integration's existing RPC2 event poller.
+VIDEO_MOTION_POLL_SECONDS = 2
 
 # Camera uptime is host-wide. An NVR may have many config entries, one per
 # channel, but they all refer to the same physical recorder uptime.
@@ -93,6 +98,18 @@ async def _async_get_host_uptime_generation(coordinator) -> int:
     )
 
     async with lock:
+        # A device that does not serve the method says so the same way every
+        # time, so it is asked once and then left alone. Without this the read
+        # runs on every poll for the life of the entry and can never succeed:
+        # on the recorder this was measured against that was most of the
+        # integration's login traffic, because of what the refusal used to do
+        # to the shared session (#1039, #577).
+        #
+        # `.get`, not `[...]`, because this key is newer than some of the state
+        # dicts that exist: removal tests build one by hand.
+        if state.get("unsupported"):
+            return int(state["generation"])
+
         # Another channel may have completed the host read while this
         # coordinator was waiting for the lock.
         now = time.monotonic()
@@ -104,6 +121,24 @@ async def _async_get_host_uptime_generation(coordinator) -> int:
             current = await coordinator.client.async_get_uptime_last()
         except asyncio.CancelledError:
             raise
+        except Rpc2MethodRefused as refused:
+            state["last_read"] = time.monotonic()
+
+            if not rpc2_refusal_is_a_stale_login(refused):
+                # Latched only for a refusal, never for a timeout: a device
+                # that did not answer has not told us anything about what it
+                # supports, and reading silence as a definite no is the #724
+                # mistake.
+                state["unsupported"] = True
+
+                _LOGGER.debug(
+                    "%s does not serve magicBox.getUpTime (%s); "
+                    "not asking again, so reboot detection is off for this host",
+                    address,
+                    refused,
+                )
+
+            return int(state["generation"])
         except Exception:
             # Cache failed attempts too, otherwise every NVR channel may repeat
             # the same failed uptime request during the same poll burst.
@@ -232,6 +267,15 @@ UNREACHABLE_AFTER_FAILURES = 5
 # A TCP probe is cheap but not free, and a wedged host fails every single poll.
 HTTPS_PROBE_MIN_INTERVAL = 600
 
+ISSUE_MOTION_NOT_PUSHED = "motion_not_pushed_{0}"
+
+# How often this host may be asked whether the device is detecting motion it is
+# not pushing, and how many times in all. One request an hour for a day, then
+# never again: a camera watching a quiet corridor genuinely sees no motion, and
+# asking it for ever would be load bought with nothing.
+MOTION_PUSH_CHECK_INTERVAL_SECONDS = 3600
+MOTION_PUSH_CHECK_LIMIT = 24
+
 ISSUE_UNREACHABLE = "unreachable_{0}"
 
 ISSUE_HTTP_DEAD_HTTPS_AVAILABLE = "http_dead_https_available_{0}"
@@ -289,8 +333,44 @@ def _entries_for_address(hass: HomeAssistant, address: str) -> list:
     ]
 
 
+async def _async_probe_tls(address: str, port: int, timeout: float = 5.0) -> bool:
+    """Does something complete a TLS handshake here? No HTTP, no credentials.
+
+    An open socket is not an HTTPS server, and the difference is not academic.
+    #489 is a camera that accepts a connection on 443 and closes it without
+    saying anything, which an open-socket check reads as "this device is
+    serving HTTPS, tick the HTTPS box and use 443" and sends the reporter
+    round a loop while the more accurate answer, that Dahua's own ports are
+    the only thing answering, sits one check further down.
+
+    The handshake is the cheapest thing that distinguishes them. The
+    certificate is not verified, for the reason SSL_CONTEXT exists: these
+    devices ship self-signed certificates, and this is a reachability probe
+    rather than a trust decision.
+    """
+    writer = None
+    try:
+        _, writer = await asyncio.wait_for(
+            asyncio.open_connection(address, port, ssl=SSL_CONTEXT), timeout
+        )
+        return True
+    except Exception:  # pylint: disable=broad-except
+        return False
+    finally:
+        if writer is not None:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:  # pylint: disable=broad-except
+                pass
+
+
 async def _async_probe_tcp(address: str, port: int, timeout: float = 5.0) -> bool:
-    """Can we open a TCP connection? No HTTP, no credentials, no retry."""
+    """Can we open a TCP connection? No HTTP, no credentials, no retry.
+
+    Right for Dahua's own ports, where answering at all is the signal, and
+    wrong for 443: see `_async_probe_tls`.
+    """
     writer = None
     try:
         _, writer = await asyncio.wait_for(
@@ -329,7 +409,10 @@ async def _async_evaluate_host(hass: HomeAssistant, address: str) -> None:
         for entry in entries
     )
 
-    state = _HOST_FAILURES.get(address)
+    # The other place normalize_address's claim was not enforced. Its one
+    # caller normalises before scheduling this, so a raw address here would
+    # silently find no state, probe nothing and raise no card.
+    state = _HOST_FAILURES.get(normalize_address(address))
     https_is_open = False
     if not already_https and state is not None:
         state["last_probe"] = time.time()
@@ -496,6 +579,15 @@ async def async_device_is_zero_indexed(client, device: str):
 
 
 @callback
+def host_auth_budget_exhausted(address: str) -> bool:
+    """Whether a transport on this host must stop offering credentials."""
+    return (
+        _HOST_FAILURES.get(normalize_address(address), {}).get("auth_refusals", 0)
+        >= MAX_AUTH_REFUSALS
+    )
+
+
+@callback
 def async_record_host_auth_refusal(address: str, source: str = "") -> int:
     """Note that this host refused the credentials, and say how often it has.
 
@@ -612,13 +704,43 @@ class DahuaHostEventStream:
     # `on_receive` read this, and on a bare instance the AttributeError from
     # `_async_run` landed inside its retry loop and hung the test rather than
     # failing it. A default here is one line and cannot be half-applied.
+    # Whether a VideoMotion event has ever arrived on this host's stream.
+    #
+    # On the class, not only in __init__, for the reason given above: several
+    # test files build a stream with object.__new__ and set three attributes.
+    # False on a bare instance means "no evidence", which is the safe reading
+    # -- the card below is raised only on positive evidence, never on absence.
+    #
+    # Never reset. A host that pushed VideoMotion once is not a host that
+    # cannot, so a reconnect must not make it look newly broken (#728).
+    _seen_pushed_video_motion = False
+
+    # How many times this host has been asked whether the device is detecting
+    # motion it is not pushing, and when it was last asked. Bounded, because a
+    # camera that genuinely never sees motion would otherwise be asked for ever.
+    _motion_push_checks = 0
+    _motion_push_last_check = 0.0
+
     _using_all_events = False
+    # Bare instances in focused tests predate this optional sidecar. Keeping a
+    # class default makes their old construction contract remain valid.
+    _video_motion_poll_task: asyncio.Task | None = None
 
     # Whether a refusal has already pushed this stream onto codes=[All]. One
     # attempt per stream: a device that refuses the explicit list and then refuses
     # [All] as well has nothing left to try, and retrying both forever would
     # double the requests at a device that is already saying no.
     _tried_all_events = False
+
+    # Which event codes this device's getEventIndexes endpoint has been seen to
+    # report as active. Learned, because an empty answer is ambiguous -- see
+    # _async_reconcile_latched_events.
+    #
+    # A None default rather than an empty set: a mutable class attribute would
+    # be shared by every host, and this must not be. Created on first use so
+    # that an instance built without __init__ -- which the tests here do -- is
+    # still correct.
+    _codes_the_device_reports: set | None = None
 
     def __init__(self, hass: HomeAssistant, address: str) -> None:
         self._hass = hass
@@ -635,6 +757,7 @@ class DahuaHostEventStream:
         # the stream even when the union of requested event names is unchanged.
         self._using_all_events = False
         self._task: asyncio.Task | None = None
+        self._video_motion_poll_task: asyncio.Task | None = None
         # Whether the last attach failed, so an outage is reported once.
         self._failing = False
         # How many times running the stream has died on contact, which is what
@@ -657,6 +780,15 @@ class DahuaHostEventStream:
         union = set()
         for coordinator in self.coordinators:
             union.update(coordinator.events or [])
+
+        # A recorder's alarm input sensors are host level: they belong to the
+        # box, not to a channel, so no channel's selection speaks for them
+        # (#1090). Deselecting AlarmLocal everywhere would otherwise stop the
+        # subscription and leave those sensors permanently stuck at whatever
+        # the setup state read found. Same reasoning as DERIVES_INTO below,
+        # which keeps a raw code subscribed for the sake of a derived one.
+        if self._alarm_input_coordinator() is not None:
+            union.add("AlarmLocal")
         return frozenset(union)
 
     def register(self, coordinator) -> None:
@@ -742,6 +874,7 @@ class DahuaHostEventStream:
             and wanted == self._events
             and use_all_events == self._using_all_events
         ):
+            self._sync_video_motion_poller()
             return
         self._events = wanted
         self._using_all_events = use_all_events
@@ -750,11 +883,341 @@ class DahuaHostEventStream:
             self._task = None
         if wanted and self._owner is not None:
             self._task = asyncio.create_task(self._async_run())
+        self._sync_video_motion_poller()
+
+    def _alarm_input_coordinator(self):
+        """The coordinator carrying this host's alarm terminals, or None (#1090).
+
+        The lowest channel that found terminals, which is the same rule
+        binary_sensor.py uses to decide who owns the entities. Picking the same
+        one in both places is what makes routing and entity creation agree: an
+        event handed to a coordinator with no sensors on it updates nothing.
+
+        None for every camera and for any recorder that answered no terminals,
+        and the caller then keeps the old per-channel behaviour untouched.
+        """
+        answering = [
+            coordinator
+            for coordinator in self.coordinators
+            if getattr(coordinator, "supports_alarm_inputs", None)
+            and coordinator.supports_alarm_inputs()
+        ]
+        if not answering:
+            return None
+        return min(answering, key=lambda c: c.get_channel())
+
+    def _wants_the_motion_push_check(self) -> bool:
+        """Whether asking this host about missing VideoMotion is worth a request.
+
+        Every one of these has to hold, and each rules out a reason the
+        question would be noise:
+
+        * nothing has ever been pushed -- one pushed event proves the device
+          can, and no amount of quiet afterwards unproves it;
+        * nobody has already turned the poller on, because then the user has
+          the fix and a card telling them about it is an insult;
+        * somebody selected VideoMotion, so an empty selection stays silent
+          rather than being told about a feature they switched off;
+        * the device says motion detection is enabled on at least one channel,
+          so a camera with motion turned off on the device is not accused of
+          failing to report it.
+        """
+        if self._seen_pushed_video_motion:
+            return False
+        if self._motion_push_checks >= MOTION_PUSH_CHECK_LIMIT:
+            return False
+        coordinators = list(self.coordinators)
+        if any(getattr(c, "poll_video_motion", False) for c in coordinators):
+            return False
+        if not any(set(c.events or []) & {"VideoMotion", "All"} for c in coordinators):
+            return False
+        return any(
+            getattr(c, "is_motion_detection_enabled", None)
+            and c.is_motion_detection_enabled()
+            for c in coordinators
+        )
+
+    async def async_check_video_motion_is_pushed(self) -> None:
+        """Raise a card when the device detects motion it is not pushing (#728).
+
+        **The evidence has to be positive, because the read is ambiguous.**
+        Measured on a DHI-NVR5464-16P-EI, `getEventIndexes` answers identically
+        for a real code with nothing active and for a code it has never heard
+        of:
+
+            code=VideoMotion          200  channels[0]=14
+            code=CrossLineDetection   200  Error: No Events
+            code=NotARealCodeAtAll    200  Error: No Events
+
+        So an empty answer means nothing and is discarded. A **non-empty** one
+        is unambiguous: the device is reporting motion on a channel right now,
+        and our stream has never once delivered a VideoMotion event. Those two
+        facts together are the whole fault, and nothing else produces them.
+
+        That is why this is not a timeout. "No motion for six hours" is what a
+        camera pointed at a locked gate reports when it is working perfectly.
+
+        Two reporters have hit this -- @mediarath, who wrote the poller in
+        #996 from their own XVR, and a second recorder on #728 -- and neither
+        could have found the option, because nothing in the interface connects
+        "motion does not work" to a checkbox in the entry's settings.
+
+        Nothing is enabled here. The card names the setting and the user
+        decides, because the poller is one request per recorder every two
+        seconds and that is not a cost to impose on a guess.
+        """
+        if self._seen_pushed_video_motion or any(
+            getattr(c, "poll_video_motion", False) for c in self.coordinators
+        ):
+            # Either the device started pushing or the user turned the poller
+            # on. Deleted rather than left standing, so somebody who ticks the
+            # box sees the card go rather than wondering whether it worked.
+            ir.async_delete_issue(
+                self._hass, DOMAIN, ISSUE_MOTION_NOT_PUSHED.format(self._address)
+            )
+            return
+        if not self._wants_the_motion_push_check():
+            return
+        now = time.monotonic()
+        if (
+            self._motion_push_checks
+            and now - self._motion_push_last_check < MOTION_PUSH_CHECK_INTERVAL_SECONDS
+        ):
+            return
+        self._motion_push_last_check = now
+        self._motion_push_checks += 1
+
+        owner = self._owner
+        if owner is None:
+            return
+        try:
+            active = await owner.client.async_get_event_indexes_cgi("VideoMotion")
+        except Exception:  # pylint: disable=broad-except
+            # A device that will not answer this is not a device accused of
+            # anything. Debug only: this runs on the poll, and a warning per
+            # hour per host for a question nobody asked for is noise.
+            _LOGGER.debug(
+                "Could not ask %s whether it is detecting motion",
+                self._address,
+                exc_info=True,
+            )
+            return
+        # A stream event or an options change may have settled the question
+        # while the network read was in flight. Do not raise a stale card.
+        if self._seen_pushed_video_motion or any(
+            getattr(c, "poll_video_motion", False) for c in self.coordinators
+        ):
+            ir.async_delete_issue(
+                self._hass, DOMAIN, ISSUE_MOTION_NOT_PUSHED.format(self._address)
+            )
+            return
+        if not active:
+            return
+
+        _LOGGER.info(
+            "%s reports motion on channel(s) %s but has never pushed a "
+            "VideoMotion event; suggesting the fallback poller",
+            self._address,
+            ", ".join(str(index) for index in sorted(active)),
+        )
+        ir.async_create_issue(
+            self._hass,
+            DOMAIN,
+            ISSUE_MOTION_NOT_PUSHED.format(self._address),
+            is_fixable=False,
+            severity=ir.IssueSeverity.WARNING,
+            translation_key="motion_not_pushed",
+            translation_placeholders={
+                "address": self._address,
+                "channels": ", ".join(str(index) for index in sorted(active)),
+            },
+        )
+
+    def _should_poll_video_motion(self) -> bool:
+        return bool(self._events & {"All", "VideoMotion"}) and any(
+            getattr(coordinator, "poll_video_motion", False)
+            for coordinator in self.coordinators
+        )
+
+    def _sync_video_motion_poller(self) -> None:
+        wanted = self._should_poll_video_motion()
+        running = (
+            self._video_motion_poll_task is not None
+            and not self._video_motion_poll_task.done()
+        )
+        if wanted and not running:
+            self._video_motion_poll_task = asyncio.create_task(
+                self._async_poll_video_motion()
+            )
+        elif not wanted and running:
+            self._video_motion_poll_task.cancel()
+            self._video_motion_poll_task = None
+
+    async def _async_reconcile_alarm_inputs(self) -> None:
+        """Re-read the alarm terminals when the stream re-attaches (#1090).
+
+        The same problem `_async_reconcile_latched_events` solves, with a
+        better answer available. These terminals have a real state read --
+        `alarm.cgi?action=getInState` returns a bitmask of every active input
+        in one request -- so there is no need to infer anything from
+        `getEventIndexes`, whose empty answer is ambiguous.
+
+        One request, and only on a host that found terminals, so a camera and
+        a recorder without them pay nothing.
+        """
+        coordinator = self._alarm_input_coordinator()
+        if coordinator is None:
+            return
+        try:
+            await coordinator._async_refresh_alarm_input_state()
+        except Exception:  # pylint: disable=broad-except
+            _LOGGER.debug(
+                "Could not re-read the alarm inputs on %s", self._address, exc_info=True
+            )
+
+    async def _async_reconcile_latched_events(self) -> None:
+        """Ask the device about events still showing as on, and close the dead ones.
+
+        Called when the stream is about to re-attach, which is the only moment a
+        Stop can have been lost: the socket was down, the device sent it anyway,
+        and nothing was listening.
+
+        **Costs nothing in the ordinary case.** Nothing is usually latched, so
+        there is nothing to ask about and no request is made. That matters
+        because a failing stream retries often, and this must not add load to a
+        device that is already struggling.
+
+        The hard part is that `getEventIndexes` cannot be taken at face value.
+        Measured on a DHI-NVR5464-16P-EI:
+
+            code=VideoMotion          200  channels[0]=14
+            code=CrossLineDetection   200  Error: No Events
+            code=NotARealCodeAtAll    200  Error: No Events
+
+        A real code with nothing active and a code the endpoint knows nothing
+        about give the **same answer**. So an empty answer is not evidence that
+        an event has ended, and clearing on it would switch off a live sensor
+        for any code the stream reports and this endpoint does not -- the
+        opposite of the bug, and worse.
+
+        So which codes this endpoint actually reports is learned from the device
+        rather than assumed, the same way `event_is_momentary` learns what a
+        Pulse is. A code is trusted only once it has been seen reported as
+        active at least once; until then an empty answer changes nothing.
+
+        That learns itself in the right order. While an event is genuinely on, a
+        reconcile sees it reported, records the code as one this endpoint
+        covers, and clears nothing. The next time the same code is latched and
+        the device does *not* report it, that is a lost Stop and it is closed.
+        """
+        if self._codes_the_device_reports is None:
+            self._codes_the_device_reports = set()
+
+        latched: dict = {}
+        for coordinator in self.coordinators:
+            events = getattr(coordinator, "latched_events", None)
+            if events is None:
+                continue
+            for code, channel in events():
+                latched.setdefault(code, set()).add(channel)
+        if not latched:
+            return
+
+        for code, channels in sorted(latched.items()):
+            try:
+                observed = await self._owner.client.async_get_event_indexes_cgi(code)
+            except Exception as ex:  # pylint: disable=broad-except
+                # A device that will not answer tells us nothing, and nothing is
+                # what we do about it. This runs on a reconnect, which is
+                # frequently a device in trouble.
+                _LOGGER.debug(
+                    "Could not ask %s which %s events are active: %s",
+                    self._address,
+                    code,
+                    ex,
+                )
+                continue
+
+            if observed:
+                # Proof that this endpoint reports this code. Recorded before
+                # the comparison below, so the first genuine activity teaches
+                # us and the lost Stop after it can be closed.
+                self._codes_the_device_reports.add(code)
+
+            if code not in self._codes_the_device_reports:
+                _LOGGER.debug(
+                    "%s reported no active %s events, but has never reported any, "
+                    "so this is not evidence the event ended",
+                    self._address,
+                    code,
+                )
+                continue
+
+            for channel in sorted(channels - observed):
+                _LOGGER.info(
+                    "%s says %s is no longer active on channel %s, so its Stop was "
+                    "lost while the event stream was down. Closing it",
+                    self._address,
+                    code,
+                    channel,
+                )
+                self._dispatch_events(
+                    "Code={0};action=Stop;index={1}\r\n".format(code, channel).encode()
+                )
+
+    async def _async_poll_video_motion(self) -> None:
+        """Synthesize VideoMotion edges from one host-wide state request."""
+        active: set[int] = set()
+        failing = False
+        while True:
+            started = time.monotonic()
+            try:
+                observed = await self._owner.client.async_get_event_indexes_cgi(
+                    "VideoMotion"
+                )
+                for index in sorted(observed - active):
+                    self._dispatch_events(
+                        f"Code=VideoMotion;action=Start;index={index}\r\n".encode(),
+                        video_motion_source="poll",
+                    )
+                for index in sorted(active - observed):
+                    self._dispatch_events(
+                        f"Code=VideoMotion;action=Stop;index={index}\r\n".encode(),
+                        video_motion_source="poll",
+                    )
+                active = observed
+                if failing:
+                    _LOGGER.info(
+                        "VideoMotion state polling for %s recovered", self._address
+                    )
+                failing = False
+            except asyncio.CancelledError:
+                raise
+            except Exception as ex:  # pylint: disable=broad-except
+                if not failing:
+                    _LOGGER.warning(
+                        "VideoMotion state polling for %s failed: %s",
+                        self._address,
+                        ex,
+                    )
+                else:
+                    _LOGGER.debug(
+                        "VideoMotion state polling for %s still failing: %s",
+                        self._address,
+                        ex,
+                    )
+                failing = True
+            await asyncio.sleep(
+                max(0.0, VIDEO_MOTION_POLL_SECONDS - (time.monotonic() - started))
+            )
 
     async def async_stop(self) -> None:
         if self._task is not None:
             self._task.cancel()
             self._task = None
+        if self._video_motion_poll_task is not None:
+            self._video_motion_poll_task.cancel()
+            self._video_motion_poll_task = None
         self._by_channel.clear()
         self._owner = None
         self._events = frozenset()
@@ -862,6 +1325,11 @@ class DahuaHostEventStream:
                 self._failing = False
                 self._consecutive_failures = 0
 
+            # Before going back round. A Stop that arrived while the socket was
+            # down is gone, and the sensor it belonged to is still on.
+            await self._async_reconcile_latched_events()
+            await self._async_reconcile_alarm_inputs()
+
             retry_in = event_stream_retry_delay(
                 stream_lifetime(time.monotonic() - start_time, self._received_data),
                 self._consecutive_failures,
@@ -884,6 +1352,13 @@ class DahuaHostEventStream:
         # know. A camera sitting quietly with nothing to report is not a camera
         # refusing to attach.
         self._received_data = True
+
+        self._dispatch_events(data_bytes, video_motion_source="stream")
+
+    def _dispatch_events(
+        self, data_bytes: bytes, video_motion_source: str | None = None
+    ) -> None:
+        """Parse and dispatch events without changing stream health state."""
 
         events = parse_event(data_bytes.decode("utf-8", errors="ignore"))
         if not events:
@@ -911,6 +1386,13 @@ class DahuaHostEventStream:
                 if code not in self._events and not derives:
                     continue
 
+            # Recorded before any filtering, deliberately. The question this
+            # answers is "does this device push VideoMotion at all", not "did
+            # anyone want that one", so a channel nobody configured still
+            # counts as evidence that the device is capable of it (#728).
+            if video_motion_source == "stream" and event.get("Code") == "VideoMotion":
+                self._seen_pushed_video_motion = True
+
             index = 0
             if "index" in event:
                 try:
@@ -932,6 +1414,36 @@ class DahuaHostEventStream:
             # with more than one channel configured, keeps the existing
             # per-index filtering below untouched: a channel nobody
             # configured must stay silent.
+            # A recorder's alarm terminals are not its cameras (#1090).
+            # `AlarmLocal`'s index is the position in the box's own `Alarm[]`
+            # table -- measured, by making unwired inputs read active -- so
+            # dispatching it through `_by_channel` below delivers terminal 4 to
+            # whichever camera happens to be channel 4. On the recorder here
+            # that lit a safety sensor belonging to a camera pointed at a rear
+            # lane, which has no alarm terminal at all.
+            #
+            # Gated on a coordinator having found terminals at setup, not on
+            # `is_recorder_host()` being true now. The device class can be
+            # answered on a later poll and flip that flag, but the entity set
+            # is decided at setup, so routing on the live flag would send
+            # events to host sensors that do not exist.
+            alarm_host = self._alarm_input_coordinator()
+            if event.get("Code") == "AlarmLocal" and alarm_host is not None:
+                try:
+                    alarm_host.handle_event(dict(event))
+                except Exception:  # pylint: disable=broad-except
+                    # Same reach as every other handler in this loop (#706):
+                    # an unguarded raise here leaves the read loop and takes
+                    # every camera's events down until the retry reconnects.
+                    _LOGGER.warning(
+                        "Unhandled error while handling a %s event from %s; "
+                        "the event is dropped and the stream continues",
+                        event.get("Code", "?"),
+                        self._address,
+                        exc_info=True,
+                    )
+                continue
+
             if event.get("Code") == "AlarmLocal" and len(self._by_channel) == 1:
                 for coordinator in next(iter(self._by_channel.values())):
                     try:
@@ -960,6 +1472,16 @@ class DahuaHostEventStream:
             # A channel nobody has configured stays silent, exactly as it did
             # when every coordinator discarded it.
             for coordinator in self._by_channel.get(index, ()):
+                if event.get("Code") == "VideoMotion":
+                    polling = getattr(coordinator, "poll_video_motion", False)
+                    # Polling is authoritative only for coordinators that opted
+                    # into it. This prevents a partial pushed Start with no Stop
+                    # from leaving their motion sensor on forever, while other
+                    # channels retain the original event-stream behaviour.
+                    if (video_motion_source == "stream" and polling) or (
+                        video_motion_source == "poll" and not polling
+                    ):
+                        continue
                 try:
                     coordinator.handle_event(dict(event))
                 except Exception:  # pylint: disable=broad-except

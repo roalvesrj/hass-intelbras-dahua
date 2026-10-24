@@ -2,6 +2,8 @@
 
 import json
 import re
+
+import aiohttp
 from types import SimpleNamespace
 
 import pytest
@@ -25,10 +27,17 @@ ADDRESS = "10.0.0.1"
 
 @pytest.fixture(autouse=True)
 def _clean_registries():
+    # _HOST_FAILURES is read by the host block now, and conftest.py already
+    # clears it for every test -- it had to, after an address left behind by
+    # another test on the same worker failed two polls at random under -n auto.
+    # Repeated here so this file's assertions do not silently depend on that
+    # fixture staying autouse, which is the only reason they pass.
     dahua_module._HOST_CONNECTORS.clear()
+    dahua_module._HOST_FAILURES.clear()
     client_module._HOST_LIMITS.clear()
     yield
     dahua_module._HOST_CONNECTORS.clear()
+    dahua_module._HOST_FAILURES.clear()
     client_module._HOST_LIMITS.clear()
 
 
@@ -47,6 +56,21 @@ class _Client:
         self._rpc2_session_instance = None
         self._host_limit = client_module._host_limiter(ADDRESS)
         self.identity_derived_from_credentials = False
+
+    async def async_get_config(self, name):
+        """The dump reads Encode to report each stream's codec. Answering with
+        a real shape rather than {} so the parsing is exercised; a test that
+        wants the refused case overrides this."""
+        if name != "Encode":
+            return {}
+        return {
+            "table.Encode[0].MainFormat[0].Video.Compression": "H.265",
+            "table.Encode[0].MainFormat[0].Audio.Compression": "AAC",
+            "table.Encode[0].ExtraFormat[0].Video.Compression": "H.264",
+            "table.Encode[0].ExtraFormat[1].Video.Compression": "H.265",
+            # Another channel's, which must not leak into channel 0's answer.
+            "table.Encode[3].MainFormat[0].Video.Compression": "MJPEG",
+        }
 
     def get_rtsp_stream_url(self, channel, subtype):
         # Present because the real client has it; the dump must never call it.
@@ -80,7 +104,11 @@ class _Coordinator:
         self._supports_disarming_linkage = False
         self._supports_lighting_v2 = True
         self._dahua_event_timestamp = {"VideoMotion-0": 0}
-        self._dahua_event_listeners = {"VideoMotion-0": object()}
+        # A list of callbacks, which is what the coordinator really holds. It was
+        # an opaque `object()` while the dump read only the key names, and the
+        # field now reports how many listeners each key has (#944), so a fake
+        # that does not model the list cannot answer what the dump asks it.
+        self._dahua_event_listeners = {"VideoMotion-0": [lambda event: None]}
         self._vto_task = None
         self._vto_client = None
 
@@ -512,6 +540,83 @@ async def test_another_devices_refusals_are_not_reported_here(hass):
     assert host["rpc2_tables_refused"] == []
 
 
+async def test_a_healthy_host_reports_no_refusals(hass):
+    """Nothing has failed, so the store has no entry for this host at all and
+    every field here is the default rather than a KeyError."""
+    entry = _entry(hass)
+    _install(hass, entry)
+
+    host = (await async_get_config_entry_diagnostics(hass, entry))["host"]
+
+    assert host["auth_refusals"] == 0
+    assert host["auth_refusals_by_source"] == {}
+    assert host["auth_budget_spent"] is False
+    assert host["consecutive_failures"] == 0
+    assert host["failing_since"] is None
+
+
+async def test_a_spent_budget_is_in_the_dump(hass):
+    """The gap this closes. Once the budget is spent the doorbell listener
+    exits, which leaves vto_task_running false and vto_client_connected false --
+    identical to a listener that was never started. The counter that made the
+    decision was recorded and never reported, so a dump could not tell the two
+    apart."""
+    entry = _entry(hass)
+    _install(hass, entry)
+    for _ in range(dahua_module.MAX_AUTH_REFUSALS):
+        dahua_module.async_record_host_auth_refusal(ADDRESS, "vto listener")
+
+    host = (await async_get_config_entry_diagnostics(hass, entry))["host"]
+
+    assert host["auth_refusals"] == dahua_module.MAX_AUTH_REFUSALS
+    assert host["auth_budget_spent"] is True
+    assert host["auth_refusal_budget"] == dahua_module.MAX_AUTH_REFUSALS
+
+
+async def test_the_breakdown_says_which_source_spent_it(hass):
+    """Per source, because that is the difference between a wrong password and a
+    bad moment: twelve channels at one each recovers on the next poll, one
+    source at three does not. The host's number is the worst single source, so
+    without the breakdown a reader cannot tell which case they are looking at."""
+    entry = _entry(hass)
+    _install(hass, entry)
+    dahua_module.async_record_host_auth_refusal(ADDRESS, "vto listener")
+    dahua_module.async_record_host_auth_refusal(ADDRESS, "vto listener")
+    dahua_module.async_record_host_auth_refusal(ADDRESS, "entry-abc")
+
+    host = (await async_get_config_entry_diagnostics(hass, entry))["host"]
+
+    assert host["auth_refusals_by_source"] == {"vto listener": 2, "entry-abc": 1}
+    assert host["auth_refusals"] == 2, "the host's number is the worst one source saw"
+    assert host["auth_budget_spent"] is False
+
+
+async def test_a_success_clears_what_the_dump_reports(hass):
+    """The store is emptied by the first success, so the dump has to go back to
+    zero with it rather than keeping a number nothing will ever clear."""
+    entry = _entry(hass)
+    _install(hass, entry)
+    dahua_module.async_record_host_auth_refusal(ADDRESS, "vto listener")
+    dahua_module.async_record_host_success(hass, ADDRESS)
+
+    host = (await async_get_config_entry_diagnostics(hass, entry))["host"]
+
+    assert host["auth_refusals"] == 0
+    assert host["auth_refusals_by_source"] == {}
+
+
+async def test_another_hosts_refusals_are_not_reported_here(hass):
+    """Keyed per host, like every other field in this block."""
+    entry = _entry(hass)
+    _install(hass, entry)
+    dahua_module.async_record_host_auth_refusal("10.9.9.9", "entry-other")
+
+    host = (await async_get_config_entry_diagnostics(hass, entry))["host"]
+
+    assert host["auth_refusals"] == 0
+    assert host["auth_refusals_by_source"] == {}
+
+
 async def test_the_new_fields_carry_nothing_secret(hass):
     entry = _entry(hass)
     _install(hass, entry)
@@ -522,6 +627,123 @@ async def test_the_new_fields_carry_nothing_secret(hass):
     assert PASSWORD not in dumped
     assert USERNAME not in dumped
     assert SERIAL not in dumped
+
+
+# --- which codec each stream carries ---------------------------------------
+
+
+async def test_it_says_which_codec_each_stream_carries(hass):
+    """The most reported fault in this integration is a camera that shows a
+    still and never a moving picture, and it is H.265 almost every time (#236,
+    #244, #257, #262, #272). Nothing here can fix it -- the remedy is on the
+    device -- but a dump that names the codec answers the question."""
+    entry = _entry(hass)
+    _install(hass, entry)
+
+    streams = (await async_get_config_entry_diagnostics(hass, entry))["streams"]
+
+    assert streams["read"] is True
+    assert streams["main"] == "H.265"
+    assert streams["sub"] == ["H.264", "H.265"]
+    assert streams["h265_anywhere"] is True
+
+
+async def test_the_audio_codec_is_not_reported_as_a_stream(hass):
+    """`Audio.Compression` sits beside `Video.Compression` in the same table --
+    AAC and G.711A on the measured recorder -- and an audio codec in a list of
+    video streams would send somebody looking in the wrong place."""
+    entry = _entry(hass)
+    _install(hass, entry)
+
+    streams = (await async_get_config_entry_diagnostics(hass, entry))["streams"]
+
+    assert "AAC" not in [streams["main"], *streams["sub"]]
+    assert "G.711A" not in [streams["main"], *streams["sub"]]
+
+
+async def test_another_channels_codec_does_not_leak_in(hass):
+    """Encode is a whole-table read covering the host: measured at 2530 keys on
+    a DHI-NVR5464. The fake carries a channel 3 entry that channel 0 must not
+    claim."""
+    entry = _entry(hass)
+    _install(hass, entry)
+
+    streams = (await async_get_config_entry_diagnostics(hass, entry))["streams"]
+
+    assert "MJPEG" not in [streams["main"], *streams["sub"]]
+
+
+async def test_a_device_that_refuses_encode_says_so(hass):
+    """Rather than reporting no streams, which reads the same as a camera with
+    none. A recorder that will not serve Encode is itself worth knowing."""
+
+    class _NoEncode(_Client):
+        async def async_get_config(self, name):
+            raise aiohttp.ClientResponseError(None, (), status=400)
+
+    entry = _entry(hass)
+    coordinator = _Coordinator()
+    coordinator.client = _NoEncode()
+    _install(hass, entry, coordinator)
+
+    streams = (await async_get_config_entry_diagnostics(hass, entry))["streams"]
+
+    assert streams["read"] is False
+    assert "Encode" in streams["why"]
+
+
+async def test_the_codec_is_reported_per_channel_too(hass):
+    """The per channel blocks are the authoritative part for a recorder."""
+    entry = _entry(hass)
+    _install(hass, entry)
+
+    result = await async_get_config_entry_diagnostics(hass, entry)
+
+    assert result["channels"][0]["streams"]["main"] == "H.265"
+
+
+# --- whether the device class is an answer or an outstanding question -------
+
+
+async def test_a_device_that_declines_to_say_its_class_is_distinguishable(hass):
+    """Settled: the device answered, with nothing. Nothing is still asking."""
+    entry = _entry(hass)
+    coordinator = _install(hass, entry)
+    coordinator._device_class = ""
+    coordinator._device_class_unanswered = False
+
+    device = (await async_get_config_entry_diagnostics(hass, entry))["device"]
+
+    assert device["device_class"] == ""
+    assert device["device_class_unanswered"] is False
+
+
+async def test_a_device_class_still_being_asked_for_says_so(hass):
+    """The gap this closes. Both cases dump `device_class: ""`, and the rebadged
+    doorbells are the devices that field exists to learn about, so a reader who
+    cannot tell a device that declines from one still being asked cannot use
+    the answer either way."""
+    entry = _entry(hass)
+    coordinator = _install(hass, entry)
+    coordinator._device_class = ""
+    coordinator._device_class_unanswered = True
+
+    device = (await async_get_config_entry_diagnostics(hass, entry))["device"]
+
+    assert device["device_class"] == ""
+    assert device["device_class_unanswered"] is True
+
+
+async def test_a_device_that_answered_is_not_reported_as_outstanding(hass):
+    entry = _entry(hass)
+    coordinator = _install(hass, entry)
+    coordinator._device_class = "VTO"
+    coordinator._device_class_unanswered = False
+
+    device = (await async_get_config_entry_diagnostics(hass, entry))["device"]
+
+    assert device["device_class"] == "VTO"
+    assert device["device_class_unanswered"] is False
 
 
 # --- what the channel numbering probe concluded -----------------------------
@@ -593,3 +815,117 @@ async def test_a_client_without_a_device_key_does_not_break_diagnostics(hass):
     device = (await async_get_config_entry_diagnostics(hass, entry))["device"]
 
     assert device["device_is_zero_indexed"] is None
+
+
+# --- whether reboot detection is running at all ------------------------------
+#
+# #1039. A device that refuses magicBox.getUpTime is asked once and then left
+# alone, which is right: that refusal used to tear down the shared RPC2 login
+# and cost most of the integration's login traffic on a recorder. What it also
+# does is switch a feature off for the life of the entry, and nothing said so.
+# The latch lives in memory, the refusal is logged at debug, and the
+# illuminator simply stops restoring a camera's lighting scheme after a reboot.
+#
+# Driven through the real host function rather than by writing the state dict
+# by hand, so a field renamed on one side of this fails here.
+
+
+class _UptimeHost:
+    """The two things `_async_get_host_uptime_generation` reads."""
+
+    def __init__(self, answers):
+        self._address = ADDRESS
+        self._answers = list(answers)
+        self.client = SimpleNamespace(async_get_uptime_last=self._read)
+
+    async def _read(self):
+        answer = self._answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+
+async def _host_uptime(answers):
+    """Run the real read once per answer.
+
+    The dedupe window is cleared *between* reads and not after the last one:
+    `last_read` is what tells the dump this host has been asked at all, and a
+    helper that zeroed it at the end would be answering its own question.
+    """
+    from custom_components.dahua import host as host_module
+
+    host = _UptimeHost(answers)
+    for index in range(len(answers)):
+        if index:
+            host_module._HOST_UPTIME_STATE[ADDRESS]["last_read"] = 0.0
+        await host_module._async_get_host_uptime_generation(host)
+
+
+async def test_a_host_nobody_has_asked_is_not_reported_as_refusing(hass):
+    """Before the first read, "off" and "no reboot seen" look identical, and
+    the dump has to be able to tell them apart."""
+    entry = _entry(hass)
+    _install(hass, entry)
+
+    host = (await async_get_config_entry_diagnostics(hass, entry))["host"]
+
+    assert host["reboot_detection_unsupported"] is False
+    assert host["host_uptime_read"] is False
+    assert host["host_uptime_last"] is None
+    assert host["reboot_generation"] == 0
+
+
+async def test_a_host_that_refuses_the_read_says_reboot_detection_is_off(hass):
+    """The recorder and the doorbell measured in #1039 both answer
+    `code=268632080` with an empty message, which is "served, not supported on
+    this platform" rather than a session problem."""
+    from custom_components.dahua.rpc2 import Rpc2MethodRefused
+
+    entry = _entry(hass)
+    _install(hass, entry)
+    await _host_uptime([Rpc2MethodRefused("getUpTime", code=268632080, message="")])
+
+    host = (await async_get_config_entry_diagnostics(hass, entry))["host"]
+
+    assert host["reboot_detection_unsupported"] is True
+    assert host["reboot_generation"] == 0
+    assert host["host_uptime_last"] is None
+
+
+async def test_a_host_that_answers_reports_its_sample(hass):
+    entry = _entry(hass)
+    _install(hass, entry)
+    await _host_uptime([1038879, 1038999])
+
+    host = (await async_get_config_entry_diagnostics(hass, entry))["host"]
+
+    assert host["reboot_detection_unsupported"] is False
+    assert host["host_uptime_read"] is True
+    assert host["host_uptime_last"] == 1038999
+    assert host["reboot_generation"] == 0
+
+
+async def test_a_reboot_shows_up_as_a_generation(hass):
+    """Uptime going backwards is the whole signal."""
+    entry = _entry(hass)
+    _install(hass, entry)
+    await _host_uptime([1038879, 42])
+
+    host = (await async_get_config_entry_diagnostics(hass, entry))["host"]
+
+    assert host["reboot_generation"] == 1
+    assert host["host_uptime_last"] == 42
+
+
+async def test_silence_does_not_switch_the_feature_off(hass):
+    """A device that did not answer has said nothing about what it supports,
+    and reading that as a definite no is the #724 mistake. The dump has to
+    agree with the latch, or it would report a healthy host as unsupported."""
+    entry = _entry(hass)
+    _install(hass, entry)
+    await _host_uptime([TimeoutError()])
+
+    host = (await async_get_config_entry_diagnostics(hass, entry))["host"]
+
+    assert host["reboot_detection_unsupported"] is False
+    assert host["host_uptime_read"] is True, "it was asked, and said nothing"

@@ -243,6 +243,7 @@ def _setup_coordinator(
         supports_day_night_color=lambda: day_night,
         supports_infrared_light=lambda: infrared,
         supports_smart_motion_detection=lambda: False,
+        supports_lighting_schemes=lambda: False,
         is_indoor_monitor=lambda: False,
         is_indoor_monitor_without_video=lambda: no_video,
         reported_device_class=lambda: device_class,
@@ -268,7 +269,17 @@ async def _added(
     if coordinator is None:
         coordinator = _setup_coordinator(answer, day_night, infrared, no_video)
     hass = type("H", (), {"data": {}})()
-    entry = type("E", (), {"entry_id": "e1", "runtime_data": {0: coordinator}})()
+    # async_on_unload because setup now keeps a listener for capabilities that
+    # turn up on a later poll, and registers it to be dropped with the entry.
+    entry = type(
+        "E",
+        (),
+        {
+            "entry_id": "e1",
+            "runtime_data": {0: coordinator},
+            "async_on_unload": lambda self, unsub: None,
+        },
+    )()
 
     added = []
     await select_module.async_setup_entry(hass, entry, adds_entities(added))

@@ -5,7 +5,9 @@ import logging
 
 import voluptuous as vol
 from homeassistant.components.repairs import ConfirmRepairFlow, RepairsFlow
+from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import issue_registry as ir
 
 from .const import CONF_PORT, CONF_USE_HTTPS, DOMAIN
@@ -28,6 +30,8 @@ async def async_create_fix_flow(
         return SwitchToHttpsRepairFlow(data or {})
     if issue_id.startswith("siblings_remain_"):
         return RemoveSiblingsRepairFlow(data or {})
+    if issue_id.startswith("leftover_rows_"):
+        return RemoveLeftoverRowsRepairFlow(data or {})
     return ConfirmRepairFlow()
 
 
@@ -108,6 +112,33 @@ class RemoveSiblingsRepairFlow(RepairsFlow):
             )
             return self.async_abort(reason="not_configured")
 
+        # Split once, and used by both the form and the removal below, because
+        # they disagreed: the loop skipped a merged entry while the form counted
+        # and named it. So the card said "This removes the remaining 3 for you"
+        # and listed an entry it would not touch -- and where every entry was
+        # protected it removed nothing, said it had succeeded, and left the only
+        # explanation in the log. For the one irreversible action in this file,
+        # the form has to describe what the button does.
+        removable = [entry for entry in entries if len(channel_configs(entry)) == 1]
+        protected = [entry for entry in entries if len(channel_configs(entry)) > 1]
+
+        if not removable:
+            # Nothing this card can do. Saying so is the point: reporting
+            # success for having removed nothing is worse than the card not
+            # existing, because the user believes the recorder is gone.
+            _LOGGER.warning(
+                "Not removing anything for %s: the %d entries left each hold "
+                "every channel of the recorder, so none of them is a leftover. "
+                "Remove it from the integrations page if that is really what "
+                "you want",
+                self._address,
+                len(protected),
+            )
+            ir.async_delete_issue(
+                self.hass, DOMAIN, ISSUE_SIBLINGS_REMAIN.format(self._address)
+            )
+            return self.async_abort(reason="nothing_to_remove")
+
         if user_input is not None:
             # A merged recorder is never a leftover. This card offers to finish a
             # deletion the user started, and the entries it is for are the other
@@ -129,20 +160,17 @@ class RemoveSiblingsRepairFlow(RepairsFlow):
             # after that change would have read as a merged recorder and been
             # protected from a card the user had asked for. Counting says what the
             # guard has always meant, and is right under either shape.
-            merged = [entry for entry in entries if len(channel_configs(entry)) > 1]
-            if merged:
+            if protected:
                 _LOGGER.error(
                     "Not removing %s for %s: it holds every channel of the "
                     "recorder on one entry, so it is not a leftover and removing "
                     "it would delete every entity the recorder has. Remove it from "
                     "the integrations page if that is really what you want",
-                    ", ".join(sorted(e.title or "untitled" for e in merged)),
+                    ", ".join(sorted(e.title or "untitled" for e in protected)),
                     self._address,
                 )
 
-            for entry in entries:
-                if len(channel_configs(entry)) > 1:
-                    continue
+            for entry in removable:
                 await self.hass.config_entries.async_remove(entry.entry_id)
                 # Same reason the HTTPS flow staggers its reloads: a Dahua web
                 # server does not enjoy eleven simultaneous teardowns.
@@ -158,9 +186,139 @@ class RemoveSiblingsRepairFlow(RepairsFlow):
             data_schema=vol.Schema({}),
             description_placeholders={
                 "address": str(self._address),
-                "count": str(len(entries)),
-                "titles": ", ".join(sorted(e.title or "untitled" for e in entries)),
+                # What will actually go, not what is at this address. A
+                # protected entry is named in its own sentence below instead.
+                "count": str(len(removable)),
+                "titles": ", ".join(sorted(e.title or "untitled" for e in removable)),
                 "removed": str(self._removed),
                 "dependents_note": self._dependents_note,
+                # Built here as prose rather than as a translated string, the
+                # same way dependents_note is: a whole sentence or nothing, so
+                # the screen reads correctly either way.
+                "protected_note": (
+                    (
+                        "%s holds every channel of the recorder on one entry, so "
+                        "it is not a leftover and is left alone. Remove it from "
+                        "the integrations page if that is really what you want."
+                        % ", ".join(sorted(e.title or "untitled" for e in protected))
+                    )
+                    if protected
+                    else ""
+                ),
+            },
+        )
+
+
+class RemoveLeftoverRowsRepairFlow(RepairsFlow):
+    """Remove the registry rows of one entry that no entity is behind.
+
+    Home Assistant already offers this one entity at a time, on each one's own
+    settings page. @kmich hit a monitor's worth at once, left behind when
+    switches an earlier release created on a VTH were gated off, and doing
+    that by hand twenty times is the thing this saves.
+
+    **Written to prefer doing nothing.** Missing a leftover costs a user one
+    entity to delete themselves; offering a live one is a bulk delete of
+    entities somebody is using, which is what the #827 merge card did when it
+    deleted 232 of them. So the list is never carried in the card's `data`,
+    which is how that card outlived its evidence: it is recomputed here, at
+    the moment the button is pressed, from the same function that raised the
+    card. Anything that has come back since is simply not in it any more.
+    """
+
+    def __init__(self, data: dict) -> None:
+        self._entry_id = data.get("entry_id")
+        self._shown_rows = None
+
+    async def async_step_init(self, user_input: dict | None = None):
+        return await self.async_step_confirm()
+
+    async def async_step_confirm(self, user_input: dict | None = None):
+        # Imported here rather than at module scope to avoid a circular import.
+        from . import ISSUE_LEFTOVER_ROWS, entry_coordinators
+        from .migrate import _entry_is_wholly_healthy, leftover_rows
+
+        entry = self.hass.config_entries.async_get_entry(self._entry_id or "")
+        if entry is None:
+            ir.async_delete_issue(
+                self.hass, DOMAIN, ISSUE_LEFTOVER_ROWS.format(self._entry_id)
+            )
+            return self.async_abort(reason="not_configured")
+
+        # Health is re-checked here, not only where the card was raised.
+        #
+        # Found by @kmich reviewing this, with a repro. Unloading an entry
+        # writes every one of its rows as unavailable with `restored: True`
+        # (`Entity.async_remove`, the `write_unavailable_state` branch), which
+        # `leftover_rows` cannot tell from a real leftover. So between an
+        # unload and the end of the next setup -- a window that is tens of
+        # seconds on a slow monitor, and unbounded if that setup raises
+        # `ConfigEntryNotReady` -- every live entity of the entry reads as a
+        # leftover, and a card raised earlier while everything was healthy was
+        # still there to be pressed. It removed the lot.
+        #
+        # The card being recomputed at the button was not enough on its own:
+        # it recomputed from a registry that was lying. This asks the question
+        # the detection cannot answer, which is whether the integration is
+        # currently the reason those rows have no entity.
+        if entry.state is not ConfigEntryState.LOADED or not _entry_is_wholly_healthy(
+            self.hass, entry, list(entry_coordinators(entry).values())
+        ):
+            _LOGGER.debug(
+                "Not offering leftover rows for %s: the entry is %s and every row "
+                "of an entry that is not fully up reads as a leftover",
+                entry.title,
+                entry.state,
+            )
+            ir.async_delete_issue(
+                self.hass, DOMAIN, ISSUE_LEFTOVER_ROWS.format(entry.entry_id)
+            )
+            return self.async_abort(reason="not_loaded")
+
+        rows = leftover_rows(self.hass, entry)
+        if not rows:
+            # Everything came back, or somebody deleted them by hand. Saying so
+            # beats reporting success for having removed nothing, which is how
+            # a user ends up believing a tidy-up happened.
+            ir.async_delete_issue(
+                self.hass, DOMAIN, ISSUE_LEFTOVER_ROWS.format(entry.entry_id)
+            )
+            return self.async_abort(reason="nothing_to_remove")
+
+        if (
+            user_input is not None
+            and self._shown_rows is not None
+            and set(rows).issubset(self._shown_rows)
+        ):
+            registry = er.async_get(self.hass)
+            for entity_id in rows:
+                # Re-read each one. The list was taken moments ago, but this is
+                # the irreversible step and a row that has gone in between must
+                # not raise out of a repair flow.
+                if registry.async_get(entity_id) is None:
+                    continue
+                registry.async_remove(entity_id)
+            _LOGGER.warning(
+                "Removed %d Dahua registry entries nothing was behind any more: %s",
+                len(rows),
+                ", ".join(rows),
+            )
+            ir.async_delete_issue(
+                self.hass, DOMAIN, ISSUE_LEFTOVER_ROWS.format(entry.entry_id)
+            )
+            return self.async_create_entry(data={})
+
+        # A newly missing row must be shown before any confirmation can act
+        # on it. Retain this only within the current flow, never in the issue.
+        self._shown_rows = set(rows)
+        return self.async_show_form(
+            step_id="confirm",
+            data_schema=vol.Schema({}),
+            description_placeholders={
+                "name": entry.title or "untitled",
+                "count": str(len(rows)),
+                # Named in full. This is the one irreversible action here, and
+                # a count alone asks somebody to trust a number.
+                "entities": "\n".join("- `%s`" % entity_id for entity_id in rows),
             },
         )

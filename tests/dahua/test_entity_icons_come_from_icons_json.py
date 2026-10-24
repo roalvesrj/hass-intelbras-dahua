@@ -28,9 +28,11 @@ PLATFORMS = (
     "camera",
     "event",
     "light",
+    "number",
     "select",
     "sensor",
     "switch",
+    "update",
 )
 
 # The mdi name each entity's code produced before it moved. Home Assistant shows
@@ -38,10 +40,16 @@ PLATFORMS = (
 # dashboard somebody arranged.
 WAS = {
     ("binary_sensor", "authorized_vehicle"): "mdi:car-check",
+    ("switch", "vth_silence"): "mdi:bell-off",
     ("select", "day_night_mode"): "mdi:theme-light-dark",
+    ("select", "lighting_scheme"): "mdi:lightbulb-auto",
     ("sensor", "license_plate"): "mdi:car-back",
+    ("sensor", "memory_used"): "mdi:memory",
+    ("sensor", "processor_usage"): "mdi:cpu-64-bit",
     ("sensor", "profile"): "mdi:theme-light-dark",
     ("switch", "alarm_output"): "mdi:alarm-light",
+    ("switch", "cloud_connection"): "mdi:cloud-outline",
+    ("switch", "intelli_tour"): "mdi:rotate-360",
     ("switch", "disarming"): "mdi:alarm-check",
     ("switch", "event_notifications"): "mdi:bell-ring",
     ("switch", "motion_detection"): "mdi:motion-sensor",

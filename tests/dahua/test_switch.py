@@ -75,10 +75,55 @@ class _Coordinator:
     def uses_rpc2_deterrence(self, dahua_type=None):
         return False
 
+    def supports_event_notifications(self):
+        """Its own table now, rather than riding on the linkage answer.
+
+        A VTO2000A answers HTTP 500 to both of those getConfig reads while
+        serving MotionDetect, so the two switches it was given could only ever
+        read off. switch.py asks about each table separately since.
+        """
+        return False
+
+    def supports_cloud_connection(self):
+        """Whether the device reports VSP_PaaS, which the cloud switch writes.
+
+        Off here: that switch is the box's rather than this channel's, and the
+        setup this double drives is about the per-channel ones. Its own file
+        covers which channel carries it (#591).
+        """
+        return self.states.get("has_cloud_connection", False)
+
+    def supports_vth_phone_setting(self, field):
+        """Whether this device reported an indoor monitor's call setting (#949).
+
+        Driven from `states` like the rest, so a case can turn the monitor's
+        do-not-disturb switch on without the double growing a second shape.
+        Off by default: these are cameras and recorders.
+        """
+        return field in self.states.get("vth_phone_fields", ())
+
+    def supports_intelli_tour(self):
+        """Whether this channel reports IntelliTour, which the tour switch writes.
+
+        Off unless a test says otherwise: the tour belongs to a PTZ channel and
+        most channels do not have one. Its own file covers the rest (#1051).
+        """
+        return self.states.get("has_intelli_tour", False)
+
+    def uses_separate_host_device(self):
+        """Only read when the cloud switch is created, to decide whether it is
+        filed under the channel's subentry or the entry itself."""
+        return False
+
     def get_ivs_rules(self):
         return []
 
     def get_serial_number(self):
+        return "SERIAL1"
+
+    def get_device_serial_number(self):
+        """The box's serial, with no channel on it. On channel 0 of anything
+        it is the same string, which is this double."""
         return "SERIAL1"
 
     def get_address(self):
@@ -101,8 +146,16 @@ class _Coordinator:
     def supports_alarm_output(self):
         return self.states.get("has_alarm_output", False)
 
-    def is_alarm_output_on(self):
-        return self.states.get("alarm_output", False)
+    def is_alarm_output_on(self, output=0):
+        return output in self.states.get("alarm_outputs_on", set())
+
+    def get_alarm_output_slots(self):
+        return self.states.get("alarm_output_slots", 1)
+
+    def get_alarm_output_name(self, output=0):
+        return self.states.get("alarm_output_names", {}).get(
+            output, "Alarm output %d" % (output + 1)
+        )
 
     def is_motion_detection_enabled(self):
         return self.states.get("motion", False)
@@ -290,9 +343,16 @@ async def test_setup_asks_the_device_nothing():
     coordinator.supports_siren = lambda: False
     coordinator.supports_smart_motion_detection = lambda: False
     coordinator.supports_disarming_linkage = lambda: True
+    coordinator.supports_event_notifications = lambda: True
 
     hass = SimpleNamespace(data={})
-    entry = SimpleNamespace(entry_id="e1", options={}, runtime_data={0: coordinator})
+    entry = SimpleNamespace(
+        entry_id="e1",
+        options={},
+        runtime_data={0: coordinator},
+        # Setup keeps a listener for capabilities that turn up on a later poll.
+        async_on_unload=lambda unsub: None,
+    )
     added = []
 
     # The decision is what changed here, not how the entities are built.
@@ -334,13 +394,62 @@ async def test_the_disarming_switches_follow_what_the_device_answered():
     ):
         await switch_module.async_setup_entry(
             hass,
-            SimpleNamespace(entry_id="e1", options={}, runtime_data={0: coordinator}),
+            SimpleNamespace(
+                entry_id="e1",
+                options={},
+                runtime_data={0: coordinator},
+                async_on_unload=lambda unsub: None,
+            ),
             adds_entities(added),
         )
 
     assert "disarming" not in added
     assert "notifications" not in added
     assert coordinator.client.calls == []
+
+
+async def test_each_disarming_switch_follows_its_own_table():
+    """DisableLinkage and DisableEventNotify are two tables, and a device may
+    serve one of them. Both switches were created from the linkage answer, so
+    a device that serves only that one got a notifications switch reading a
+    key it never reports.
+
+    Measured on the hardware here: a VTO2000A answers HTTP 500 to both reads
+    while serving MotionDetect, and a DHI-NVR5464-16P-EI answers 200 to both.
+    Neither is the mixed case, which is why it is asserted rather than
+    assumed.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from custom_components.dahua import switch as switch_module
+
+    coordinator = _Coordinator()
+    coordinator.supports_siren = lambda: False
+    coordinator.supports_smart_motion_detection = lambda: False
+    coordinator.supports_disarming_linkage = lambda: True
+    coordinator.supports_event_notifications = lambda: False
+
+    added = []
+    with patch.multiple(
+        switch_module,
+        DahuaMotionDetectionBinarySwitch=lambda *a, **k: "motion",
+        DahuaDisarmingLinkageBinarySwitch=lambda *a, **k: "disarming",
+        DahuaDisarmingEventNotificationsLinkageBinarySwitch=lambda *a, **k: "notifications",
+    ):
+        await switch_module.async_setup_entry(
+            SimpleNamespace(data={}),
+            SimpleNamespace(
+                entry_id="e1",
+                options={},
+                runtime_data={0: coordinator},
+                async_on_unload=lambda unsub: None,
+            ),
+            adds_entities(added),
+        )
+
+    assert "disarming" in added
+    assert "notifications" not in added
 
 
 # --- the alarm output relay ---------------------------------------------------
@@ -401,13 +510,29 @@ def test_two_alarm_outputs_do_not_share_an_entity():
 
 
 def test_the_alarm_output_reports_the_physical_state():
+    """Read back from the device, never from what was last written: these
+    boxes accept a write, answer OK and drive nothing."""
     c = _Coordinator()
     s = _switch(DahuaAlarmOutputSwitch, c)
     s._output = 0
 
     assert s.is_on is False
-    c.states["alarm_output"] = True
+    c.states["alarm_outputs_on"] = {0}
     assert s.is_on is True
+
+
+def test_each_relay_reports_its_own_state():
+    """`getOutState` is one bitmask covering every relay, so a switch that
+    ignored its own index would show all six as whatever the first one is."""
+    c = _Coordinator()
+    c.states["alarm_outputs_on"] = {5}
+    first = _switch(DahuaAlarmOutputSwitch, c)
+    first._output = 0
+    sixth = _switch(DahuaAlarmOutputSwitch, c)
+    sixth._output = 5
+
+    assert first.is_on is False
+    assert sixth.is_on is True
 
 
 # --- privacy mode -------------------------------------------------------------
@@ -479,11 +604,18 @@ async def _added_for(coordinator):
         "supports_siren",
         "supports_smart_motion_detection",
         "supports_disarming_linkage",
+        "supports_event_notifications",
     ):
         if not hasattr(coordinator, name):
             setattr(coordinator, name, lambda: False)
 
-    entry = SimpleNamespace(entry_id="e1", options={}, runtime_data={0: coordinator})
+    entry = SimpleNamespace(
+        entry_id="e1",
+        options={},
+        runtime_data={0: coordinator},
+        # Setup keeps a listener for capabilities that turn up on a later poll.
+        async_on_unload=lambda unsub: None,
+    )
     added = []
     with patch.multiple(
         switch_module,
@@ -493,6 +625,9 @@ async def _added_for(coordinator):
         DahuaSmartMotionDetectionBinarySwitch=lambda *a, **k: "smart",
         DahuaPrivacyModeBinarySwitch=lambda *a, **k: "privacy",
         DahuaAlarmOutputSwitch=lambda *a, **k: "alarm_output",
+        # The multi-relay variant is a different class, because an
+        # entity that names itself cannot also translate its name.
+        DahuaNamedAlarmOutputSwitch=lambda *a, **k: "named_alarm_output",
     ):
         await switch_module.async_setup_entry(
             SimpleNamespace(data={}), entry, adds_entities(added)
@@ -513,7 +648,7 @@ async def test_privacy_mode_is_only_offered_where_the_camera_has_a_cover():
     assert "privacy" in await _added_for(with_cover)
 
 
-async def test_the_alarm_output_is_only_offered_where_there_is_one():
+async def test_the_alarm_output_is_only_offered_where_there_is_a_relay():
     without = _Coordinator()
     without.supports_smart_motion_detection = lambda: False
     assert "alarm_output" not in await _added_for(without)
@@ -522,6 +657,25 @@ async def test_the_alarm_output_is_only_offered_where_there_is_one():
     with_relay.supports_smart_motion_detection = lambda: False
     with_relay.states["has_alarm_output"] = True
     assert "alarm_output" in await _added_for(with_relay)
+
+
+async def test_a_box_with_six_relays_gets_six_switches():
+    """It used to get none: the multi-output `getOutState` encoding was
+    unverified, so a recorder with relays was refused rather than given a
+    switch that might report one as open while it is closed. It is a bitmask,
+    measured, so they are offered now."""
+    c = _Coordinator()
+    c.supports_smart_motion_detection = lambda: False
+    c.states["has_alarm_output"] = True
+    c.states["alarm_output_slots"] = 6
+
+    built = await _added_for(c)
+
+    assert len([name for name in built if name == "named_alarm_output"]) == 6
+    assert "alarm_output" not in built, (
+        "six relays all called the same translated name is why the named "
+        "variant exists"
+    )
 
 
 async def test_smart_motion_is_offered_for_either_flavour():
@@ -549,7 +703,13 @@ async def _switches_for(coordinator):
     coordinator.supports_siren = lambda: False
     coordinator.supports_smart_motion_detection = lambda: False
     coordinator.supports_disarming_linkage = lambda: False
-    entry = SimpleNamespace(entry_id="e1", options={}, runtime_data={0: coordinator})
+    entry = SimpleNamespace(
+        entry_id="e1",
+        options={},
+        runtime_data={0: coordinator},
+        # Setup keeps a listener for capabilities that turn up on a later poll.
+        async_on_unload=lambda unsub: None,
+    )
     added = []
     with patch.multiple(
         switch_module,
@@ -571,3 +731,65 @@ async def test_an_indoor_monitor_without_a_camera_gets_no_motion_detection_switc
 
 async def test_a_camera_still_gets_one():
     assert "motion" in await _switches_for(_Coordinator())
+
+
+# --- naming several relays ----------------------------------------------------
+
+
+def _named(slots, names, output):
+    """The real coordinator's naming rule, with only what it reads set."""
+    from custom_components.dahua import DahuaDataUpdateCoordinator
+
+    coordinator = object.__new__(DahuaDataUpdateCoordinator)
+    coordinator._alarm_output_slots = slots
+    coordinator._alarm_output_names = names
+    return coordinator.get_alarm_output_name(output)
+
+
+def test_a_relay_name_shared_with_another_is_not_used():
+    """Every one of the six on the recorder measured is called "Beep" out of
+    the factory. That is the default for all of them rather than a description
+    of any one, and six entities named "Beep" are worse than six numbered."""
+    beeps = {n: "Beep" for n in range(6)}
+
+    assert _named(6, beeps, 0) == "Alarm output 1"
+    assert _named(6, beeps, 5) == "Alarm output 6"
+
+
+def test_a_relay_somebody_renamed_keeps_its_name():
+    names = {0: "Beep", 1: "Beep", 2: "Gate", 3: "Beep", 4: "Beep", 5: "Beep"}
+
+    assert _named(6, names, 2) == "Gate"
+
+
+def test_its_still_default_neighbours_stay_numbered():
+    """The rule is per relay, not per device: one renamed relay must not stop
+    the other five being told apart."""
+    names = {0: "Beep", 1: "Beep", 2: "Gate", 3: "Beep", 4: "Beep", 5: "Beep"}
+
+    assert _named(6, names, 0) == "Alarm output 1"
+    assert _named(6, names, 3) == "Alarm output 4"
+
+
+def test_the_number_counts_from_one():
+    """The device's own interface numbers its ports from one while the config
+    array is indexed from zero, the same off-by-one as the alarm inputs."""
+    assert _named(6, {}, 0) == "Alarm output 1"
+    assert _named(6, {}, 5) == "Alarm output 6"
+
+
+def test_a_relay_the_device_did_not_name_is_numbered():
+    assert _named(6, {0: ""}, 0) == "Alarm output 1"
+    assert _named(6, {}, 2) == "Alarm output 3"
+
+
+def test_a_single_relay_is_still_translated_not_named():
+    """A device with one relay keeps the name it has always had, in every
+    language it has always had it in. That is the whole reason there are two
+    classes rather than a branch."""
+    c = _Coordinator()
+    c.states["alarm_output_slots"] = 1
+    single = _switch(DahuaAlarmOutputSwitch, c)
+
+    assert single.translation_key == "alarm_output"
+    assert getattr(single, "_attr_name", None) is None

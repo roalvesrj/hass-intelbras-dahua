@@ -75,6 +75,23 @@ def _coordinator():
         # None so the configured-channels sensor is not created here; this
         # double is a camera, not a recorder.
         get_configured_channel_count=lambda: None,
+        # Setup asks every channel this before the per-channel loop, to decide
+        # which one carries the device's processor and memory sensors. False, so
+        # the entities each test below names are the only ones added.
+        supports_system_load=lambda: False,
+        # And this decides whether those sensors go under the channel's
+        # subentry or the entry itself. Never reached while the answer above is
+        # False, but a setup double answers every question its platform asks.
+        uses_separate_host_device=lambda: False,
+        # A channel of a recorder: its entity key carries the suffix, so this
+        # page is the camera's and not the box's. The firmware and serial
+        # sensors read this to decide which identity to report.
+        stands_in_for_the_host=lambda: False,
+        # Nothing read the recorder's slot table for this double, so both fall
+        # back to what the device reports about itself, which is what every
+        # assertion in this file was written against.
+        get_channel_firmware_version=lambda: None,
+        get_channel_serial_number=lambda: None,
     )
     return c
 
@@ -110,8 +127,17 @@ def test_the_profile_sensor_reports_the_named_profile():
     assert _sensor(DahuaProfileSensor, _coordinator()).native_value == "Night"
 
 
-def test_the_serial_sensor_reports_the_device_serial_not_the_entity_key():
-    """Every channel of one NVR is the same box and must say the same serial."""
+def test_the_serial_sensor_reports_a_serial_not_the_entity_key():
+    """`get_serial_number` appends the channel so that each channel's entities
+    get distinct keys. That composite is this integration's bookkeeping and is
+    not a serial number, so it must never be what the sensor shows.
+
+    This used to say "every channel of one NVR is the same box and must say the
+    same serial", which stopped being the behaviour when a channel's device page
+    started describing the camera in that slot. Which identity it reports is
+    covered in test_the_sensors_agree_with_their_page.py; what survives here is
+    that it is a serial either way.
+    """
     value = _sensor(DahuaSerialNumberSensor, _coordinator()).native_value
 
     assert value == "SERIAL1"
@@ -168,7 +194,17 @@ def _setup_coordinator(profile_support, no_video=False):
 
 def _setup(coordinator):
     hass = type("H", (), {"data": {}})()
-    entry = type("E", (), {"entry_id": "e1", "runtime_data": {0: coordinator}})()
+    entry = type(
+        "E",
+        (),
+        {
+            "entry_id": "e1",
+            "runtime_data": {0: coordinator},
+            # Setup keeps a listener for capabilities that turn up on a later
+            # poll, and registers its removal here (#1057).
+            "async_on_unload": staticmethod(lambda unsub: None),
+        },
+    )()
     added = []
     return hass, entry, added
 
@@ -177,6 +213,43 @@ async def test_the_profile_sensor_is_only_added_when_profile_mode_is_supported()
     hass, entry, added = _setup(_setup_coordinator(profile_support=True))
     await sensor_module.async_setup_entry(hass, entry, adds_entities(added))
     assert any(isinstance(s, DahuaProfileSensor) for s in added)
+
+
+async def test_the_profile_sensor_arrives_when_the_probe_finally_answers(hass):
+    """The platform's half of #1057, through the real dispatcher.
+
+    The coordinator asking the Lighting profile again is only half of it:
+    nothing creates the sensor from a late answer unless this platform is
+    listening for one. Driven through the real `hass` and the real
+    dispatcher, because the bug #1063 fixed in the same mechanism was
+    invisible to every test that faked them.
+    """
+    from custom_components.dahua import late
+
+    answered = {"yet": False}
+    coordinator = _setup_coordinator(profile_support=False)
+    coordinator.supports_profile_mode = lambda: answered["yet"]
+    entry = type(
+        "E",
+        (),
+        {
+            "entry_id": "e1",
+            "runtime_data": {0: coordinator},
+            "async_on_unload": staticmethod(lambda unsub: None),
+        },
+    )()
+    added = []
+
+    await sensor_module.async_setup_entry(hass, entry, adds_entities(added))
+    assert not any(isinstance(s, DahuaProfileSensor) for s in added)
+
+    answered["yet"] = True
+    late.async_notify_capability_discovered(hass, "e1", coordinator.get_serial_number())
+    await hass.async_block_till_done()
+
+    assert any(
+        isinstance(s, DahuaProfileSensor) for s in added
+    ), "the device answered and the sensor it gates was not created"
 
 
 async def test_no_profile_sensor_without_profile_support():

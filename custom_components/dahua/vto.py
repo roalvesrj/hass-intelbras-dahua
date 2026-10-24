@@ -11,7 +11,6 @@ import asyncio
 import hashlib
 from json import JSONDecoder
 from typing import Optional, Callable
-from requests.auth import HTTPDigestAuth
 
 PROTOCOLS = {True: "https", False: "http"}
 
@@ -60,9 +59,20 @@ class DahuaVTOClient(asyncio.Protocol):
     base_url: str
     hold_time: int
     lock_status: {}
-    auth: HTTPDigestAuth
     data_handlers: {}
     buffer: bytearray
+
+    # What the device said when it answered the login and granted no session,
+    # or None while nothing has been refused. Declared on the class because the
+    # coordinator reads it off whatever it got back from `create_connection`,
+    # and the retry tests build a stand-in protocol that sets only the two
+    # attributes that loop used to read.
+    login_refused = None
+
+    # Whether close() asked for the disconnect that connection_lost is about to
+    # report. On the class as well as in __init__ because several tests build
+    # this client with object.__new__ and reach close() without it.
+    _closing: bool = False
 
     def __init__(
         self,
@@ -78,7 +88,6 @@ class DahuaVTOClient(asyncio.Protocol):
         self.password = password
         self.is_ssl = is_ssl
         self.base_url = f"{PROTOCOLS[self.is_ssl]}://{self.host}/cgi-bin/"
-        self.auth = HTTPDigestAuth(self.username, self.password)
         self.realm = None
         self.random = None
         self.request_id = 1
@@ -91,6 +100,7 @@ class DahuaVTOClient(asyncio.Protocol):
         self.buffer = bytearray()
 
         self._keep_alive_handle = None
+        self._closing = False
 
         # This is the hook back into HA
         self.on_receive_vto_event = on_receive_vto_event
@@ -181,7 +191,33 @@ class DahuaVTOClient(asyncio.Protocol):
             self.disconnected.set_result(True)
 
     def connection_lost(self, exc):
-        _LOGGER.error("server closed the connection")
+        # The reconnect loop logs the disconnect itself -- "Disconnected from VTO
+        # at <address>, reconnecting in <n>s" -- with the address and the delay,
+        # so all this can usefully add is why, and only when the why is a
+        # failure.
+        #
+        # It used to log "server closed the connection" at ERROR for every one
+        # of the three cases below, including the one where the server did not
+        # close anything and we did. Unloading an entry therefore ended with an
+        # ERROR in the log saying the doorbell had dropped us, which is the
+        # opposite of what happened, and it is the line somebody sees after an
+        # upgrade restart and reports as a fault.
+        # Through getattr because this runs in a transport callback, and several
+        # test files build this client with object.__new__ and set only the few
+        # attributes they are about. An AttributeError raised here would be
+        # swallowed by the event loop rather than failing anything visibly.
+        where = getattr(self, "host", None) or "an unknown address"
+
+        if self._closing:
+            _LOGGER.debug("Closed the VTO connection to %s", where)
+        elif exc is None:
+            # The doorbell ended it cleanly. Worth knowing, not worth shouting:
+            # the loop above says so and reconnects.
+            _LOGGER.debug("The VTO at %s closed the event connection", where)
+        else:
+            _LOGGER.warning(
+                "Lost the event connection to the VTO at %s: %s", where, exc
+            )
 
         if self._keep_alive_handle is not None:
             self._keep_alive_handle.cancel()
@@ -199,6 +235,10 @@ class DahuaVTOClient(asyncio.Protocol):
         itself on every reply, and the doorbell keeps pushing events into an
         entry Home Assistant has already unloaded -- once per reload.
         """
+        # Set before the transport goes, because closing it is what calls
+        # connection_lost, and that is the only way it can tell our own
+        # teardown from the doorbell dropping us.
+        self._closing = True
         if self._keep_alive_handle is not None:
             self._keep_alive_handle.cancel()
             self._keep_alive_handle = None
@@ -275,6 +315,23 @@ class DahuaVTOClient(asyncio.Protocol):
                     self.sessionId = message.get("session")
 
                     self.login()
+                else:
+                    # A device can refuse before it challenges -- an account
+                    # already locked out answers "user or password not valid!"
+                    # here. This branch did nothing at all, so that connection
+                    # sat open until the device dropped it and then reconnected
+                    # at once, because the device had demonstrably spoken. Same
+                    # unbudgeted loop as a refusal after the challenge, one
+                    # round trip earlier.
+                    self.login_refused = (
+                        str(error_message or "").strip() or "the login was refused"
+                    )
+                    _LOGGER.warning(
+                        "The doorbell at %s refused the login before challenging: %s",
+                        self.host,
+                        self.login_refused,
+                    )
+                    self.close()
 
         request_data = {
             "clientType": "",
@@ -293,7 +350,39 @@ class DahuaVTOClient(asyncio.Protocol):
             if message is None:
                 return
             params = message.get("params")
+            if not isinstance(params, dict):
+                # A refused login answers with no params at all, and reading
+                # `keepAliveInterval` off that None raised AttributeError --
+                # inside `data_received`, which logs and swallows it. So a wrong
+                # password produced "Failed to handle message" and nothing else:
+                # no session, no attach, no keepalive, and nothing telling the
+                # caller the credentials were the problem.
+                params = {}
             keep_alive_interval = params.get("keepAliveInterval")
+
+            if keep_alive_interval is None:
+                # The device answered and granted no session. Judged the way
+                # dhip.py judges the same reply: `result: false`, or an error
+                # where a session should be. A reply carrying neither is left
+                # alone -- it is not evidence of a refusal, and the existing
+                # defensive case (params without an interval) must stay a
+                # no-op rather than start costing a lockout budget.
+                error = message.get("error") or {}
+                if message.get("result") is False or error:
+                    self.login_refused = (
+                        str(error.get("message") or "").strip()
+                        or "the device granted no session"
+                    )
+                    _LOGGER.warning(
+                        "The doorbell at %s refused the login: %s",
+                        self.host,
+                        self.login_refused,
+                    )
+                    # Closed rather than left to time out. The caller is parked
+                    # on `disconnected`, and a socket the device holds open
+                    # keeps it waiting for a connection that will never carry
+                    # an event.
+                    self.close()
 
             if keep_alive_interval is not None:
                 self.keep_alive_interval = keep_alive_interval - 5

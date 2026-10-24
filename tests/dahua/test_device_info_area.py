@@ -51,6 +51,40 @@ class _Coordinator:
     def get_firmware_version(self):
         return "2.800.0"
 
+    def get_device_serial_number(self):
+        return SERIAL
+
+    # A recorder now has a device of its own, so device_info asks whether
+    # this channel is still standing in for the box.
+    def uses_separate_host_device(self):
+        return False
+
+    def host_device_identifier(self):
+        return SERIAL + "_host"
+
+    def stands_in_for_the_host(self):
+        """Computed the way the real one is, rather than stated separately."""
+        return (
+            self.get_serial_number() == self.get_device_serial_number()
+            and not self.uses_separate_host_device()
+        )
+
+    # A standalone camera: the recorder's camera table says nothing about it, so
+    # every one of these is None and device_info falls back to what the device
+    # reports about itself. The recorder case is covered in
+    # test_the_camera_behind_the_channel.py.
+    def get_channel_model(self):
+        return None
+
+    def get_channel_serial_number(self):
+        return None
+
+    def get_channel_firmware_version(self):
+        return None
+
+    def get_channel_mac(self):
+        return None
+
     def configured_area_name(self):
         return self._area_name
 

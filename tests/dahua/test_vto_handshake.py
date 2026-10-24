@@ -16,7 +16,9 @@ commented open issue for exactly that reason.
 vto.py was the lowest-covered module in the integration at 31%.
 """
 
+import asyncio
 import json
+import logging
 
 from custom_components.dahua.vto import DahuaVTOClient
 
@@ -35,9 +37,20 @@ class _Transport:
     def __init__(self):
         self.written = []
         self.closing = False
+        self.closed = False
 
     def is_closing(self):
         return self.closing
+
+    def close(self):
+        """The real transport has this and `close()` calls it.
+
+        Without it the client's own guard swallowed an AttributeError and the
+        tests still passed, which would have made "did it close the socket"
+        unaskable.
+        """
+        self.closed = True
+        self.closing = True
 
     def write(self, message):
         self.written.append(message)
@@ -614,6 +627,94 @@ async def test_connection_lost_does_the_same():
     assert client.disconnected.done()
 
 
+async def test_a_disconnect_we_asked_for_is_not_logged_as_a_failure(caplog):
+    """An unload or a reload calls close(), which closes the transport, which is
+    what makes asyncio call connection_lost. Reporting that as the server closing
+    on us put an ERROR in the log for a normal shutdown, and it is the line people
+    see after an upgrade restart and report as a fault."""
+    client = _client()
+    _do_handshake(client)
+
+    with caplog.at_level(logging.DEBUG, logger="custom_components.dahua"):
+        client.close()
+        client.connection_lost(None)
+
+    assert client._closing is True
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING], [
+        r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+    ]
+    # Still said something, so this is not a silent close.
+    assert any("Closed the VTO connection" in r.getMessage() for r in caplog.records)
+
+
+async def test_the_doorbell_closing_it_is_not_a_failure_either(caplog):
+    """`exc is None` with no close() of ours means the far end ended the stream.
+    The reconnect loop logs that, with the address and how long it is waiting, so
+    a second line here at ERROR was a duplicate of a better one."""
+    client = _client()
+    _do_handshake(client)
+
+    with caplog.at_level(logging.DEBUG, logger="custom_components.dahua"):
+        client.connection_lost(None)
+
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("closed the event connection" in r.getMessage() for r in caplog.records)
+
+
+async def test_a_connection_lost_to_an_error_says_which_error(caplog):
+    """The one thing the reconnect loop's own message cannot know. The old line
+    said "server closed the connection" whatever had happened, so a reset, a
+    refused socket and a clean shutdown were indistinguishable in a log."""
+    client = _client()
+    _do_handshake(client)
+
+    with caplog.at_level(logging.DEBUG, logger="custom_components.dahua"):
+        client.connection_lost(OSError("connection reset by peer"))
+
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1, [r.getMessage() for r in warnings]
+    assert "connection reset by peer" in warnings[0].getMessage()
+    assert HOST in warnings[0].getMessage()
+
+
+async def test_a_close_still_cancels_the_keepalive_and_reports_the_disconnect():
+    """The behaviour the log change must not disturb: `disconnected` is what the
+    reconnect loop waits on, and a keepalive scheduled after the socket has gone
+    fires into nothing."""
+    client = _client()
+    _do_handshake(client)
+    assert client._keep_alive_handle is not None
+
+    client.close()
+    client.connection_lost(None)
+
+    assert client._keep_alive_handle is None
+    assert client.disconnected.done()
+
+
+async def test_the_callbacks_survive_a_client_built_without_init(caplog):
+    """`connection_lost` runs inside a transport callback, where an AttributeError
+    is swallowed by the event loop rather than failing anything visibly.
+
+    Several files here build this client with `object.__new__` and set only the
+    attributes they are about -- test_vto_stop.py's close() test is one -- so a
+    message that reads `self.host` breaks on them silently. Written because the
+    first version of this change did exactly that.
+    """
+    client = object.__new__(DahuaVTOClient)
+    client.transport = _Transport()
+    client._keep_alive_handle = None
+    client.disconnected = asyncio.get_running_loop().create_future()
+
+    with caplog.at_level(logging.DEBUG, logger="custom_components.dahua"):
+        client.close()
+        client.connection_lost(None)
+        client.connection_lost(OSError("and again, with a reason"))
+
+    assert client.disconnected.done()
+    assert any("Closed the VTO connection" in r.getMessage() for r in caplog.records)
+
+
 async def test_losing_the_connection_twice_does_not_raise():
     """eof_received and connection_lost both fire on an ordinary close, so the future
     is already resolved the second time. Setting it again would raise InvalidStateError
@@ -797,3 +898,152 @@ async def test_a_transport_that_is_already_gone_does_not_raise_on_connect():
 
     assert client.transport.written == []
     _finish(client)
+
+
+# --- a login the device refuses ---------------------------------------------
+#
+# A refused login answers with no `params` at all, and `handle_login` read
+# `keepAliveInterval` straight off it. That raised AttributeError inside
+# `data_received`, which logs and swallows, so a wrong password produced one
+# "Failed to handle message" line and then nothing: no session, no attach, no
+# keepalive, and nothing anywhere naming the credentials. The socket then sat
+# open until the device dropped it, and because the device *had* spoken, the
+# coordinator read the attempt as a connection that worked and reconnected
+# within ten seconds -- for ever, against a box that locks the source IP for
+# about half an hour after repeated failed logins.
+
+
+def _to_login(client):
+    """Take the client to the point where it has sent the hashed password."""
+    client.connection_made(client.transport)
+    pre_login = _requests_for(client, "global.login")[0]
+    client.data_received(
+        _frame(
+            {
+                "id": pre_login["id"],
+                "session": 1722306858,
+                "error": {
+                    "code": 268632079,
+                    "message": "Component error: login challenge!",
+                },
+                "params": {"random": "1234567890", "realm": "Login to 00408C123456"},
+            }
+        )
+    )
+    return _requests_for(client, "global.login")[1]
+
+
+async def test_a_refused_login_is_recorded_rather_than_swallowed():
+    client = _client()
+    login = _to_login(client)
+
+    client.data_received(
+        _frame(
+            {
+                "id": login["id"],
+                "result": False,
+                "error": {"code": 268632081, "message": "Login error!"},
+            }
+        )
+    )
+
+    assert client.login_refused == "Login error!"
+
+
+async def test_a_refused_login_neither_attaches_nor_starts_a_keepalive():
+    client = _client()
+    login = _to_login(client)
+
+    client.data_received(
+        _frame(
+            {"id": login["id"], "result": False, "error": {"message": "Login error!"}}
+        )
+    )
+
+    assert _requests_for(client, "eventManager.attach") == []
+    assert client._keep_alive_handle is None
+
+
+async def test_a_refused_login_closes_the_connection_rather_than_waiting():
+    """The caller is parked on `disconnected`, and a socket the device holds
+    open keeps it waiting for a connection that will never carry an event."""
+    client = _client()
+    login = _to_login(client)
+
+    client.data_received(
+        _frame(
+            {"id": login["id"], "result": False, "error": {"message": "Login error!"}}
+        )
+    )
+
+    assert client.transport.closed is True
+    assert client.disconnected.done() is True
+
+
+async def test_a_refusal_that_explains_nothing_still_says_something():
+    """`login_refused` is what the coordinator logs, and it decides whether to
+    stop, so it has to be set even when the device gives no message. An empty
+    string there would read as "not refused"."""
+    client = _client()
+    login = _to_login(client)
+
+    client.data_received(_frame({"id": login["id"], "result": False}))
+
+    assert client.login_refused
+    assert isinstance(client.login_refused, str)
+
+
+async def test_a_reply_with_neither_an_interval_nor_an_error_is_not_a_refusal():
+    """The guard on the case above. `test_a_login_reply_without_an_interval_does_not_attach`
+    is deliberately defensive rather than a known device behaviour, so it must
+    not start spending a lockout budget: a reply carrying no verdict is not
+    evidence the credentials were rejected."""
+    client = _client()
+    login = _to_login(client)
+
+    client.data_received(_frame({"id": login["id"], "params": {}}))
+
+    assert client.login_refused is None
+    assert client.transport.closed is False
+    assert client.disconnected.done() is False
+
+
+async def test_a_successful_login_records_no_refusal():
+    """The negative control: nothing above may fire on the happy path."""
+    client = _client()
+    _do_handshake(client)
+    try:
+        assert client.login_refused is None
+        assert client.disconnected.done() is False
+    finally:
+        _finish(client)
+
+
+async def test_a_refusal_before_the_challenge_is_recorded_too():
+    """A device can refuse one round trip earlier than the login proper: an
+    account already locked out answers the pre-login with "user or password not
+    valid!" rather than with a challenge. That branch did nothing at all, so the
+    connection sat open and was then reconnected at once, which is the same
+    unbudgeted loop one step sooner."""
+    client = _client()
+    client.connection_made(client.transport)
+    pre_login = _requests_for(client, "global.login")[0]
+
+    client.data_received(
+        _frame(
+            {
+                "id": pre_login["id"],
+                "error": {
+                    "code": 268632085,
+                    "message": "Component error: user or password not valid!",
+                },
+                "params": {},
+            }
+        )
+    )
+
+    assert client.login_refused == "Component error: user or password not valid!"
+    assert client.transport.closed is True
+    assert client.disconnected.done() is True
+    # And still no second login, which is what the neighbouring test pins.
+    assert len(_requests_for(client, "global.login")) == 1

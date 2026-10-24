@@ -3,82 +3,65 @@ Custom integration to integrate Dahua cameras with Home Assistant.
 """
 
 import asyncio
-from collections import deque
-from typing import Any, Dict
 import logging
-import random
-import re
-import ssl
-import time
 
-from datetime import timedelta
+# Patched as `dahua_module.time` by test_uptime_reboot_detection.py, which is
+# the only reader left after the host and coordinator moves, so it stays a name
+# on this module.
+import time  # noqa: F401  pylint: disable=unused-import
 
-from homeassistant.components.tag import async_scan_tag
-import hashlib
-
-from aiohttp import ClientError, ClientResponseError, ClientSession, TCPConnector
+from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
-from homeassistant.exceptions import ConfigEntryAuthFailed
-from homeassistant.helpers import area_registry as ar
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.device_registry import DeviceEntry
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
-from homeassistant.helpers.typing import ConfigType
 from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 
-from . import dahua_utils
-from .client import (
+# Kept for the same reason as the two blocks further down, and marked the same
+# way: each of these was a public name of this package before the host and
+# coordinator moves, so something may still reach it as
+# `custom_components.dahua.<name>`. This module itself no longer uses them.
+from . import dahua_utils  # noqa: F401  pylint: disable=unused-import
+from .client import (  # noqa: F401  pylint: disable=unused-import
     _HOST_RPC2_EVENT_POLL,
     _HOST_RPC2_EVENT_STATE,
     DahuaClient,
     clear_host_cache,
 )
-from .ivs import ivs_rules_for_channel, ivs_rule_index
+from .ivs import (  # noqa: F401  pylint: disable=unused-import
+    ivs_rules_for_channel,
+    ivs_rule_index,
+)
 
 from .const import (
-    CONF_EVENTS,
-    CONF_PASSWORD,
-    ISSUE_URL,
-    CONF_PORT,
-    CONF_USERNAME,
     CONF_ADDRESS,
+    CONF_CHANNEL,
+    CONF_EVENTS,
+    CONF_LABELS,
     CONF_NAME,
+    CONF_PASSWORD,
+    CONF_PORT,
+    CONF_RTSP_PORT,
+    CONF_REQUIRE_REPORTED_SERIAL,
+    CONF_USERNAME,
+    CONF_USE_HTTPS,
+    DEFAULT_EVENTS,
     DOMAIN,
     PLATFORMS,
-    CAMERA,
-    LIGHT,
-    SELECT,
-    SWITCH,
-    CONF_RTSP_PORT,
     STARTUP_MESSAGE,
-    CONF_CHANNEL,
-    CONF_AUTO_DETECT_CHANNEL,
-    CONF_USE_HTTPS,
-    CONF_SCAN_INTERVAL,
-    CONF_USE_RPC2,
-    CONF_NVR_ACTIVE_DETERRENCE,
-    CONF_MANUAL_SIREN,
-    CONF_MANUAL_SECURITY_LIGHT,
-    CONF_AREA,
-    CONF_AUTHORIZED_PLATES,
-    DEFAULT_EVENTS,
-    CONF_AUTHORIZED_HOLD_TIME,
-    DEFAULT_SCAN_INTERVAL,
-    DEFAULT_AUTHORIZED_HOLD_TIME,
-    MIN_SCAN_INTERVAL,
-    EVENT_DAHUA_ANPR_RECOGNIZED,
 )
-from .dahua_utils import parse_event
-from .deterrence import (
+from .dahua_utils import parse_event  # noqa: F401  pylint: disable=unused-import
+from .deterrence import (  # noqa: F401  pylint: disable=unused-import
     product_definition_supports_security_light,
     product_definition_supports_siren,
     siren_definition_failure_reason,
     security_light_definition_failure_reason,
 )
-from .illuminator_restore import IlluminatorRestoreStore
-from .vto import DahuaVTOClient
+from .illuminator_restore import (  # noqa: F401  pylint: disable=unused-import
+    IlluminatorRestoreStore,
+)
+from .vto import DahuaVTOClient  # noqa: F401  pylint: disable=unused-import
 
 # Imported back rather than left behind. Every one of these was a public
 # name of this package: platforms, entity.py, diagnostics and a good part of
@@ -97,6 +80,7 @@ from .host import (  # noqa: F401  pylint: disable=unused-import
     HOST_UPTIME_DEDUPE_SECONDS,
     HTTPS_PROBE_MIN_INTERVAL,
     ISSUE_HTTP_DEAD_HTTPS_AVAILABLE,
+    ISSUE_MOTION_NOT_PUSHED,
     ISSUE_UNREACHABLE,
     MAX_AUTH_REFUSALS,
     MAX_BACKOFF_DOUBLINGS,
@@ -117,6 +101,7 @@ from .host import (  # noqa: F401  pylint: disable=unused-import
     _async_evaluate_host,
     _async_get_host_uptime_generation,
     _async_probe_tcp,
+    _async_probe_tls,
     _entries_for_address,
     _host_stream,
     _release_connector,
@@ -156,11 +141,15 @@ from .coordinator import (  # noqa: F401  pylint: disable=unused-import
     PULSE_STATE_CODES,
     RECENT_EVENT_COUNT,
     SMART_MOTION_ROW,
+    VIDEO_COLOR_FIELDS,
     WHITE_LIGHT,
+    alarm_input_event_code,
+    alarm_input_index,
     day_night_color_name,
     describe_update_failure,
     door_index,
     doorbell_state,
+    event_payload,
     failure_backoff,
     get_configured_scan_interval,
     illuminator_brightness_bank,
@@ -171,10 +160,63 @@ from .coordinator import (  # noqa: F401  pylint: disable=unused-import
     remote_device_model,
     remote_device_protocol,
     smart_motion_row_indices,
+    video_color_fields,
     vto_retry_state,
 )
 
 WHITE_LIGHT_SCHEME = "WhiteMode"
+
+
+def device_by_identifier(registry, identifier: tuple, entry_id: str):
+    """This config entry's device holding `identifier`, or None.
+
+    `device_registry.async_get_device` is deprecated. Home Assistant reports
+    every call and says it will stop working in 2027.8:
+
+        calls `device_registry.async_get_device`, which is deprecated because
+        device identifiers and connections are no longer unique across config
+        entries; use `async_get_device_by_identifier` ... instead
+
+    Every place this integration asked that question meant "the device of this
+    entry", so the replacement is also the more accurate answer: the old call
+    resolves a shared identifier by preferring a matching domain and then falls
+    back to the first match, which on two entries for one recorder could be the
+    other entry's device.
+
+    One caller does not mean that: `migrate.py` asks whether anybody at all
+    already holds an identifier it is about to write, which is
+    `devices_with_identifier` below. Narrowing that one to this entry would
+    have dropped a check, so it is kept as it was.
+
+    The fallback keeps the 2026.8.0 minimum in `hacs.json` working, and is the
+    behaviour every caller has today. Delete it, and this helper with it, once
+    the minimum is past the release that added the replacement.
+    """
+    by_identifier = getattr(registry, "async_get_device_by_identifier", None)
+    if by_identifier is None:
+        held = registry.async_get_device(identifiers={identifier})
+        return held if held is not None and entry_id in held.config_entries else None
+    return by_identifier(identifier, entry_id)
+
+
+def devices_with_identifier(registry, identifier: tuple) -> list:
+    """Every device holding `identifier`, whichever config entry owns it.
+
+    The other half of the deprecation above, for the one question that really
+    is about every entry: `migrate.py` checks that a serial it is about to
+    write onto a device is not already somebody else's, and an entry scoped
+    answer would say no when the answer is yes.
+
+    A list rather than one device, because that is also what the question
+    needs. `async_get_device` resolved several matches down to one by
+    preferring a matching domain and then taking the first, so a conflict could
+    be hidden behind the device being moved; every match is now seen.
+    """
+    get_devices = getattr(registry, "async_get_devices", None)
+    if get_devices is None:
+        held = registry.async_get_device(identifiers={identifier})
+        return [held] if held is not None else []
+    return list(get_devices(identifiers={identifier}))
 
 
 def scheme_blocking_white_light(data: dict, channel: int, profile_mode):
@@ -435,6 +477,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: DahuaConfigEntry):
             exc_info=True,
         )
 
+    # The recorder's disks used to be enumerated once per channel. Cheap when
+    # there is nothing to do, which is every camera and every already-cleaned
+    # recorder, and it must never stop a device setting up: duplicate entities
+    # are a papercut, cameras being offline is not.
+    try:
+        from .migrate import async_drop_duplicate_disk_sensors
+
+        await async_drop_duplicate_disk_sensors(hass, entry)
+    except Exception:  # pylint: disable=broad-except
+        _LOGGER.exception(
+            "Could not tidy up the duplicate Dahua disk sensors for %s. They are "
+            "disabled by default and harmless, and the integration will set up "
+            "normally",
+            entry.data.get(CONF_ADDRESS),
+        )
+
     # One coordinator per channel. A single camera has one, a merged recorder has
     # one per subentry (#827), and channel_configs hands back the same shape for
     # both so there is a single path here.
@@ -514,8 +572,36 @@ async def async_setup_entry(hass: HomeAssistant, entry: DahuaConfigEntry):
             ", ".join(str(channel) for channel, _ in failures),
         )
 
-    # Home Assistant's own place for per entry runtime state, and it clears the
-    # attribute itself when the entry unloads, so there is nothing to pop.
+    # A new serial must not reach the platforms unless its registry migration
+    # completed. Otherwise an error or unavailable backup creates duplicate
+    # entities and strands automations on the old IDs.
+    try:
+        from .migrate import async_adopt_the_real_serial
+
+        moved = await async_adopt_the_real_serial(hass, entry, coordinators)
+        if any(
+            (getattr(c.client, "_vth_identity", None) or {}).get("class") == "VTH"
+            for c in coordinators
+        ) and not entry.data.get(CONF_REQUIRE_REPORTED_SERIAL):
+            hass.config_entries.async_update_entry(
+                entry, data={**entry.data, CONF_REQUIRE_REPORTED_SERIAL: True}
+            )
+        if moved:
+            _LOGGER.warning(
+                "%s: %d entities adopted the reported serial; entity IDs are unchanged",
+                entry.data.get(CONF_ADDRESS),
+                moved,
+            )
+    except BaseException as error:
+        await asyncio.gather(
+            *[c.async_stop() for c in coordinators], return_exceptions=True
+        )
+        if isinstance(error, Exception):
+            raise ConfigEntryNotReady(
+                "Serial registry migration could not complete: " + str(error)
+            ) from error
+        raise
+
     entry.runtime_data = {c.get_channel(): c for c in coordinators}
 
     # https://developers.home-assistant.io/docs/config_entries_index/
@@ -534,6 +620,47 @@ async def async_setup_entry(hass: HomeAssistant, entry: DahuaConfigEntry):
         coordinator.platforms.extend(wanted)
     if wanted:
         await hass.config_entries.async_forward_entry_setups(entry, wanted)
+
+    # Registry rows nothing is behind any more, offered together rather than
+    # one at a time (@kmich on #1103). After the platforms, because what they
+    # create is the whole evidence, and wrapped like the other registry jobs:
+    # a tidy-up card must never be what stops a camera working.
+    try:
+        from .migrate import (
+            async_offer_leftover_rows,
+            async_recheck_leftover_rows_when_late_work_settles,
+        )
+
+        # Before the offer, not after. A capability that answers on the very
+        # first poll can settle while this coroutine is still awaiting the
+        # scan below, and a listener registered afterwards would miss the one
+        # signal it exists for.
+        async_recheck_leftover_rows_when_late_work_settles(hass, entry, coordinators)
+        left = await async_offer_leftover_rows(hass, entry, coordinators)
+        if left:
+            _LOGGER.debug(
+                "%s has %d registry rows with no entity behind them",
+                entry.data.get(CONF_ADDRESS),
+                left,
+            )
+    except Exception:  # pylint: disable=broad-except
+        _LOGGER.exception(
+            "Could not check %s for leftover registry rows. Nothing is wrong "
+            "with the device and the entry is set up normally",
+            entry.data.get(CONF_ADDRESS),
+        )
+
+    # Labels the user chose for this entry's devices. Home Assistant has no
+    # DeviceInfo field for labels, unlike suggested_area, so they can only be
+    # put on through the registry -- and only once the devices exist, which is
+    # after the platforms have been forwarded.
+    #
+    # Add only here, and that falls out of the helper rather than being a
+    # second rule: nothing has changed since last time, so the "stop asking
+    # for" set is empty and a label somebody removed by hand is not re-added
+    # until they change the option. The options flow passes the real previous
+    # selection and so can also remove.
+    _async_label_devices(hass, entry, coordinators)
 
     # Wrapped, because unloading does not clear an entry's update listeners.
     # A plain add_update_listener leaves one behind on every reload, and then a
@@ -565,6 +692,11 @@ ISSUE_SIBLINGS_REMAIN = "siblings_remain_{0}"
 # Raised when the removed entry was referenced by automations or scripts. Those
 # break silently -- the entities simply stop existing and nothing fires.
 ISSUE_REMOVAL_BROKE_THINGS = "removal_broke_things_{0}"
+# Raised when this entry has registry rows no entity is behind any more, so
+# they can be removed together instead of one at a time. Never persistent: it
+# is recomputed from the registry on every start, and the flow recomputes it
+# again before removing anything.
+ISSUE_LEFTOVER_ROWS = "leftover_rows_{0}"
 
 
 async def async_migrate_synthesised_unique_id(hass, entry) -> None:
@@ -631,8 +763,44 @@ async def async_migrate_synthesised_unique_id(hass, entry) -> None:
     hass.config_entries.async_update_entry(entry, unique_id=wanted)
 
 
+@callback
+def _async_label_devices(hass: HomeAssistant, entry, coordinators) -> None:
+    """Put the entry's chosen labels on each of its devices.
+
+    Quiet about everything: a device that is not in the registry yet, a registry
+    that will not take the update, no labels chosen at all. None of it is worth
+    a camera failing to set up over, which is the mistake #1048 made with a
+    repair card.
+    """
+    chosen = entry.options.get(CONF_LABELS, entry.data.get(CONF_LABELS)) or []
+    if not chosen:
+        return
+    try:
+        registry = dr.async_get(hass)
+        for coordinator in coordinators:
+            device = device_by_identifier(
+                registry, (DOMAIN, coordinator.get_serial_number()), entry.entry_id
+            )
+            if device is None:
+                continue
+            wanted = dahua_utils.labels_for_device(device.labels, chosen, chosen)
+            if wanted != set(device.labels):
+                registry.async_update_device(device.id, labels=wanted)
+    except Exception:  # pylint: disable=broad-except
+        _LOGGER.debug("Could not label the devices for %s", entry.title, exc_info=True)
+
+
 async def async_unload_entry(hass: HomeAssistant, entry: DahuaConfigEntry) -> bool:
     """Handle removal of an entry."""
+    # Before anything else, and before the early return below, because the
+    # card must not outlive the setup that raised it. Unloading writes every
+    # row of this entry as unavailable with `restored: True`, which is
+    # indistinguishable from a leftover, so a card still on screen through a
+    # reload would offer to delete the entry's whole entity set (@kmich on
+    # #1114). The next successful setup raises it again if the leftovers are
+    # still there.
+    ir.async_delete_issue(hass, DOMAIN, ISSUE_LEFTOVER_ROWS.format(entry.entry_id))
+
     channels = entry_coordinators(entry)
     if not channels:
         # Setup may have failed before the coordinator was registered, or a
@@ -697,7 +865,17 @@ def _async_forget_host(hass: HomeAssistant, address: str) -> None:
     Only correct once the last entry for the address has gone. The failure count
     drives the poll backoff and the two issues are per host, so a host that still
     has entries must keep all of it.
+
+    Normalised here rather than trusted from the caller. Six stores and two
+    repair ids are keyed below, every one of them written under
+    `normalize_address`, so one raw address reaching this leaves all six behind
+    for good and withdraws neither card -- and the single caller happens to
+    normalise, which is what makes that a latent bug rather than a reported
+    one. `normalize_address` says "everything host scoped goes through this",
+    and this is one of the two places where that was a claim rather than a
+    fact.
     """
+    address = normalize_address(address)
     _HOST_FAILURES.pop(address, None)
     _HOST_UPTIME_STATE.pop(address, None)
     _HOST_UPTIME_LOCKS.pop(address, None)
@@ -715,6 +893,7 @@ def _async_forget_host(hass: HomeAssistant, address: str) -> None:
         _CAPABILITY_REFUSALS_REPORTED.discard(target)
     ir.async_delete_issue(hass, DOMAIN, ISSUE_UNREACHABLE.format(address))
     ir.async_delete_issue(hass, DOMAIN, ISSUE_HTTP_DEAD_HTTPS_AVAILABLE.format(address))
+    ir.async_delete_issue(hass, DOMAIN, ISSUE_MOTION_NOT_PUSHED.format(address))
 
 
 @callback
@@ -856,7 +1035,67 @@ async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
             address,
         )
 
+    await _async_forget_entry_storage(hass, entry)
+
     _async_report_removal(hass, entry, address, siblings, dependents)
+
+
+async def _async_forget_entry_storage(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Delete the lighting state this entry had stored, and say what it strands.
+
+    Three stores are keyed by config entry id: the lighting-scheme restore
+    modes, the channel snapshots, and one override store per illuminator
+    entity. Removing the entry left all of them in `.storage` for ever, and
+    unreachable with it, because a re-add gets a new entry id.
+
+    The illuminator entities are found through the entity registry, which Home
+    Assistant still has at this point and clears as soon as this hook returns --
+    the same window `_async_dependents` reads in.
+
+    Deliberately forgiving, for the reason that function gives: this is tidying
+    on a teardown path, nothing here is worth failing a removal over, and an
+    exception from a removal hook is only logged anyway.
+
+    A channel whose tables the override still held is named in a warning. Those
+    cameras are left in WhiteMode and the snapshot that was the only way back
+    goes with the entry. Removing an entry always did that; it was silent.
+    """
+    try:
+        # Imported here rather than at module scope: illuminator_restore is a
+        # sibling this module's own importers pull in, and a top-level import
+        # would be circular.
+        from .illuminator_restore import (  # pylint: disable=import-outside-toplevel
+            OVERRIDE_UNIQUE_ID_SUFFIX,
+            async_forget_entry_storage,
+        )
+        from homeassistant.helpers import (  # pylint: disable=import-outside-toplevel
+            entity_registry as er,
+        )
+
+        registry = er.async_get(hass)
+        overrides = [
+            row.unique_id
+            for row in er.async_entries_for_config_entry(registry, entry.entry_id)
+            if row.unique_id.endswith(OVERRIDE_UNIQUE_ID_SUFFIX)
+        ]
+        stranded = await async_forget_entry_storage(hass, entry.entry_id, overrides)
+    except Exception:  # pylint: disable=broad-except
+        _LOGGER.debug(
+            "Could not clear the stored lighting state for %s",
+            entry.entry_id,
+            exc_info=True,
+        )
+        return
+
+    if stranded:
+        _LOGGER.warning(
+            "%s was removed while Home Assistant was holding the white light on "
+            "for channel(s) %s. Those cameras are still forced to white light, "
+            "and the saved copy of their own lighting settings went with the "
+            "entry, so the mode has to be put back on the device itself",
+            entry.title or entry.entry_id,
+            ", ".join(str(channel) for channel in stranded),
+        )
 
 
 @callback
@@ -885,7 +1124,6 @@ def _async_report_removal(
     described = _describe_dependents(dependents)
 
     if siblings:
-        titles = ", ".join(sorted(e.title or "untitled" for e in siblings))
         ir.async_create_issue(
             hass,
             DOMAIN,

@@ -6,11 +6,12 @@ from homeassistant.core import HomeAssistant
 from homeassistant.components.select import SelectEntity
 from homeassistant.const import EntityCategory
 from homeassistant.exceptions import HomeAssistantError
-from custom_components.dahua import DahuaDataUpdateCoordinator, entry_coordinators
+from custom_components.dahua import DahuaDataUpdateCoordinator
 
-from . import dahua_utils
+from . import dahua_utils, entry_coordinators
 from .const import DOMAIN
 from .entity import DahuaBaseEntity
+from .late import async_add_and_keep_watching
 from .infrared import (
     MODE_BY_OPTION,
     OPTION_BY_MODE,
@@ -32,7 +33,16 @@ PARALLEL_UPDATES = 1
 
 async def async_setup_entry(hass: HomeAssistant, entry, async_add_devices):
     """Setup select platform."""
-    for coordinator in entry_coordinators(entry).values():
+
+    async def build(coordinator):
+        """Which selects this channel warrants, as the device answers today.
+
+        Called again when a capability turns up on a later poll, so a camera
+        whose infrared probe timed out at setup gets its Infrared Mode select
+        when the device finally answers rather than at the next reload
+        (#1057). That rebuild re-reads the preset list, which is why the
+        signal names one channel rather than the whole entry.
+        """
         devices = []
 
         if coordinator.is_amcrest_doorbell() and coordinator.supports_security_light():
@@ -96,6 +106,12 @@ async def async_setup_entry(hass: HomeAssistant, entry, async_add_devices):
         if coordinator.supports_infrared_light():
             devices.append(DahuaInfraredModeSelect(coordinator, entry))
 
+        # Only where the camera itself named its modes. Absent on most
+        # channels of a recorder and present-but-false on some, so the probe
+        # returns None rather than a list for both of those.
+        if coordinator.supports_lighting_schemes():
+            devices.append(DahuaLightingSchemeSelect(coordinator, entry))
+
         # The non-Amcrest SmartMotionDetect path only: it carries a Sensitivity
         # word, and supports_smart_motion_detection() is already the per-channel
         # "this channel has a row" signal the enable switch uses.
@@ -110,7 +126,11 @@ async def async_setup_entry(hass: HomeAssistant, entry, async_add_devices):
             for vto in links.get("vtos") or {}:
                 devices.append(DahuaVthCameraLinkSelect(coordinator, entry, vto))
 
-        async_add_devices(devices, config_subentry_id=coordinator.subentry_id)
+        return devices
+
+    await async_add_and_keep_watching(
+        hass, entry, build, async_add_devices, entry_coordinators
+    )
 
 
 async def _async_preset_ids(coordinator):
@@ -488,3 +508,75 @@ class DahuaVthCameraLinkSelect(DahuaBaseEntity, SelectEntity):
                     "option": option,
                 },
             )
+
+
+# The device's own spelling against the slug Home Assistant looks a label up
+# by. Only these three have been seen; anything else the camera reports is
+# offered by its own name rather than hidden, because a mode that exists and
+# cannot be chosen is worse than an untranslated one.
+_SCHEME_OPTIONS = {
+    "InfraredMode": "infrared",
+    "WhiteMode": "white",
+    "AIMode": "smart_dual",
+}
+_SCHEME_BY_OPTION = {option: mode for mode, option in _SCHEME_OPTIONS.items()}
+
+
+class DahuaLightingSchemeSelect(DahuaBaseEntity, SelectEntity):
+    """Which emitter the camera is willing to use: infrared, white, or both.
+
+    A dual-light camera decides its own illumination, and `LightingScheme` is
+    the setting that says which half it may reach for. While it reads
+    `AIMode` or `InfraredMode` the white light stays off whatever is written
+    to `Lighting_V2` -- the value is stored, Home Assistant reports the light
+    on, and nothing lights up (#647). That made the scheme invisible and
+    unreachable from Home Assistant, and this is the control for it.
+
+    `AIMode` is what the web interface calls Smart Dual Light: the camera runs
+    infrared and switches to white when it recognises something. What it will
+    switch for is its own setting, `AIMixLightObjFilterTypes`, and a camera
+    filtering on `Human` alone never lights for a vehicle however this is set.
+
+    Measured on a DHI-NVR5464-16P-EI driving a VSIPP-6DIRMD-I3 on channel 11:
+    all three modes write to all nine scenes channel-scoped and read back, and
+    the original restores cleanly.
+    """
+
+    _attr_translation_key = "lighting_scheme"
+    _attr_entity_category = EntityCategory.CONFIG
+
+    def __init__(self, coordinator: DahuaDataUpdateCoordinator, config_entry):
+        super().__init__(coordinator, config_entry)
+        self._coordinator = coordinator
+        reported = coordinator.get_lighting_schemes() or []
+        # The camera's list, in its order, mapped to slugs where one is known.
+        self._modes = {_SCHEME_OPTIONS.get(mode, mode): mode for mode in reported}
+        self._attr_options = list(self._modes)
+
+    @property
+    def unique_id(self):
+        return self._coordinator.get_serial_number() + "_lighting_scheme"
+
+    @property
+    def current_option(self):
+        """The mode every scene agrees on, or None where they disagree."""
+        mode = self._coordinator.get_lighting_scheme()
+        if mode is None:
+            return None
+        return _SCHEME_OPTIONS.get(mode, mode)
+
+    async def async_select_option(self, option: str) -> None:
+        mode = self._modes.get(option)
+        if mode is None:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="lighting_scheme_unknown",
+                translation_placeholders={
+                    "mode": option,
+                    "known": ", ".join(self._modes),
+                },
+            )
+        await self._coordinator.client.async_set_channel_scoped_lighting_scheme(
+            self._coordinator.get_channel(), mode
+        )
+        await self._coordinator.async_request_refresh()

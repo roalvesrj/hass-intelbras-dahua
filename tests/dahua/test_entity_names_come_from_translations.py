@@ -34,9 +34,11 @@ PLATFORMS = (
     "camera",
     "event",
     "light",
+    "number",
     "select",
     "sensor",
     "switch",
+    "update",
 )
 
 # What each entity's `name` property returned before it was translated. The whole
@@ -45,6 +47,14 @@ PLATFORMS = (
 WAS = {
     ("binary_sensor", "authorized_vehicle"): "Authorized Vehicle",
     ("event", "doorbell"): "Doorbell",
+    ("switch", "vth_silence"): "Do not disturb",
+    ("number", "vth_ring_volume"): "Door station ring volume",
+    ("number", "vth_indoor_ring_volume"): "Indoor ring volume",
+    ("number", "vth_talk_volume"): "Talk volume",
+    ("number", "vth_alarm_volume"): "Alarm volume",
+    ("number", "vth_vto_ring_volume"): "Ring volume for {vto} calls",
+    ("number", "motion_region1_sensitivity"): "Motion region 1 sensitivity",
+    ("number", "motion_region1_threshold"): "Motion region 1 threshold",
     ("button", "reboot"): "Reboot",
     ("button", "open_door"): "Open Door",
     ("button", "cancel_call"): "Cancel Call",
@@ -55,14 +65,31 @@ WAS = {
     # to match. Listed because this table is asserted as equal to the file, which
     # is what makes a rename fail rather than pass quietly.
     ("select", "infrared_mode"): "Infrared Mode",
+    # New with the illumination mode control. Named "Illumination mode"
+    # rather than "Lighting scheme" because the latter is Dahua's word for
+    # it, not one a user would recognise from the camera's own interface.
+    ("select", "lighting_scheme"): "Illumination mode",
     ("select", "smart_motion_sensitivity"): "Smart Motion Sensitivity",
     ("select", "vth_camera_link"): "Camera for {vto} calls",
+    # New in this change, so there is nothing they "was": the table is what
+    # stops a later edit renaming them under somebody.
+    ("sensor", "processor_usage"): "Processor usage",
+    ("sensor", "memory_used"): "Memory used",
     ("sensor", "firmware_version"): "Firmware Version",
     ("sensor", "serial_number"): "Serial Number",
     ("sensor", "profile"): "Profile",
     ("sensor", "configured_channels"): "Configured Channels",
     ("sensor", "license_plate"): "License Plate",
+    # New with the picture adjustments being translated. These are the
+    # words the _attr_name they replaced returned, so no entity is renamed.
+    ("number", "image_brightness"): "Brightness",
+    ("number", "image_contrast"): "Contrast",
+    ("number", "image_saturation"): "Saturation",
+    ("number", "image_hue"): "Hue",
+    ("update", "firmware_update"): "Firmware Update",
     ("switch", "motion_detection"): "Motion Detection",
+    ("switch", "cloud_connection"): "Cloud Connection",
+    ("switch", "intelli_tour"): "AI Tour",
     ("switch", "disarming"): "Disarming",
     ("switch", "event_notifications"): "Event Notifications",
     ("switch", "smart_motion_detection"): "Smart Motion Detection",
@@ -145,6 +172,53 @@ def _keys_passed_in(platform):
     return keys
 
 
+def _keys_in_a_table(platform, table):
+    """The first element of every tuple in a module-level table of keys.
+
+    One class with four instances cannot declare a class attribute per name, and
+    the construction passes a loop variable, so neither of the two scans above
+    finds anything. number.py keeps the literals in IMAGE_ADJUSTMENTS instead:
+    `(translation key, VideoColor field)` per row, the key also being the
+    unique-id suffix.
+
+    Read rather than excluded. A blanket "trust the number platform" subtraction
+    would stop this file noticing a dead `number.*` string, which is the whole
+    point of the second test; parsing the table keeps both directions exact.
+    """
+    tree = ast.parse(io.open(PACKAGE / ("%s.py" % platform), encoding="utf-8").read())
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(
+            isinstance(target, ast.Name) and target.id == table
+            for target in node.targets
+        ):
+            continue
+        rows = getattr(node.value, "elts", [])
+        return {
+            row.elts[0].value
+            for row in rows
+            if getattr(row, "elts", None)
+            and isinstance(row.elts[0], ast.Constant)
+            and isinstance(row.elts[0].value, str)
+        }
+    raise AssertionError(
+        "%s.py has no %s table any more. If its keys moved, point this at the new "
+        "place rather than deleting the call: without it the four picture "
+        "adjustment strings read as dead." % (platform, table)
+    )
+
+
+# Platform modules that name their keys in a table instead of per class.
+KEY_TABLES = (
+    ("number", "IMAGE_ADJUSTMENTS"),
+    # An indoor monitor's volumes (#949), same shape and same reason.
+    ("number", "MONITOR_VOLUMES"),
+    # Motion region 1's sensitivity and threshold (#1115), likewise.
+    ("number", "MOTION_REGION_FIELDS"),
+)
+
+
 def _keys_in_code():
     found = {
         (platform, key): cls.name
@@ -154,6 +228,9 @@ def _keys_in_code():
     for platform in PLATFORMS:
         for key in _keys_passed_in(platform):
             found.setdefault((platform, key), "chosen by %s.py" % platform)
+    for platform, table in KEY_TABLES:
+        for key in _keys_in_a_table(platform, table):
+            found.setdefault((platform, key), "%s in %s.py" % (table, platform))
     return found
 
 

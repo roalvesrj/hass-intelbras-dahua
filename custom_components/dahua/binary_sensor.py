@@ -8,18 +8,22 @@ from homeassistant.components.binary_sensor import (
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.event import async_call_later
-from custom_components.dahua import DahuaDataUpdateCoordinator, entry_coordinators
+from custom_components.dahua import (
+    DahuaDataUpdateCoordinator,
+    alarm_input_event_code,
+    entry_coordinators,
+)
 
 from .const import (
+    ALL_EVENTS,
     MOTION_SENSOR_DEVICE_CLASS,
-    DOMAIN,
     SAFETY_DEVICE_CLASS,
     TAMPER_DEVICE_CLASS,
     CONNECTIVITY_DEVICE_CLASS,
     SOUND_DEVICE_CLASS,
     DOOR_DEVICE_CLASS,
 )
-from .entity import DahuaBaseEntity, DahuaEventDrivenEntity
+from .entity import DahuaBaseEntity, DahuaEventDrivenEntity, DahuaHostEntity
 
 # Override event names. Otherwise we'll generate the name from the event name for example SmartMotionHuman will
 # become "Smart Motion Human"
@@ -29,9 +33,22 @@ NAME_OVERRIDES = {
     "DoorbellPressed": "Button Pressed",  # For VTO/Doorbell devices
 }
 
+# The four codes the platform adds for a doorbell whatever the user selected.
+# A literal, and deliberately so: test_event_sensor_names_are_translated.py
+# finds them by reading the DahuaEventSensor calls in async_setup_entry below,
+# so a fifth added there and not here fails that test. A shared constant would
+# make the two agree by construction and check nothing.
+DOORBELL_EVENTS = frozenset(
+    {"DoorbellPressed", "Invite", "DoorStatus", "CallNoAnswered"}
+)
+
 # Event codes with a name in translations/en.json, so their sensors can be named
-# in any language. ALL_EVENTS plus the four the platform adds for a doorbell, as a
-# literal because the entity has to decide without reading its own translations.
+# in any language: everything a user can select, plus the doorbell four.
+#
+# Derived from ALL_EVENTS rather than repeated. This used to be its own copy of
+# all 41 codes, which meant adding an event code was an edit in two files with
+# nothing to fail if you made only one. `All` is dropped because it is the
+# device's catch-all rather than a code it sends.
 #
 # A code outside this set still gets a sensor: `get_event_list` reads the config
 # entry and nothing stops a hand edited .storage naming something else. It keeps
@@ -39,55 +56,7 @@ NAME_OVERRIDES = {
 # test_event_sensor_names_are_translated.py asserts this matches both the file and
 # the codes the platform can produce, so the fallback cannot be reached by adding
 # a code to ALL_EVENTS and forgetting the string.
-TRANSLATED_EVENTS = frozenset(
-    {
-        "VideoMotion",
-        "VideoLoss",
-        "AlarmLocal",
-        "CrossLineDetection",
-        "CrossRegionDetection",
-        "AudioMutation",
-        "SmartMotionHuman",
-        "SmartMotionVehicle",
-        "VideoBlind",
-        "AudioAnomaly",
-        "VideoMotionInfo",
-        "NewFile",
-        "IntelliFrame",
-        "LeftDetection",
-        "TakenAwayDetection",
-        "VideoAbnormalDetection",
-        "FaceDetection",
-        "FaceRecognition",
-        "HumanTrait",
-        "VideoUnFocus",
-        "WanderDetection",
-        "RioterDetection",
-        "ParkingDetection",
-        "MoveDetection",
-        "StorageNotExist",
-        "StorageFailure",
-        "StorageLowSpace",
-        "AlarmOutput",
-        "InterVideoAccess",
-        "NTPAdjustTime",
-        "TimeChange",
-        "MDResult",
-        "HeatImagingTemper",
-        "CrowdDetection",
-        "FireWarning",
-        "FireWarningInfo",
-        "ObjectPlacementDetection",
-        "ObjectRemovalDetection",
-        "Traffic",
-        "TrafficJunction",
-        "TrafficSnapshot",
-        "DoorbellPressed",
-        "Invite",
-        "DoorStatus",
-        "CallNoAnswered",
-    }
-)
+TRANSLATED_EVENTS = (frozenset(ALL_EVENTS) - {"All"}) | DOORBELL_EVENTS
 
 
 def event_display_name(event_name: str) -> str:
@@ -167,11 +136,106 @@ DEVICE_CLASS_OVERRIDES = {
 PARALLEL_UPDATES = 0
 
 
+def _disk_reporter(coordinators: list):
+    """The one coordinator that carries the recorder's disk sensors.
+
+    `storageDevice.cgi?action=getDeviceAllInfo` takes no channel: the disks
+    belong to the box. A recorder is one entry with a coordinator per channel
+    (#827) and every one of them answered this question, so a twelve channel
+    recorder with four bays grew forty eight entities describing four disks, and
+    filed the recorder's bays under devices named after cameras.
+
+    The lowest channel carries them now, the same arrangement the processor and
+    memory sensors use. Returns None for anything that reports no disks, which
+    is every camera.
+    """
+    answering = [c for c in coordinators if c.get_storage_disks()]
+    if not answering:
+        return None
+    return min(answering, key=lambda c: c.get_channel())
+
+
+def _alarm_input_reporter(coordinators: list):
+    """The one coordinator that carries the recorder's alarm input sensors.
+
+    `Alarm` and `alarm.cgi` take no channel: the terminals are screwed to the
+    back of the box. Only the coordinator that probed them has a list, and the
+    lowest channel wins if more than one did, which is the same rule
+    `_disk_reporter` uses and the same one `host.py` picks the routing target
+    with. The two have to agree: an AlarmLocal handed to a coordinator with no
+    sensors on it updates nothing.
+
+    Returns None for everything that reports no terminals, which is every
+    camera.
+    """
+    # Tolerated rather than demanded: the suite builds coordinators with
+    # object.__new__ and sets only the attributes a test is about, so asking
+    # every double for a method it has never needed turns one new capability
+    # into twenty unrelated failures.
+    answering = [
+        c
+        for c in coordinators
+        if getattr(c, "supports_alarm_inputs", None) and c.supports_alarm_inputs()
+    ]
+    if not answering:
+        return None
+    return min(answering, key=lambda c: c.get_channel())
+
+
 async def async_setup_entry(hass: HomeAssistant, entry, async_add_devices):
     """Setup binary_sensor platform."""
+    # Once for the device, before the per-channel loop. Disabled by default:
+    # diagnostic, and the read that feeds it is a login the device logs, so only
+    # someone who enables it pays for the refresh (#745).
+    reporter = _disk_reporter(list(entry_coordinators(entry).values()))
+    if reporter is not None:
+        async_add_devices(
+            [
+                DahuaDiskProblemBinarySensor(reporter, entry, disk["name"])
+                for disk in reporter.get_storage_disks()
+            ],
+            # The box's own device belongs to the entry, not to one channel's
+            # subentry: the processor is not channel 0's processor. A camera
+            # reporting its SD card has no separate host device, so its
+            # sensors stay where they are, on its own channel.
+            config_subentry_id=(
+                None if reporter.uses_separate_host_device() else reporter.subentry_id
+            ),
+        )
+
+    # The recorder's own alarm input terminals, once for the box (#1090).
+    # These used to arrive as a per-channel AlarmLocal sensor, which put
+    # terminal 4 on whichever camera was channel 4.
+    alarm_reporter = _alarm_input_reporter(list(entry_coordinators(entry).values()))
+    if alarm_reporter is not None:
+        async_add_devices(
+            [
+                DahuaAlarmInputBinarySensor(alarm_reporter, entry, alarm_input)
+                for alarm_input in alarm_reporter.get_alarm_inputs()
+            ],
+            # The terminals belong to the entry, not to one channel's
+            # subentry, for the reason the disks above give.
+            config_subentry_id=(
+                None
+                if alarm_reporter.uses_separate_host_device()
+                else alarm_reporter.subentry_id
+            ),
+        )
+
     for coordinator in entry_coordinators(entry).values():
         sensors: list[BinarySensorEntity] = []
         for event_name in coordinator.get_event_list():
+            # A recorder's alarm terminals have their own sensors above, so
+            # this channel's AlarmLocal sensor has nothing left to show. What
+            # used to feed it was the misdelivery: the terminal number was
+            # read as a channel, and terminal 4 lit whichever camera was
+            # channel 4 (#1090). Not created rather than left to sit at off
+            # for ever -- Home Assistant marks an entity a platform has
+            # stopped providing as unavailable and offers to remove it, which
+            # is visible, where a stale "off" is indistinguishable from a
+            # quiet alarm and will be believed.
+            if event_name == "AlarmLocal" and alarm_reporter is not None:
+                continue
             sensors.append(DahuaEventSensor(coordinator, entry, event_name))
 
         # For doorbells we'll just add these since most people will want them
@@ -187,14 +251,6 @@ async def async_setup_entry(hass: HomeAssistant, entry, async_add_devices):
         # Recognised from a plate, which an indoor monitor without a camera cannot read.
         if not coordinator.is_indoor_monitor_without_video():
             sensors.append(DahuaAuthorizedVehicleBinarySensor(coordinator, entry))
-
-        # One disk-health sensor per physical disk on a recorder. Disabled by
-        # default: it is diagnostic, and the read that feeds it is a logged login,
-        # so only someone who enables it pays for the refresh (#745).
-        for disk in coordinator.get_storage_disks():
-            sensors.append(
-                DahuaDiskProblemBinarySensor(coordinator, entry, disk["name"])
-            )
 
         if sensors:
             async_add_devices(sensors, config_subentry_id=coordinator.subentry_id)
@@ -376,6 +432,73 @@ class DahuaIVSRuleBinarySensor(DahuaEventSensor):
         }
 
 
+class DahuaAlarmInputBinarySensor(DahuaHostEntity, DahuaEventSensor):
+    """One of a recorder's own alarm input terminals (#1090).
+
+    A recorder has screw terminals on its back panel -- sixteen on the
+    DHI-NVR5464-16P-EI measured here -- and they are nothing to do with its
+    cameras. Every one of them arrives as `AlarmLocal` with an `index`, and
+    that index is the position in the box's `Alarm[]` table, not a video
+    channel. Dispatching it as a channel put a garage door contact on a camera
+    pointed at a rear lane.
+
+    So these are host entities: created once for the box, filed against the
+    recorder's own device rather than a camera's.
+
+    **Named by the device, not by this integration.** `Alarm[n].Name` reads
+    `"Alarm-in Port4"` for index 3, which is the label the owner sees in the
+    recorder's web interface and on the chassis. The wire counts from zero and
+    the label counts from one, and the device's own string is the only thing
+    that reconciles them -- so it is used as given, including after somebody
+    renames a terminal to "Garage". The unique id keeps the zero-based index,
+    which is identity rather than description and must not move when a label
+    does.
+    """
+
+    def __init__(self, coordinator, entry, alarm_input: dict):
+        index = alarm_input["index"]
+        DahuaEventSensor.__init__(
+            self, coordinator, entry, alarm_input_event_code(index)
+        )
+        # Assigned, not declared as `_attr_device_class`: DahuaEventSensor has
+        # a `device_class` property reading `_device_class`, which wins over
+        # the attribute and had these reporting `motion`. A contact closing on
+        # a screw terminal is not motion -- it is what the per-channel
+        # AlarmLocal sensor these replace always was.
+        self._device_class = SAFETY_DEVICE_CLASS
+        self._alarm_index = index
+        self._alarm_enabled = alarm_input.get("enabled", True)
+        # The device's serial rather than get_serial_number(), which appends
+        # the channel. A terminal belongs to the box, so its identity must not
+        # depend on which channel's coordinator happens to be carrying it --
+        # otherwise removing channel 0 from a recorder would rename every one.
+        self._unique_id = "%s_alarm_input_%d" % (
+            coordinator.get_device_serial_number(),
+            index,
+        )
+        # Set last: DahuaEventSensor's __init__ assigns a translation key for
+        # any code in TRANSLATED_EVENTS and a name for anything else, and
+        # neither applies to a name the device supplied.
+        self._attr_translation_key = None
+        self._name = alarm_input.get("name") or "Alarm input %d" % (index + 1)
+        self._attr_name = self._name
+
+    @property
+    def extra_state_attributes(self):
+        return {
+            **(super().extra_state_attributes or {}),
+            # Both numbers, because they differ by one and which one a user
+            # means depends on whether they are reading the chassis or the
+            # event. Publishing only one guarantees half of them are confused.
+            "alarm_input_index": self._alarm_index,
+            "alarm_input_number": self._alarm_index + 1,
+            # Whether the device will act on this terminal at all. A disabled
+            # input never sends an event, so a sensor that never moves has an
+            # explanation here rather than looking broken.
+            "enabled_on_device": self._alarm_enabled,
+        }
+
+
 class DahuaAuthorizedVehicleBinarySensor(DahuaEventDrivenEntity, BinarySensorEntity):
     """Binary sensor that turns on when an authorized vehicle license plate is recognized."""
 
@@ -492,7 +615,7 @@ class DahuaAuthorizedVehicleBinarySensor(DahuaEventDrivenEntity, BinarySensorEnt
         return False
 
 
-class DahuaDiskProblemBinarySensor(DahuaBaseEntity, BinarySensorEntity):
+class DahuaDiskProblemBinarySensor(DahuaHostEntity, BinarySensorEntity):
     """A recorder's disk health, as a diagnostic problem sensor (#745).
 
     On when the disk's State is not Success or any partition reports an error.
@@ -514,7 +637,16 @@ class DahuaDiskProblemBinarySensor(DahuaBaseEntity, BinarySensorEntity):
         self._disk_name = disk_name
         # /dev/sda -> dev_sda, so the id is stable and slug-shaped.
         slug = disk_name.replace("/", "_").strip("_")
-        self._attr_unique_id = "%s_disk_%s" % (coordinator.get_serial_number(), slug)
+        # The device's serial rather than get_serial_number(), which appends the
+        # channel. A disk belongs to the box, so its identity must not depend on
+        # which channel's coordinator happens to be carrying it -- otherwise
+        # removing channel 0 from a recorder would rename every disk sensor.
+        # On channel 0 the two are the same string, so the ids that existed
+        # before this change and survive it are byte for byte what they were.
+        self._attr_unique_id = "%s_disk_%s" % (
+            coordinator.get_device_serial_number(),
+            slug,
+        )
         self._attr_name = "Disk %s" % disk_name
 
     def _disk(self):
@@ -544,7 +676,7 @@ class DahuaDiskProblemBinarySensor(DahuaBaseEntity, BinarySensorEntity):
         disk = self._disk()
         if disk is None:
             return super().extra_state_attributes
-        return {
+        attributes = {
             **(super().extra_state_attributes or {}),
             "disk": disk["name"],
             "state": disk["state"],
@@ -553,3 +685,21 @@ class DahuaDiskProblemBinarySensor(DahuaBaseEntity, BinarySensorEntity):
             "partition_error": disk["has_error"],
             "health_flag": disk["health_flag"],
         }
+
+        # What the disk is, when RPC2 answered for it. Added only where there is
+        # a value, so a recorder that cannot say does not grow a row of
+        # "unknown" on a diagnostic sensor. `capacity_gb` is the disk itself;
+        # `total_gb` above is what is formatted on it, and the two differ by a
+        # few percent.
+        for key, name in (
+            ("model", "model"),
+            ("serial", "disk_serial"),
+            ("firmware", "disk_firmware"),
+            ("bus", "bus"),
+            ("power_mode", "power_mode"),
+        ):
+            if disk.get(key):
+                attributes[name] = disk[key]
+        if disk.get("capacity_bytes"):
+            attributes["capacity_gb"] = round(disk["capacity_bytes"] / 1_000_000_000, 1)
+        return attributes

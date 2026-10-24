@@ -86,6 +86,7 @@ SMART_MOTION = "async_get_smart_motion_detection"
 PRIVACY = "async_get_privacy_mode"
 DAY_NIGHT = "async_get_video_in_options"
 ALARM_OUT = "async_get_alarm_output_state"
+CLOUD_UPGRADE = "async_get_cloud_upgrade_info"
 
 
 async def test_everything_is_fetched_when_every_platform_is_on():
@@ -165,11 +166,14 @@ async def test_coaxial_status_survives_either_reader():
     assert COAXIAL not in await _poll(light=False, switch=False)
 
 
-async def test_motion_detection_survives_either_reader():
-    """The camera entity reads this as well as the switch."""
-    assert MOTION in await _poll(switch=False), "the camera entity still needs it"
-    assert MOTION in await _poll(camera=False), "the motion switch still needs it"
-    assert MOTION not in await _poll(camera=False, switch=False)
+async def test_motion_detection_survives_any_of_its_three_readers():
+    """The camera entity and the motion switch read this, and since #1115 so do
+    the motion region sliders on `number`. Three readers, so losing any two of
+    the platforms must not stop the table being fetched for the third."""
+    assert MOTION in await _poll(switch=False, number=False), "the camera needs it"
+    assert MOTION in await _poll(camera=False, number=False), "the switch needs it"
+    assert MOTION in await _poll(camera=False, switch=False), "the sliders need it"
+    assert MOTION not in await _poll(camera=False, switch=False, number=False)
 
 
 async def test_lighting_v2_survives_losing_the_light_platform_on_a_doorbell():
@@ -257,7 +261,7 @@ async def test_a_flood_light_still_gets_the_coaxial_status():
     c.supports_siren = lambda: False
     c.supports_security_light = lambda: False
     c.is_flood_light = lambda: True
-    c._supports_floodlightmode = True
+    c.supports_floodlightmode = lambda: True
 
     await c._async_update_data()
 
@@ -270,8 +274,33 @@ async def test_a_flood_light_without_floodlightmode_is_not_asked():
     c.supports_siren = lambda: False
     c.supports_security_light = lambda: False
     c.is_flood_light = lambda: True
-    c._supports_floodlightmode = False
+    c.supports_floodlightmode = lambda: False
 
     await c._async_update_data()
 
     assert COAXIAL not in c.client.calls
+
+
+# --- the cloud upgrade record belongs to the update platform -----------------
+
+
+async def test_the_cloud_upgrade_record_is_not_read_without_the_update_platform():
+    """It feeds only the informational update entity."""
+    c = _coordinator(update=False)
+    c._supports_cloud_upgrade = True
+
+    await c._async_update_data()
+
+    assert CLOUD_UPGRADE not in c.client.calls
+
+
+async def test_the_cloud_upgrade_record_is_read_once_and_reused():
+    """The device rewrites it only after its own OTA check, so re-reading it
+    every poll would be thousands of requests for a value that has not moved."""
+    c = _coordinator()
+    c._supports_cloud_upgrade = True
+
+    await c._async_update_data()
+    await c._async_update_data()
+
+    assert c.client.calls.count(CLOUD_UPGRADE) == 1

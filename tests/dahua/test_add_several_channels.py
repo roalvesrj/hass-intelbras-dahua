@@ -309,14 +309,62 @@ async def test_all_channels_with_nothing_found_chooses_nothing():
 
 
 async def test_the_form_says_how_many_were_found():
-    """The count is in the label and the description, so it has to be given."""
+    """The count is in the label and the description, so it has to be given.
+
+    Asserted on the count rather than on the whole dict, which is what this
+    used to do. An exact dict here says two things at once -- "the count is
+    right" and "nothing else is passed" -- and it was the second that failed
+    when the form gained a sentence naming the channels skipped for ONVIF.
+    Being told the count is wrong because a different key was added is the
+    kind of failure that gets fixed by editing the expectation.
+
+    The second claim is better made elsewhere and now is:
+    test_config_step_placeholders.py checks the placeholders the steps name
+    against the ones the flow passes, in both directions, which is the thing
+    an exact dict was standing in for.
+    """
     flow = _flow()
     flow._found_channels = {1: "ONE", 4: "FOUR"}
     flow._errors = {}
 
     result = await flow.async_step_channels()
 
-    assert result["description_placeholders"] == {"count": "2"}
+    assert result["description_placeholders"]["count"] == "2"
+
+
+async def test_an_onvif_channel_is_named_rather_than_just_missing():
+    """#577: the reporter counted six channels, was offered four, and had to
+    find a generic sentence about channels that "are not listed" to work out
+    why. The one on ONVIF is named now, by the number the recorder shows."""
+    flow = _flow()
+    flow._found_channels = {1: "ONE"}
+    flow._onvif_channels = [5]
+    flow._errors = {}
+
+    result = await flow.async_step_channels()
+
+    note = result["description_placeholders"]["skipped_note"]
+    assert "Channel 6" in note, "named by recorder channel number, not index"
+    assert "ONVIF" in note
+    # And says what the user can still do. The first version of this note said
+    # the integration "cannot drive" the channel, which contradicts #710: that
+    # PR warns at setup and deliberately still creates the camera entity, and
+    # @JimGermany reports the stream working through his recorder for such a
+    # channel. Telling somebody a thing is impossible when the integration
+    # allows it is the worse error of the two.
+    assert "by hand" in note, "the note must not imply the channel is unusable"
+
+
+async def test_nothing_skipped_means_no_sentence():
+    """A whole sentence or nothing, the rule the repair cards follow."""
+    flow = _flow()
+    flow._found_channels = {1: "ONE"}
+    flow._onvif_channels = []
+    flow._errors = {}
+
+    result = await flow.async_step_channels()
+
+    assert result["description_placeholders"]["skipped_note"] == ""
 
 
 async def test_the_form_offers_the_switch_and_the_list():
@@ -597,3 +645,102 @@ async def test_creating_the_entry_carries_every_channel():
         passed["subentries"] is not None
     ), "the channels were never handed to async_create_entry"
     assert [s["data"][CONF_CHANNEL] for s in passed["subentries"]] == [0, 1]
+
+
+# --- the ceiling the dialog advertises (#1000) ------------------------------
+
+
+async def _bounded(monkeypatch, client, budget=0.2):
+    """Run the bounded search against `client`, with the network stubbed."""
+    import custom_components.dahua.config_flow as flow_module
+
+    class _Session:
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(flow_module, "ClientSession", lambda **kw: _Session())
+    monkeypatch.setattr(flow_module, "TCPConnector", lambda **kw: None)
+    monkeypatch.setattr(flow_module, "DahuaClient", lambda *a, **kw: client)
+    monkeypatch.setattr(flow_module, "DISCOVERY_TIMEOUT_SECONDS", budget)
+
+    flow = _flow()
+    started = asyncio.get_running_loop().time()
+    found = await flow._async_discover_channels(_entry_data(), 0)
+    return found, asyncio.get_running_loop().time() - started
+
+
+class _SlowSlotTable(_Client):
+    """A device that accepts the read and does not answer it.
+
+    This is the half the old ceiling did not cover. It was around the snapshot
+    probes only, so the slot table and the titles could spend TIMEOUT_SECONDS
+    each before the ceiling applied to anything -- 20, 20 and 30, while the
+    dialog said 30.
+    """
+
+    def __init__(self, delay):
+        super().__init__({}, [])
+        self.delay = delay
+
+    async def async_get_remote_devices(self):
+        await asyncio.sleep(self.delay)
+        return {}
+
+
+async def test_a_slot_table_that_never_answers_is_inside_the_ceiling(monkeypatch):
+    """#1000's shape: the step sat past the number on screen with no way to
+    tell a slow search from a frozen one."""
+    found, took = await _bounded(monkeypatch, _SlowSlotTable(delay=5), budget=0.2)
+
+    assert found == {}
+    assert took < 2, "the search ran for %.1fs on a 0.2s budget" % took
+
+
+async def test_an_expired_search_offers_nothing_rather_than_failing(monkeypatch):
+    """Expiry is an ordinary outcome. The camera the user asked for is still
+    added -- not offering extras is a fine answer, and a failed setup is not."""
+    found, _ = await _bounded(monkeypatch, _SlowSlotTable(delay=5), budget=0.1)
+
+    assert found == {}
+
+
+async def test_a_search_that_finishes_in_time_still_offers_what_it_found(
+    monkeypatch,
+):
+    """The ceiling must not cost the feature it protects."""
+    # (enabled, protocol) per slot index, which is the shape _Client reads.
+    client = _Client({1: (True, "Dahua")}, live=[1])
+
+    found, _ = await _bounded(monkeypatch, client, budget=5)
+
+    assert found == {1: "Channel 2"}
+
+
+async def test_the_step_moves_on_after_the_search_expires(monkeypatch):
+    """What the user sees: the dialog ends and the naming step arrives, rather
+    than the progress step being shown again for ever."""
+    import custom_components.dahua.config_flow as flow_module
+
+    flow = _flow()
+    flow.hass = SimpleNamespace(
+        async_create_task=lambda coro: asyncio.ensure_future(coro)
+    )
+    monkeypatch.setattr(flow_module, "DISCOVERY_TIMEOUT_SECONDS", 0.1)
+
+    async def never_answers(user_input, exclude):
+        await asyncio.sleep(5)
+        return {"unreachable": "never"}
+
+    # The inner search, so the ceiling around it is still in the path.
+    # Patching _async_discover_channels would replace the ceiling itself and
+    # this test would hang instead of failing.
+    flow._async_search_channels = never_answers
+
+    first = await flow.async_step_discover()
+    assert first["type"] == FlowResultType.SHOW_PROGRESS
+
+    await flow._discovery_task
+    second = await flow.async_step_discover()
+
+    assert second["type"] == FlowResultType.SHOW_PROGRESS_DONE
+    assert second["step_id"] == "name", "an expired search must not offer channels"

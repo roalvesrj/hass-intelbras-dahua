@@ -1,7 +1,9 @@
 """light.py had no tests at all, and day/night handling has regressed before."""
 
+from types import SimpleNamespace
 from unittest.mock import Mock
 
+import aiohttp
 import pytest
 
 from custom_components.dahua import dahua_utils
@@ -22,6 +24,8 @@ class _Client:
         self.scheme_reads = 0
         self.scheme_writes = []
         self.operations = []
+        # (channel, enabled, brightness) for each channel-scoped force (#959).
+        self.channel_scoped_calls = []
 
         # How the device answers an infrared write: normally it takes it. Set
         # v1_refuses to an exception to model a refusal, or v1_ignores to model
@@ -31,6 +35,9 @@ class _Client:
         # The Lighting_V2 path, which infrared reaches only after v1 refuses.
         self.v2_modes = []
         self.v2_refuses = None
+        # When set to an exception, the CGI setConfig path async_set_lighting_v2
+        # raises it (a 400 models a Lighting_V2 table that is read-only over CGI).
+        self.v2_set_refuses = None
         self.v2_ignores = False
         self.infrared_mode = "Auto"
 
@@ -39,6 +46,12 @@ class _Client:
         self.light_mode = "Manual"
         self.light_brightness = 64
         self.light_field = "NearLight"
+
+    async def async_force_channel_scoped_white_light(
+        self, channel, enabled, brightness
+    ):
+        """The #959 recorder-channel path. Records the routed arguments."""
+        self.channel_scoped_calls.append((channel, enabled, brightness))
 
     async def async_set_lighting_v2_mode(
         self, channel, mode, brightness, profile_mode, light_index=0, bank="MiddleLight"
@@ -116,6 +129,8 @@ class _Client:
         light_index=0,
         bank="MiddleLight",
     ):
+        if self.v2_set_refuses is not None:
+            raise self.v2_set_refuses
         self.v2.append(
             (
                 channel,
@@ -204,7 +219,9 @@ class _Store:
 
 
 class _Coordinator:
-    def __init__(self, channel=3, profile_mode="1", uses_scheme=False):
+    def __init__(
+        self, channel=3, profile_mode="1", uses_scheme=False, uses_channel_scoped=False
+    ):
         self.client = _Client()
         self._channel = channel
         self._profile_mode = profile_mode
@@ -230,6 +247,7 @@ class _Coordinator:
         self.illuminator_bank = "MiddleLight"
         self.camera_reboot_generation = 0
         self.uses_scheme = uses_scheme
+        self.uses_channel_scoped = uses_channel_scoped
 
     def get_channel(self):
         return self._channel
@@ -275,6 +293,23 @@ class _Coordinator:
         against; test_driving_infrared_through_lighting_v2.py covers the other."""
         return self.infrared_v2_row
 
+    def infrared_reads_lighting_v2(self):
+        """Whether the mode is read from Lighting_V2, which is wherever a row
+        exists. Weaker than the test the *write* uses, deliberately: see
+        test_the_v1_lighting_table_can_be_a_decoy.py."""
+        return self.get_infrared_v2_row() is not None
+
+    def lighting_v2_samples(self):
+        """How many real Lighting_V2 readings the poll has taken.
+
+        Modelled on `refreshed`, so every refresh here counts as one: this
+        double's device always answers. A device whose read fails carries the
+        previous table forward and does *not* count, which is the case
+        test_the_v1_lighting_table_can_be_a_decoy.py covers against the real
+        coordinator rather than here.
+        """
+        return self.refreshed
+
     def is_illuminator_on(self):
         return self.illuminator_on
 
@@ -292,6 +327,9 @@ class _Coordinator:
 
     def uses_lighting_scheme_illuminator(self):
         return self.uses_scheme
+
+    def uses_channel_scoped_illuminator(self):
+        return self.uses_channel_scoped
 
     async def async_refresh(self):
         self.refreshed += 1
@@ -313,6 +351,7 @@ def _light(cls, coordinator):
 
     if cls is DahuaIlluminator:
         entity._manual_on = False
+        entity._scheme_fallback = False
         entity._scheme_restore = None
         entity._light_restore = None
         entity._last_brightness = 255
@@ -483,6 +522,73 @@ async def test_scheme_illuminator_uses_the_two_table_client_path():
     ]
     assert c.client.v2 == []
     assert light.async_write_ha_state.call_count == 2
+
+
+async def test_channel_scoped_illuminator_routes_to_the_force_method():
+    """A recorder channel whose LightingScheme answers per channel (#959) goes to
+    the channel-scoped force method, not the plain Lighting_V2 path, and passes the
+    channel, the on/off, and the converted brightness (255 -> 100). OFF brightness
+    is unused by the override, so it is sent as 0."""
+    c = _Coordinator(channel=11, profile_mode="1", uses_channel_scoped=True)
+
+    light = _light(DahuaIlluminator, c)
+    assert light.is_on is False
+
+    await light.async_turn_on(**{ATTR_BRIGHTNESS: 255})
+    assert light.is_on is True
+
+    await light.async_turn_off()
+    assert light.is_on is False
+
+    assert c.client.channel_scoped_calls == [(11, True, 100), (11, False, 0)]
+    assert c.client.v2 == [] and c.client.v2_raw == [] and c.client.v1 == []
+    assert c.client.scheme_calls == []
+    assert light.async_write_ha_state.call_count == 2
+
+
+def _cgi_400():
+    return aiohttp.ClientResponseError(
+        SimpleNamespace(real_url="http://10.0.0.5/cgi-bin/configManager.cgi"),
+        (),
+        status=400,
+    )
+
+
+async def test_lighting_v2_400_falls_back_to_the_scheme_path():
+    """A camera whose Lighting_V2 is CGI read-only returns 400 to the plain
+    write. The illuminator must then drive the white light through the two-table
+    LightingScheme path instead, and turn on (#994)."""
+    c = _Coordinator(channel=0, profile_mode="1")  # not scheme, not channel-scoped
+    c.illuminator_index = 1
+    c.client.v2_set_refuses = _cgi_400()
+
+    light = _light(DahuaIlluminator, c)
+    await light.async_turn_on(**{ATTR_BRIGHTNESS: 255})
+
+    assert light._scheme_fallback is True
+    assert light.is_on is True
+    # The two-table path ran with the on command; the dead CGI write recorded
+    # nothing because it was refused before appending.
+    assert c.client.scheme_calls == [(0, True, 100, "1", 1)]
+    assert c.client.v2 == []
+
+
+async def test_a_learned_scheme_fallback_skips_the_cgi_path():
+    """Once learned, both on and off go straight to the two-table path and never
+    touch the refused CGI write again."""
+    c = _Coordinator(channel=0, profile_mode="1")
+    c.illuminator_index = 1
+    c.client.v2_set_refuses = _cgi_400()  # would raise if the CGI path were used
+
+    light = _light(DahuaIlluminator, c)
+    light._scheme_fallback = True
+
+    await light.async_turn_on(**{ATTR_BRIGHTNESS: 255})
+    await light.async_turn_off()
+
+    assert [call[:2] for call in c.client.scheme_calls] == [(0, True), (0, False)]
+    assert c.client.v2 == []
+    assert light.is_on is False
 
 
 async def test_scheme_illuminator_failed_write_preserves_entity_state(monkeypatch):

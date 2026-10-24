@@ -8,11 +8,13 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.components.switch import SwitchDeviceClass, SwitchEntity
 from homeassistant.const import EntityCategory
-from custom_components.dahua import DahuaDataUpdateCoordinator, entry_coordinators
+from custom_components.dahua import entry_coordinators
 
 from . import dahua_utils, refusals
 from .const import DOMAIN
-from .entity import DahuaBaseEntity
+from .entity import DahuaBaseEntity, DahuaHostEntity
+from .const import VTH_SILENCE_FIELD
+from .late import async_add_and_keep_watching
 from .client import SIREN_TYPE
 
 # What a device answers a siren write with when it cannot be reached, as opposed
@@ -32,12 +34,100 @@ SIREN_CONTROL = refusals.SIREN
 PARALLEL_UPDATES = 1
 
 
+def _cloud_reporter(coordinators: list):
+    """The one coordinator that should carry the device's cloud switch.
+
+    The cloud connection is the box's, not a channel's: VSP_PaaS is served
+    host wide and carries one Enable for the whole device. A recorder is one
+    entry with a coordinator per channel (#827), so without this every channel
+    would get its own copy of the same switch, and sixteen switches would
+    fight over one flag. The lowest channel that reported the key carries it,
+    which is what the processor and memory sensors already do.
+
+    Returns None when no channel reported the table.
+    """
+    answering = [c for c in coordinators if c.supports_cloud_connection()]
+    if not answering:
+        return None
+    return min(answering, key=lambda c: c.get_channel())
+
+
+def _alarm_output_reporter(coordinators: list):
+    """The one coordinator that should carry the box's relay switches.
+
+    `AlarmOut` and `alarm.cgi` take no channel: the relays are screwed to the
+    back of the box. Same problem `_cloud_reporter` solves and the same
+    answer, and it matters more here than it looks -- lifting the
+    single-output restriction without this would give a twelve channel
+    recorder with six relays seventy two switches, all of them writing to the
+    same six rows.
+
+    Returns None when no channel reported any relay, which is most cameras.
+    """
+    answering = [
+        c
+        for c in coordinators
+        if getattr(c, "supports_alarm_output", None) and c.supports_alarm_output()
+    ]
+    if not answering:
+        return None
+    return min(answering, key=lambda c: c.get_channel())
+
+
+def _filed_under(entity, coordinator):
+    """Which subentry this entity belongs to, as `late.py` asks.
+
+    The cloud connection is the box's rather than one channel's, so its switch
+    belongs to the device the recorder has of its own. A camera has no separate
+    host device, so its switch stays on its own channel. Same rule as the
+    processor and memory sensors in sensor.py, and the same helper shape.
+    """
+    if isinstance(entity, DahuaHostEntity) and coordinator.uses_separate_host_device():
+        return None
+    return coordinator.subentry_id
+
+
 async def async_setup_entry(hass: HomeAssistant, entry, async_add_devices):
     """Setup sensor platform."""
-    for coordinator in entry_coordinators(entry).values():
+
+    # Keep the selected reporter for this setup's lifetime: its serial is part
+    # of the switch's unique id, so a lower channel answering later must not
+    # create a second one. Reloading the entry makes a fresh selection. The
+    # same rule the load sensors follow since #1076.
+    cloud_reporter = _cloud_reporter(list(entry_coordinators(entry).values()))
+    alarm_output_reporter = _alarm_output_reporter(
+        list(entry_coordinators(entry).values())
+    )
+
+    async def build(coordinator):
+        """Which switches this channel warrants, as the device answers today.
+
+        Called again when a capability turns up on a later poll, so a channel
+        whose SmartMotionDetect read timed out at setup gets its switch when
+        the device finally answers rather than at the next reload (#1057).
+        Nothing in here talks to the device, so a rebuild costs no request.
+        """
         # I think most cameras have a motion sensor so we'll blindly add a switch for it.
         # Not an indoor monitor without a camera: there is no picture to detect motion in.
+        nonlocal cloud_reporter, alarm_output_reporter
+        if alarm_output_reporter is None and coordinator.supports_alarm_output():
+            # A relay that turned up on a later poll, the same way the cloud
+            # switch below is allowed to.
+            alarm_output_reporter = coordinator
+
         devices = []
+
+        # The cloud connection is the box's, so one channel carries the switch
+        # and `_cloud_reporter` picks which. Built here rather than once at
+        # setup so that a device whose VSP_PaaS read timed out gets the switch
+        # when it finally answers, instead of at the next reload (#1057): the
+        # retry announces the capability and this is what the announcement
+        # rebuilds. `_filed_under` keeps it on the box's own device page.
+        if cloud_reporter is None and coordinator.supports_cloud_connection():
+            cloud_reporter = coordinator
+        if cloud_reporter is coordinator:
+            devices.append(DahuaCloudConnectionSwitch(coordinator, entry))
+
         if not coordinator.is_indoor_monitor_without_video():
             devices.append(DahuaMotionDetectionBinarySwitch(coordinator, entry))
 
@@ -61,14 +151,34 @@ async def async_setup_entry(hass: HomeAssistant, entry, async_add_devices):
             devices.append(DahuaSmartMotionDetectionBinarySwitch(coordinator, entry))
         if coordinator.supports_privacy_mode():
             devices.append(DahuaPrivacyModeBinarySwitch(coordinator, entry))
-        if coordinator.supports_alarm_output():
-            devices.append(DahuaAlarmOutputSwitch(coordinator, entry, output=0))
+        # The relays belong to the box, so one channel carries them all. A
+        # camera is its own box and nothing moves; a recorder gets them on its
+        # own device instead of a copy per channel.
+        if alarm_output_reporter is coordinator:
+            slots = coordinator.get_alarm_output_slots()
+            build_output = (
+                DahuaAlarmOutputSwitch if slots == 1 else DahuaNamedAlarmOutputSwitch
+            )
+            devices.extend(
+                build_output(coordinator, entry, output) for output in range(slots)
+            )
+
+        # Per channel, and on purpose: IntelliTour is indexed by channel, so a
+        # dual sensor camera gets the switch on its PTZ channel only and a
+        # recorder with two PTZ cameras gets two switches rather than one that
+        # writes to the wrong row (#1051).
+        if coordinator.supports_intelli_tour():
+            devices.append(DahuaIntelliTourSwitch(coordinator, entry))
 
         # The coordinator already asked the device this during setup and kept the
         # answer. Asking again here put a network round trip inside platform setup,
         # where a device that is slow to answer eats the entry's setup budget.
+        # One switch per table, rather than both from the linkage answer. They
+        # are two tables and a device can serve one without the other, and the
+        # poll already decides separately whether to read each of them.
         if coordinator.supports_disarming_linkage():
             devices.append(DahuaDisarmingLinkageBinarySwitch(coordinator, entry))
+        if coordinator.supports_event_notifications():
             devices.append(
                 DahuaDisarmingEventNotificationsLinkageBinarySwitch(coordinator, entry)
             )
@@ -77,7 +187,22 @@ async def async_setup_entry(hass: HomeAssistant, entry, async_add_devices):
             DahuaIVSRuleSwitch(coordinator, entry, rule)
             for rule in coordinator.get_ivs_rules()
         )
-        async_add_devices(devices, config_subentry_id=coordinator.subentry_id)
+        # An indoor monitor's do not disturb, where the monitor reported it
+        # (#998). Gated on the field rather than on the device class: the key
+        # is present on a VTH5221D's 3.000 firmware and on @kmich's 4.800, but
+        # nothing says every monitor has it.
+        if coordinator.supports_vth_phone_setting(VTH_SILENCE_FIELD):
+            devices.append(DahuaMonitorSilenceSwitch(coordinator, entry))
+        return devices
+
+    await async_add_and_keep_watching(
+        hass,
+        entry,
+        build,
+        async_add_devices,
+        entry_coordinators,
+        subentry_for=_filed_under,
+    )
 
 
 class DahuaMotionDetectionBinarySwitch(DahuaBaseEntity, SwitchEntity):
@@ -118,6 +243,96 @@ class DahuaMotionDetectionBinarySwitch(DahuaBaseEntity, SwitchEntity):
         Value is fetched from api.get_motion_detection_config
         """
         return self._coordinator.is_motion_detection_enabled()
+
+
+class DahuaCloudConnectionSwitch(DahuaHostEntity, SwitchEntity):
+    """The device's connection to Dahua's cloud, which DMSS calls arrive over.
+
+    Asked for in #591, where @ScratMan was driving `VSP_PaaS.Enable` from a
+    `shell_command` curl to stop a doorbell ringing the DMSS app while someone
+    was home.
+
+    Worth knowing before using it: this is the whole cloud connection, not the
+    ringing. Turning it off stops remote viewing through DMSS as well, which
+    @ScratMan confirmed on a VTO2311R-WP. For events rather than calls, the
+    Event Notifications switch is the lighter tool.
+
+    A host entity rather than a channel one: there is one cloud connection per
+    box. See `_cloud_reporter`.
+    """
+
+    _attr_translation_key = "cloud_connection"
+
+    _attr_entity_category = EntityCategory.CONFIG
+
+    async def async_turn_on(self, **kwargs):  # pylint: disable=unused-argument
+        """Connect the device to the cloud again."""
+        await self._coordinator.client.async_set_cloud_connection(True)
+        await self._coordinator.async_refresh()
+
+    async def async_turn_off(self, **kwargs):  # pylint: disable=unused-argument
+        """Disconnect the device from the cloud."""
+        await self._coordinator.client.async_set_cloud_connection(False)
+        await self._coordinator.async_refresh()
+
+    @property
+    def unique_id(self):
+        """Unique within the platform, and per device rather than per channel."""
+        return self._coordinator.get_serial_number() + "_cloud_connection"
+
+    @property
+    def is_on(self):
+        """Whether the device says its cloud connection is on."""
+        return self._coordinator.is_cloud_connection_enabled()
+
+
+class DahuaIntelliTourSwitch(DahuaBaseEntity, SwitchEntity):
+    """Start and stop a PTZ camera's AI tour plan.
+
+    Asked for in #1051 by @MassakerGU, who was driving `IntelliTour[1].Enable`
+    from outside Home Assistant on a DH-SDT6E432-8P-MB-A-PV1 and wanted the
+    tour to stop while someone was in the garden.
+
+    What it does and does not do. It toggles the plan the camera already has;
+    it does not create, edit or schedule one, and it touches nothing else in
+    the row. The plan, its presets, its dwell times and the camera's PTZ
+    behaviour are left exactly as the camera's own interface set them, which
+    is what @MassakerGU asked for.
+
+    A channel entity rather than a host one. `IntelliTour` is indexed by
+    channel: on the measured camera, row [0] is null for the panorama sensor
+    and row [1] carries the tour for the PTZ sensor, and Home Assistant shows
+    those as two channels in that order.
+    """
+
+    _attr_translation_key = "intelli_tour"
+
+    # Configuration rather than a control: this changes how the camera behaves
+    # from now on rather than doing one thing now. Same reasoning as the motion
+    # detection switch above.
+    _attr_entity_category = EntityCategory.CONFIG
+
+    async def async_turn_on(self, **kwargs):  # pylint: disable=unused-argument
+        """Start this channel's tour plan."""
+        channel = self._coordinator.get_channel()
+        await self._coordinator.client.async_set_intelli_tour(channel, True)
+        await self._coordinator.async_refresh()
+
+    async def async_turn_off(self, **kwargs):  # pylint: disable=unused-argument
+        """Stop this channel's tour plan."""
+        channel = self._coordinator.get_channel()
+        await self._coordinator.client.async_set_intelli_tour(channel, False)
+        await self._coordinator.async_refresh()
+
+    @property
+    def unique_id(self):
+        """Unique within the platform. The serial already carries the channel."""
+        return self._coordinator.get_serial_number() + "_intelli_tour"
+
+    @property
+    def is_on(self):
+        """Whether the camera says this channel's tour is running."""
+        return self._coordinator.is_intelli_tour_enabled()
 
 
 class DahuaDisarmingLinkageBinarySwitch(DahuaBaseEntity, SwitchEntity):
@@ -402,10 +617,27 @@ class DahuaSirenBinarySwitch(DahuaBaseEntity, SwitchEntity):
         return self._coordinator.is_siren_on()
 
 
-class DahuaAlarmOutputSwitch(DahuaBaseEntity, SwitchEntity):
-    """Switch for a physical alarm/relay output."""
+class DahuaAlarmOutputSwitch(DahuaHostEntity, SwitchEntity):
+    """Switch for a physical alarm/relay output.
+
+    `AlarmOut` takes no channel: the relays are screwed to the back of the
+    box, like the alarm inputs beside them. On a recorder this is a host
+    entity, filed against the recorder rather than a camera. On a camera
+    there is nothing to separate and it keeps the page it has.
+
+    **State is read back rather than assumed.** These devices will accept a
+    write, answer `OK` and drive nothing, so `is_on` comes from
+    `alarm.cgi?action=getOutState` and never from what was last written.
+    Measured on a DHI-NVR5464-16P-EI: forcing `AlarmOut[5].Mode = 1` makes
+    that read answer 32, which is 1<<5, and the relay really closes.
+    """
 
     _attr_device_class = SwitchDeviceClass.SWITCH
+    # The name a single-relay device has always had, in every language it has
+    # always had it in. A box with several relays cannot use this, because one
+    # string cannot tell six entities apart -- that is
+    # DahuaNamedAlarmOutputSwitch below, and the two are separate classes
+    # because an entity that sets `_attr_name` never reads its translation.
     _attr_translation_key = "alarm_output"
 
     def __init__(self, coordinator, entry, output: int):
@@ -424,15 +656,59 @@ class DahuaAlarmOutputSwitch(DahuaBaseEntity, SwitchEntity):
 
     @property
     def unique_id(self):
-        """Return a stable unique ID for this alarm output."""
+        """Return a stable unique ID for this alarm output.
+
+        The device's serial rather than `get_serial_number()`, which appends
+        the channel. A relay belongs to the box, so its identity must not
+        depend on which channel's coordinator happens to be carrying the
+        switch -- otherwise removing channel 0 from a recorder would rename
+        every one. The same rule, and the same wording, as the disk sensors.
+
+        On a camera and on channel 0 the two are the same string, so the ids
+        that exist today and survive this are byte for byte what they were.
+        """
         return (
-            self._coordinator.get_serial_number() + "_alarm_output_" + str(self._output)
+            self._coordinator.get_device_serial_number()
+            + "_alarm_output_"
+            + str(self._output)
         )
+
+    @property
+    def extra_state_attributes(self):
+        return {
+            **(super().extra_state_attributes or {}),
+            # Both numbers, as for the alarm inputs: the device indexes from
+            # zero and prints from one, and which a reader means depends on
+            # whether they are looking at the chassis or at the config.
+            "alarm_output_index": self._output,
+            "alarm_output_number": self._output + 1,
+        }
 
     @property
     def is_on(self):
         """Return the physical state from alarm.cgi?action=getOutState."""
-        return self._coordinator.is_alarm_output_on()
+        return self._coordinator.is_alarm_output_on(self._output)
+
+
+class DahuaNamedAlarmOutputSwitch(DahuaAlarmOutputSwitch):
+    """One relay of several, named rather than translated.
+
+    A box with six relays cannot name them all "Alarm Output". The name has
+    to come from the device or from the relay's number, and neither is
+    something a translation file can hold -- so this names itself, the way
+    the disk sensors and the per-rule IVS sensors do.
+
+    Separate from its parent rather than a branch inside it because setting
+    `_attr_name` makes Home Assistant ignore the translation key entirely:
+    a class doing both silently keeps its English name in every language, and
+    there is a test asserting none of them does.
+    """
+
+    _attr_translation_key = None
+
+    def __init__(self, coordinator, entry, output: int):
+        super().__init__(coordinator, entry, output)
+        self._attr_name = coordinator.get_alarm_output_name(output)
 
 
 class DahuaPrivacyModeBinarySwitch(DahuaBaseEntity, SwitchEntity):
@@ -466,3 +742,53 @@ class DahuaPrivacyModeBinarySwitch(DahuaBaseEntity, SwitchEntity):
         Value is fetched from client.async_get_privacy_mode
         """
         return self._coordinator.is_privacy_mode_enabled()
+
+
+class DahuaMonitorSilenceSwitch(DahuaBaseEntity, SwitchEntity):
+    """Do not disturb on an indoor monitor (#998).
+
+    `VideoTalkPhoneGeneral.SilenceEnable`, measured as a real boolean on a
+    VTH5221D (3.000.0012000.0.R), where it read False.
+
+    The monitor also has `DisableRingStartTime` and `DisableRingEndTime`, a
+    scheduled quiet period. That is a different thing from this switch, it is
+    set on the device itself, and this does not touch it.
+    """
+
+    _attr_translation_key = "vth_silence"
+
+    # Configuration rather than a control: it changes how the monitor behaves
+    # from now on rather than doing something once.
+    _attr_entity_category = EntityCategory.CONFIG
+
+    async def async_turn_on(self, **kwargs):  # pylint: disable=unused-argument
+        """Silence this monitor."""
+        await self._set(True)
+
+    async def async_turn_off(self, **kwargs):  # pylint: disable=unused-argument
+        """Let this monitor ring again."""
+        await self._set(False)
+
+    async def _set(self, silent: bool) -> None:
+        await self._coordinator.client.async_set_video_talk_phone_field(
+            VTH_SILENCE_FIELD, silent
+        )
+        await self._coordinator.async_refresh()
+
+    @property
+    def unique_id(self):
+        """Unique within the platform. The serial already carries the channel."""
+        return self._coordinator.get_serial_number() + "_vth_silence"
+
+    @property
+    def available(self) -> bool:
+        """Off until the poll has the flag, so it never shows a guessed state."""
+        return (
+            super().available
+            and self._coordinator.get_vth_phone_flag(VTH_SILENCE_FIELD) is not None
+        )
+
+    @property
+    def is_on(self):
+        """Whether the monitor says it is silenced."""
+        return self._coordinator.get_vth_phone_flag(VTH_SILENCE_FIELD)

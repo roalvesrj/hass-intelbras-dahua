@@ -37,6 +37,7 @@ PLATFORMS = [
     "select",
     "sensor",
     "switch",
+    "update",
 ]
 
 # Ways the device's name can be reached from an entity.
@@ -86,13 +87,20 @@ def test_every_entity_class_inherits_the_base():
         ):
             classname, bases = match.groups()
             # DahuaEventSensor inherits DahuaEventDrivenEntity, and per-rule
-            # IVS sensors inherit DahuaEventSensor.
+            # IVS sensors inherit DahuaEventSensor. DahuaHostEntity is the base
+            # for the entities that describe the box rather than a channel, and
+            # is itself a DahuaBaseEntity, so the attribute is still set once.
+            # DahuaNamedAlarmOutputSwitch inherits DahuaAlarmOutputSwitch for
+            # the same reason the IVS sensors inherit theirs: it is the same
+            # entity naming itself instead of translating.
             if not any(
                 base in bases
                 for base in (
                     "DahuaBaseEntity",
                     "DahuaEventDrivenEntity",
                     "DahuaEventSensor",
+                    "DahuaHostEntity",
+                    "DahuaAlarmOutputSwitch",
                 )
             ):
                 offenders.append("%s.%s" % (name, classname))

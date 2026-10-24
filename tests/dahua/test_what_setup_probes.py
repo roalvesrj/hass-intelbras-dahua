@@ -27,6 +27,7 @@ from types import SimpleNamespace
 
 from custom_components.dahua import DahuaDataUpdateCoordinator
 from custom_components.dahua.client import DahuaClient
+from custom_components.dahua.const import UPDATE
 
 # Every question setup asks, and the capability it decides. Taken from the source:
 # each of these is one try block whose handler sets exactly this attribute.
@@ -46,7 +47,31 @@ PROBES = [
         "IPC-COLOR4M-TZ",
     ),
     ("async_get_privacy_mode", "_supports_privacy_mode", None),
+    # The device's cloud connection, which a VTO2000A refuses with a 500
+    # while serving four other tables on the same request (#591).
+    ("async_get_cloud_connection", "_supports_cloud_connection", None),
+    ("async_get_cloud_upgrade_info", "_supports_cloud_upgrade", None),
+    # A PTZ camera's AI tour plan (#1051). Judged on this channel's own row,
+    # since the table is indexed by channel and one row of it can be null.
+    ("async_get_intelli_tour", "_supports_intelli_tour", None),
+    # The picture adjustments (#1006). This one was added without a probe at
+    # all: the read sat in the poll's fan-out gated on nothing but the platform,
+    # so a device that refuses the table failed every refresh. Listed here so it
+    # inherits the three properties this file is about, which is exactly what it
+    # did not have.
+    ("async_get_video_color", "_video_color_fields", None),
+    # The device's own processor and memory. Both are RPC2 only with no CGI
+    # form, so a device with RPC2 switched off refuses them in a way none of the
+    # others do -- with a RuntimeError, not a ClientResponseError -- which is
+    # why that handler is broader than PROBE_FAILED. Listed here for the three
+    # properties this file is about.
+    ("async_get_system_load", "_supports_system_load", None),
 ]
+
+# The probes whose capability is a set of field names rather than a bool, so
+# "off" for them is an empty set. Only the picture adjustments: a device can
+# serve three of the four, and a single yes could not say which.
+PROBE_SETS = {"_video_color_fields"}
 
 
 # What setup asks the coordinator about itself. Off, so the fan-out afterwards is
@@ -61,10 +86,12 @@ SELF_METHODS = (
 )
 
 FLAGS = (
+    "_supports_cloud_upgrade",
     "_supports_coaxial_control",
     "_supports_day_night_color",
     "_supports_disarming_linkage",
     "_supports_event_notifications",
+    "_supports_intelli_tour",
     "_supports_floodlightmode",
     "_supports_lighting",
     "_supports_lighting_scheme_illuminator",
@@ -73,6 +100,8 @@ FLAGS = (
     "_supports_profile_mode",
     "_supports_ptz_position",
     "_supports_smart_motion_detection",
+    "_supports_system_load",
+    "_video_color_fields",
 )
 
 
@@ -171,6 +200,9 @@ def _coordinator(hass, refusing=None, model="IPC-HFW1234"):
     # passes because nothing happened. The coaxial one is gated this way and was
     # doing exactly that until a test asserted it had been asked.
     c._wanted_by = lambda *a, **k: True
+    # The coaxial probe is gated on this too, and the model above has no siren,
+    # security light or flood light that would make it True on its own.
+    c.reads_coaxial_status = lambda: True
     c.channel_option = lambda key, default=None: default
     c.get_coaxial_status_channel = lambda: 0
     c.get_rpc2_coaxial_status_channel = lambda: 1
@@ -222,6 +254,18 @@ async def test_setup_only_runs_its_probes_once(hass):
     await coordinator._async_update_data()
 
     assert asked == [], "the capability probes ran again on the second poll"
+
+
+async def test_the_cloud_upgrade_probe_is_not_asked_without_the_update_platform(hass):
+    """The record feeds only the informational update entity, so setup must not
+    spend a read on a device that will never show one. The poll half of the same
+    gate is pinned in test_poll_skips_unused.py; this is the setup half."""
+    coordinator = _coordinator(hass)
+    coordinator._wanted_by = lambda *platforms: UPDATE not in platforms
+
+    await coordinator._async_update_data()
+
+    assert "async_get_cloud_upgrade_info" not in coordinator.client.asked
 
 
 # --- a capability that worked and then stopped -------------------------------
@@ -314,7 +358,15 @@ async def test_a_refused_probe_turns_its_own_capability_off(hass, method, flag, 
 
     await coordinator._async_update_data()
 
-    assert getattr(coordinator, flag) is False
+    got = getattr(coordinator, flag)
+    # `is False` for the bools rather than `== False`, which would also accept a
+    # 0 or an empty string from a handler that had quietly started storing
+    # something else. The picture adjustments are the one capability that is a
+    # set of field names, so theirs is compared as an empty set.
+    if flag in PROBE_SETS:
+        assert got == frozenset()
+    else:
+        assert got is False
 
 
 @pytest.mark.parametrize("method, flag, model", PROBES)
@@ -332,3 +384,19 @@ async def test_a_refused_probe_leaves_the_others_alone(hass, method, flag, model
 
     got = {name: getattr(refusing, name) for name in FLAGS if name != flag}
     assert got == expected, "refusing %s also changed another capability" % method
+
+
+async def test_a_coaxial_status_nothing_reads_is_not_asked_at_setup(hass):
+    """A recorder without the deterrence opt-in has no entity that reads this
+    status, and the poll never fetches it. Asking anyway cost a full timeout per
+    setup on an NVR whose channels never answer `coaxialControlIO.cgi`.
+    `test_every_probe_is_actually_asked` is the other half: with the rule True,
+    the same fake is asked."""
+    coordinator = _coordinator(hass)
+    coordinator.reads_coaxial_status = lambda: False
+
+    await coordinator._async_update_data()
+
+    assert coordinator.initialized is True
+    assert "async_get_coaxial_control_io_status" not in coordinator.client.asked
+    assert coordinator._supports_coaxial_control is False

@@ -10,20 +10,36 @@ pytest_plugins = ["pytest_homeassistant_custom_component"]
 
 @pytest.fixture(autouse=True)
 def _clear_shared_host_reads():
-    """The host read cache is module state and holds tasks.
+    """The host read caches are module state and hold tasks.
 
     A task left behind by one test belongs to that test's event loop, so this
-    has to be cleared for every test, not just the ones that know about it.
+    has to be cleared for every test, not just the ones that know about it. The
+    load reading is the same shape -- a _SharedRead, good for thirty seconds --
+    so a leaked one is usable from a later test, on a loop that has gone.
     """
     from custom_components.dahua import client as client_module
 
     client_module._HOST_CACHE.clear()
     client_module._HOST_LIMITS.clear()
     client_module._HOST_REMOTE_IVS_LOCKS.clear()
+    client_module._HOST_LIGHTING_SCHEME_LOCKS.clear()
+    client_module._HOST_SPEAKER_LOCKS.clear()
+    client_module._HOST_VTH_PHONE_LOCKS.clear()
+    client_module._HOST_VTO_INFO_LOCKS.clear()
+    client_module._HOST_SYSTEM_LOAD.clear()
+    from custom_components.dahua import coordinator as coordinator_module
+
+    coordinator_module._HOST_UNPLAYABLE.clear()
     yield
     client_module._HOST_CACHE.clear()
     client_module._HOST_LIMITS.clear()
     client_module._HOST_REMOTE_IVS_LOCKS.clear()
+    client_module._HOST_LIGHTING_SCHEME_LOCKS.clear()
+    client_module._HOST_SPEAKER_LOCKS.clear()
+    client_module._HOST_VTH_PHONE_LOCKS.clear()
+    client_module._HOST_VTO_INFO_LOCKS.clear()
+    client_module._HOST_SYSTEM_LOAD.clear()
+    coordinator_module._HOST_UNPLAYABLE.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -53,6 +69,23 @@ def _clear_host_uptime():
     yield
     dahua_module._HOST_UPTIME_STATE.clear()
     dahua_module._HOST_UPTIME_LOCKS.clear()
+
+
+@pytest.fixture(autouse=True)
+def _clear_lighting_recovery_files():
+    """The lock and cache the lighting recovery stores share per file.
+
+    Shared so that a recorder's twelve channel coordinators, which each build
+    their own store object over one file, do not each cache it. That makes it
+    module state keyed by config entry id, and two tests using the same entry
+    id would otherwise read each other's. The lock goes with it, because a
+    lock belongs to the loop it was created on.
+    """
+    from custom_components.dahua import illuminator_restore
+
+    illuminator_restore._FILES.clear()
+    yield
+    illuminator_restore._FILES.clear()
 
 
 @pytest.fixture(autouse=True)

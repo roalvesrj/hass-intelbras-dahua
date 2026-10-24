@@ -17,7 +17,13 @@ import asyncio
 
 import pytest
 
-from custom_components.dahua.illuminator_restore import IlluminatorRestoreStore
+from custom_components.dahua.illuminator_restore import (
+    OVERRIDE_UNIQUE_ID_SUFFIX,
+    _FileState,
+    ChannelLightingSnapshotStore,
+    IlluminatorRestoreStore,
+    override_store_key,
+)
 
 
 class _Store:
@@ -25,7 +31,12 @@ class _Store:
 
     def __init__(self, on_disk=None):
         self.saved = []
+        self.removed = 0
         self._on_disk = dict(on_disk or {})
+
+    async def async_remove(self):
+        self.removed += 1
+        self._on_disk = {}
 
     async def async_save(self, data):
         self.saved.append(data)
@@ -45,8 +56,11 @@ def _store(data, on_disk=None):
     save just wrote.
     """
     store = object.__new__(IlluminatorRestoreStore)
-    store._lock = asyncio.Lock()
-    store._data = dict(data)
+    # The lock and the cache belong to the file rather than to the object, so
+    # that a recorder's channels share one of each. A fresh holder per test is
+    # what keeps these cases apart.
+    store._file = _FileState()
+    store._file.data = dict(data)
     backing = _Store(data if on_disk is None else on_disk)
     store._store = backing
     store._new_store = lambda: backing
@@ -110,7 +124,7 @@ async def test_removing_something_that_is_not_there_writes_nothing():
     await store.async_remove(0, 1)
 
     assert store._store.saved == [], "rewrote the file with no change to make"
-    assert store._data == {"2:3": "Off"}
+    assert store._file.data == {"2:3": "Off"}
 
 
 async def test_removing_one_does_not_disturb_the_other_channels():
@@ -146,4 +160,49 @@ async def test_a_verified_removal_updates_what_is_held_in_memory():
 
     await store.async_remove(0, 1)
 
-    assert store._data == {"2:3": "Off"}
+    assert store._file.data == {"2:3": "Off"}
+
+
+# --- and the removal, for an entry that is going ----------------------------
+#
+# All three stores are keyed by config entry id, so removing the entry left them
+# in `.storage` for ever and unreachable with it: a re-add gets a new id.
+
+
+def test_the_override_store_key_is_built_in_one_place():
+    """light.py wrote this f-string itself, and the removal has to find the same
+    name. Two copies of a storage key is a key that can drift."""
+    assert (
+        override_store_key("e1", "SERIAL1_illuminator")
+        == "dahua.illuminator_restore.e1.SERIAL1_illuminator"
+    )
+
+
+def test_the_override_suffix_is_what_the_entity_uses():
+    """The removal finds those stores through the entity registry by this
+    suffix, and the illuminator builds its unique_id with it."""
+    assert OVERRIDE_UNIQUE_ID_SUFFIX == "_illuminator"
+
+
+async def test_removing_the_modes_store_drops_the_file_and_the_cache():
+    store = IlluminatorRestoreStore.__new__(IlluminatorRestoreStore)
+    store._file = _FileState()
+    store._store = _Store()
+    store._file.data = {"0:0": "AIMode"}
+
+    await store.async_remove_all()
+
+    assert store._store.removed == 1
+    assert store._file.data is None, "a later read would answer from the cache"
+
+
+async def test_removing_the_snapshot_store_drops_the_file_and_the_cache():
+    store = ChannelLightingSnapshotStore.__new__(ChannelLightingSnapshotStore)
+    store._file = _FileState()
+    store._store = _Store()
+    store._file.data = {"11": {"LightingScheme": []}}
+
+    await store.async_remove_all()
+
+    assert store._store.removed == 1
+    assert store._file.data is None

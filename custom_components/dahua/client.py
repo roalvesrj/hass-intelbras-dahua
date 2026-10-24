@@ -4,14 +4,24 @@ import logging
 import re
 import socket
 from copy import deepcopy
-from contextlib import suppress
+from contextlib import AsyncExitStack, asynccontextmanager, suppress
 import asyncio
 import time
 import aiohttp
+from multidict import CIMultiDict
+from yarl import URL
 
+from homeassistant.exceptions import HomeAssistantError
+
+from .const import ALL_EVENTS, DOMAIN
+from .dhip import DhipLoginRefused, DhipTransport
 from .digest import DigestAuth
 from .ivs import ivs_rule_index
 from .rpc2 import DahuaRpc2Client, Rpc2MethodRefused
+
+# An indoor monitor's call settings: do not disturb, and the volumes (#949, #998).
+VTH_PHONE_TABLE = "VideoTalkPhoneGeneral"
+from . import white_light_override as wlo
 from hashlib import md5
 from urllib.parse import quote
 
@@ -83,10 +93,106 @@ RPC2_EVENT_HEARTBEAT = b"Heartbeat\r\n"
 MAX_CONCURRENT_REQUESTS_PER_HOST = 2
 _HOST_LIMITS: dict = {}
 
+# How long a request may wait for one of those slots before it gives up.
+#
+# The cap above is this integration's own politeness, not a limit the device
+# announced, so time spent queueing for it must not be charged to the device's
+# clock. It was: every call site started `asyncio.timeout(TIMEOUT_SECONDS)` and
+# *then* queued for the semaphore, so on a recorder with enough channels the
+# back of the queue expired without ever being sent. Measured on a 19 channel
+# Amcrest NV5232E-16P in #1043: 1 channel of 19 set up, and the log filled with
+# timeouts naming a device that was answering everything it was actually asked.
+#
+# The wait needs a ceiling of its own all the same. A device that accepts
+# connections and then says nothing holds each slot for TIMEOUT_SECONDS, and
+# with the queue two wide a deep fan-out would otherwise grow with its own
+# depth: measured at 50s for a hundred reads, and it keeps going up.
+#
+# Three times TIMEOUT_SECONDS, which is a measurement rather than a guess. One
+# getConfig on a DHI-NVR5464-16P-EI costs a median 0.14s, so the deepest poll
+# reported so far -- 19 channels of around twenty reads each -- is 380 reads and
+# drains in about 26s two at a time. That is what has to fit under the ceiling,
+# and at TIMEOUT_SECONDS it did not, which is the bug. 60s leaves better than
+# twice that headroom while still bounding a wedged fan-out at roughly 80s.
+#
+# Longer than DEFAULT_SCAN_INTERVAL on purpose: a coordinator schedules its
+# next refresh when the current one finishes (`_schedule_refresh` is called at
+# the end of `_async_refresh`), so a slow poll delays the next one rather than
+# stacking up behind it.
+MAX_QUEUE_WAIT_SECONDS = 3 * TIMEOUT_SECONDS
+
 # A remote IVS write replaces a whole channel table. Entries for the same NVR
 # must serialize the fresh read and write together, even if they use different
 # RPC2 sessions or credentials.
 _HOST_REMOTE_IVS_LOCKS: dict[tuple[str, int], asyncio.Lock] = {}
+
+# One lock per device over its lighting tables. Keyed by device rather than
+# held on the client, because LightingScheme and Lighting_V2 are the device's
+# and a client is per channel: two channels of one recorder each holding their
+# own lock excluded each other from nothing. The turn-on saves its recovery
+# mode before it writes the camera, on purpose, so without this another
+# channel's poll can reconcile that key away in the gap and leave the camera
+# in WhiteMode with nothing to go back to.
+_HOST_LIGHTING_SCHEME_LOCKS: dict[str, asyncio.Lock] = {}
+
+# One clip at a time per speaker, keyed by device and channel.
+_HOST_SPEAKER_LOCKS: dict[tuple, asyncio.Lock] = {}
+
+# Whole-table call-setting writes must preserve other in-flight changes,
+# including writes from another client or user on the same monitor.
+_HOST_VTH_PHONE_LOCKS: dict[str, asyncio.Lock] = {}
+
+# The same, for VTOInfo. Keyed by device rather than by client, because the two
+# entities that write this table belong to different HA platforms: a platform's
+# PARALLEL_UPDATES serialises its own entities and says nothing about anyone
+# else's, and the select and the number here are one of each. Read-modify-write
+# is the only safe shape on a VTH (see _async_set_vto_slot_field), so without
+# this both callers copy the same table and the later write puts back the
+# other's old value, having answered True for its own.
+_HOST_VTO_INFO_LOCKS: dict[str, asyncio.Lock] = {}
+
+# Pushing audio to a device's speaker. `singlepart` is a stream rather than an
+# upload: the device plays what arrives as it arrives, sends no status line of
+# any kind, and leaves the socket open. Measured on a VTO2000A, where an
+# unknown action on the same CGI is refused in 0.26s while this one is simply
+# held. So the client owns the rate, decides when the clip has ended, and
+# closes; there is no response to read success from.
+AUDIO_POST_PATH = "/cgi-bin/audio.cgi?action=postAudio&httptype=singlepart&channel={0}"
+
+# How long to listen for an answer that is not expected, after the last byte.
+# Only a device that refuses -- a wrong codec, a busy talk channel -- is
+# expected to say anything at all, and this is how long it is given to.
+AUDIO_REFUSAL_GRACE_SECONDS = 2.0
+
+# How finely the clip is fed to the device. Ten writes a second is small enough
+# that a device consuming in real time is never more than 100ms ahead of its
+# buffer, and coarse enough not to spend a syscall per 100 bytes.
+AUDIO_WRITES_PER_SECOND = 10
+
+# How much slower than its declared rate a device may drain and still be given
+# the whole clip. Four, because that is the size of the mistake actually on
+# offer: 16-bit PCM at 16 kHz is 32000 bytes a second and A-law at 8 kHz is
+# 8000, so a caller who names the wrong one of those two is out by exactly this
+# factor. Tolerating it matters more than it sounds: a push given up on part
+# way is the shape a VTO2000A was found hung after, so a caller who guesses the
+# rate high should hear slow audio rather than risk that.
+AUDIO_SLOWEST_TOLERATED = 4.0
+
+# No progress at all for this long means the device has stopped taking audio,
+# whatever rate was declared. Distinct from the ceiling above: that one bounds
+# a device draining slowly, this one catches one that has stopped, and only the
+# second is worth giving up on quickly.
+#
+# Spelled out rather than aliased to TIMEOUT_SECONDS, which it equals, because
+# the two are patched separately in tests and an alias bound at import time
+# would quietly ignore one of them. It must not exceed the flat part of the
+# ceiling, or a device that never takes a byte would be reported as playing
+# slowly instead of as never having started.
+AUDIO_STALL_SECONDS = 20.0
+
+# How often the send is looked in on while it runs. Only the granularity of the
+# two limits above, so it wants to be well under either.
+AUDIO_PROGRESS_CHECK_SECONDS = 1.0
 
 
 def _describe_client_error(exception) -> str:
@@ -162,6 +268,36 @@ def _remote_ivs_lock(device: str, channel: int) -> asyncio.Lock:
     if lock is None:
         lock = asyncio.Lock()
         _HOST_REMOTE_IVS_LOCKS[key] = lock
+    return lock
+
+
+def _lighting_scheme_lock(device: str) -> asyncio.Lock:
+    """This device's lighting tables, shared by every channel's client."""
+    lock = _HOST_LIGHTING_SCHEME_LOCKS.get(device)
+    if lock is None:
+        lock = asyncio.Lock()
+        _HOST_LIGHTING_SCHEME_LOCKS[device] = lock
+    return lock
+
+
+def _speaker_lock(device: str, channel_number: int) -> asyncio.Lock:
+    """One speaker, so one clip at a time on it.
+
+    Keyed per device *and* channel, which is the scope the hardware has. A
+    doorbell has one of each and the distinction costs it nothing, but a
+    recorder addresses a different camera per channel and each of those has a
+    speaker of its own, so a per-device lock would make eight independent
+    speakers queue behind one another. Scope is the recurring bug in this
+    integration and the cheap direction to be wrong in is the narrow one.
+
+    Per device rather than per address because two boxes behind one IP on
+    different ports are not each other (#1084).
+    """
+    key = (device, channel_number)
+    lock = _HOST_SPEAKER_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _HOST_SPEAKER_LOCKS[key] = lock
     return lock
 
 
@@ -346,8 +482,13 @@ async def _release_rpc2(key) -> None:
         # A device that will not take the logout will time the session out on
         # its own. Losing the socket matters more than losing the courtesy.
         _LOGGER.debug("RPC2 logout failed for %s", key[0], exc_info=True)
-    if not holder.session.closed:
-        await holder.session.close()
+    try:
+        close = getattr(holder.client, "close", None)
+        if close is not None:
+            await close()
+    finally:
+        if not holder.session.closed:
+            await holder.session.close()
 
 
 def _digest_state(device: str, username: str) -> dict:
@@ -414,8 +555,21 @@ def vth_camera_links(vto_table, camera_table) -> dict:
     On one extension LinkIPC was absent rather than empty, which reads as no
     camera.
 
-    Only names and keys are kept. VTHRemoteIPCInfo also holds each camera's
-    login, and none of that leaves here.
+    ⭐ RingVolume comes out of the same slot, and that is why this reads more
+    than its name says: the table is already in hand and a second read of it to
+    carry one integer would be a second login on a device that logs every one.
+    Measured on two VTH5221D (3.000.0012000.0.R) with the owner listening: both
+    monitors turned down to 10 rang audibly quieter than at 70, while
+    `VideoTalkPhoneGeneral.RingVolume` stayed at 70 throughout. So the per-VTO
+    volume is live, and it is a SEPARATE setting from the monitor-wide one that
+    `DahuaMonitorVolumeNumber` already exposes, not a second view of it.
+
+    ⚠ `LinkIPC` is absent from every slot on that 3.000 firmware while
+    RingVolume is present on all twenty, so a slot can carry one and not the
+    other and neither may stand in for the other's absence.
+
+    Only names, keys and the volume are kept. VTHRemoteIPCInfo also holds each
+    camera's login, and none of that leaves here.
     """
     if not isinstance(vto_table, dict) or not isinstance(camera_table, dict):
         raise ValueError(
@@ -426,9 +580,22 @@ def vth_camera_links(vto_table, camera_table) -> dict:
         if not _configured(entry):
             continue
         link = entry.get("LinkIPC")
+        volume = entry.get("RingVolume")
         vtos[key] = {
             "name": str(entry.get("MachineAddress") or "").strip() or key,
             "link": link if isinstance(link, str) else "",
+            # None rather than a default, so the entity can be withheld from a
+            # slot that does not carry one. A slider reading an invented 0 is
+            # worse than no slider (#641), and it would be a slider that looks
+            # like the monitor is already silent.
+            #
+            # ⚠ `bool` is an `int` in Python, and a device that answered `true`
+            # here would otherwise arrive as the volume 1.
+            "ring_volume": (
+                volume
+                if isinstance(volume, int) and not isinstance(volume, bool)
+                else None
+            ),
         }
     cameras = {
         key: str(entry.get("MachineAddress") or "").strip() or key
@@ -512,6 +679,18 @@ CONFIG_CACHE_TTL_SECONDS = 300
 # getConfig is a settings read. getStatus and the rest report live state.
 CONFIG_READ_MARKER = "action=getConfig"
 _HOST_CACHE: dict = {}
+
+# The processor and memory reading, per device, as a _SharedRead. Two numbers
+# that describe the box, asked for by every channel of a recorder on every poll,
+# so they are shared the way the config reads are -- including while the request
+# is still in flight, which is the case that matters here. Cleared by
+# clear_host_cache.
+_HOST_SYSTEM_LOAD: dict = {}
+
+# Short enough that a diagnostic sensor still moves, long enough that channels
+# whose polls have drifted apart still share one request. The poll interval
+# itself is 120s by default, so this mostly guards the within-cycle duplicates.
+SYSTEM_LOAD_TTL_SECONDS = 30
 
 
 def _cache_lifetime(url: str) -> int:
@@ -599,9 +778,94 @@ def clear_host_cache(scope: str) -> None:
     the connector teardown has only the address, and dropping everything behind
     it is right there because the connector is going too.
     """
+    # The load reading goes too: it is keyed by device key, so match the same
+    # two ways. A write is not a reason to distrust it, but a connector
+    # teardown is, and this helper serves both.
+    for key in [
+        k for k in _HOST_SYSTEM_LOAD if k == scope or str(k).startswith(scope + ":")
+    ]:
+        _HOST_SYSTEM_LOAD.pop(key, None)
     stale = [k for k in _HOST_CACHE if k[0] == scope or k[0].startswith(scope + ":")]
     for key in stale:
         del _HOST_CACHE[key]
+
+
+async def cancel_reads_issued_on(session) -> None:
+    """Stop the reads still in flight on a session that is about to close.
+
+    `clear_host_cache` forgets a shared read, which is all a write needs: the
+    request is still wanted by whoever is waiting on it, and it finishes into
+    their hands. Shutdown is the other case. There the session the read is
+    using is about to be closed under it, and forgetting the task leaves it
+    running against a session that is no longer there, with nobody left to
+    collect what it raises:
+
+        AssertionError: assert self._connector is not None
+        RuntimeError: Session is closed
+        ERROR Error doing job: AssertionError exception in shielded future
+
+    Reported on a restart in #1043. Nothing is lost by cancelling one of these:
+    the client that issued it is stopping and the answer has nowhere to go.
+
+    **By session, not by device.** One read of one URL is shared by every entry
+    on the device, and they do not share a session: there is one per
+    coordinator, closed by that coordinator. Cancelling everything for the
+    device would take away a read another entry is waiting on and is still
+    running, which is a worse bug than the one being fixed.
+
+    A read that has already landed is left where it is. Its answer does not
+    depend on any session, and dropping it would make the next entry on this
+    device ask the hardware again for something it has just been told.
+    """
+    if session is None:
+        return
+
+    cancelled = []
+
+    for store in (_HOST_SYSTEM_LOAD, _HOST_CACHE):
+        for key, entry in list(store.items()):
+            owner = getattr(entry, "owner", None)
+            if owner is None or owner is not session:
+                # None is "nobody said", which must never match: a client with
+                # no session of its own would otherwise cancel every read that
+                # also had none.
+                continue
+            task = getattr(entry, "task", None)
+            if task is None:
+                continue
+            if not task.done():
+                store.pop(key, None)
+                task.cancel()
+                cancelled.append(task)
+            elif not task.cancelled() and task.exception() is not None:
+                # Reading `.exception()` is itself what marks it retrieved, so
+                # the failure that was already there does not become the log
+                # line this exists to remove. The entry goes with it: a read
+                # that failed was never usable anyway.
+                store.pop(key, None)
+
+    if cancelled:
+        await asyncio.gather(*cancelled, return_exceptions=True)
+
+
+class ReadAfterClose(asyncio.CancelledError):
+    """A read asked for after its client started closing.
+
+    `cancel_reads_issued_on` stops the reads that were already out when a
+    client closed. This is the other half: the reads that had not gone out
+    yet. A poll is a fan-out of many reads, and the entry can stop in the
+    middle of one, so a branch that has not reached its read yet will reach it
+    with the session on its way out and fail the way #1043 reported.
+
+    A `CancelledError` rather than a connection error, for the same reason
+    #1064 left a cancelled waiter alone: a cancellation unwinds the poll in
+    silence, while an error raises `Exception fetching information from ...`
+    once per branch, which is the noise this exists to remove. It also passes
+    straight through the `except Exception` handlers that would otherwise read
+    it as the device's verdict: `_note_probe_refusal` would record a
+    capability as absent, and the RPC2 fallback would write the transport off
+    for the host. Both of those outlive the entry that is stopping.
+    """
 
 
 class _SharedRead:
@@ -611,11 +875,14 @@ class _SharedRead:
     than issuing their own. Once it lands, it answers again for the TTL.
     """
 
-    __slots__ = ("task", "expires_at")
+    __slots__ = ("task", "expires_at", "owner")
 
-    def __init__(self, task: asyncio.Task) -> None:
+    def __init__(self, task: asyncio.Task, owner=None) -> None:
         self.task = task
         self.expires_at = None  # stamped when the request lands
+        # The session the request was issued on, so that a client closing can
+        # stop its own reads without touching another entry's (#1043).
+        self.owner = owner
 
     def is_usable(self, now: float) -> bool:
         if not self.task.done():
@@ -648,12 +915,30 @@ def _pop_complete_multipart_part(buffer: bytes, boundary: bytes):
     if start:
         buffer = buffer[start:]
 
-    header_end = buffer.find(b"\r\n\r\n", len(boundary))
+    # How far this part can possibly extend. Everything below stays inside
+    # it, which is the whole of #995: the header search ran to the end of the
+    # buffer, so a part whose headers run straight into its payload -- the
+    # heartbeat on a DH-SD42A212TN-HNI does exactly that, with no blank line
+    # -- found its separator inside the *next* part's headers. The
+    # Content-Length scan below then read a range spanning both parts and
+    # took the first value in it, which was the heartbeat's 9. Applied to the
+    # event that followed, that delivered nine bytes of it: `Code=Cros`.
+    next_boundary = buffer.find(boundary, len(boundary))
+    part_limit = next_boundary if next_boundary != -1 else len(buffer)
+
+    header_end = buffer.find(b"\r\n\r\n", len(boundary), part_limit)
     separator_len = 4
     if header_end == -1:
-        header_end = buffer.find(b"\n\n", len(boundary))
+        header_end = buffer.find(b"\n\n", len(boundary), part_limit)
         separator_len = 2
     if header_end == -1:
+        # No separator anywhere in this part. If the next boundary is already
+        # here the part is malformed and the framing is the only thing left
+        # to trust, so it is delivered whole and the reader makes what it can
+        # of it -- a heartbeat carries no Code and is dropped. Otherwise the
+        # headers may simply still be arriving.
+        if next_boundary != -1:
+            return buffer[:next_boundary], buffer[next_boundary:]
         return None, buffer
 
     payload_start = header_end + separator_len
@@ -671,6 +956,10 @@ def _pop_complete_multipart_part(buffer: bytes, boundary: bytes):
 
     if content_length is not None:
         part_end = payload_start + content_length
+        # Found again from the payload rather than reusing the one above:
+        # that one is the first boundary after this part's own, which for a
+        # well-formed part is the same position, and for a payload that
+        # happens to contain the boundary bytes is not.
         next_boundary = buffer.find(boundary, payload_start)
 
         # If the next part starts before the declared payload end, the length
@@ -735,6 +1024,52 @@ def _storage_int(value) -> int:
         return int(float(value))
     except (TypeError, ValueError):
         return 0
+
+
+def parse_storage_device_details(params: dict) -> dict:
+    """What each disk *is*, from RPC2 StorageDeviceManager.getDeviceInfos.
+
+    The CGI read behind parse_storage_disks answers state and capacity and
+    nothing about the hardware. This method answers the rest, and measured on a
+    DHI-NVR5464-16P-EI it is served while every health-shaped method on the same
+    service is refused (268632080), so the SMART ceiling in parse_storage_disks
+    stands -- this is identity, not health:
+
+        {"device": [{"Name": "/dev/sda", "Module": "ST6000VX00232EF110",
+                     "SerialNo": "ZAD3KYFP", "Firmware": "SC60", "BUS": "SATA",
+                     "Media": "DISK", "PowerMode": "Active",
+                     "Capacity": 6001175126016.0, "Partitions": [...]}, ...]}
+
+    Keyed by the name the CGI read uses, so the two can be joined. Returns {}
+    for anything unexpected rather than raising: this is an enhancement to a
+    diagnostic sensor and must never be the reason one disappears.
+
+    Note the capacity disagrees with the CGI's summed partitions -- 6001175126016
+    against 5923181428736 for the same disk -- because one is the disk and the
+    other is what is formatted on it. Both are reported, under names that say
+    which is which.
+    """
+    if not isinstance(params, dict):
+        return {}
+    devices = params.get("device")
+    if not isinstance(devices, list):
+        return {}
+    found = {}
+    for device in devices:
+        if not isinstance(device, dict):
+            continue
+        name = device.get("Name")
+        if not name:
+            continue
+        found[str(name)] = {
+            "model": str(device.get("Module") or "").strip() or None,
+            "serial": str(device.get("SerialNo") or "").strip() or None,
+            "firmware": str(device.get("Firmware") or "").strip() or None,
+            "bus": str(device.get("BUS") or "").strip() or None,
+            "power_mode": str(device.get("PowerMode") or "").strip() or None,
+            "capacity_bytes": _storage_int(device.get("Capacity")),
+        }
+    return found
 
 
 def parse_storage_disks(data: dict) -> list:
@@ -804,6 +1139,80 @@ def parse_storage_disks(data: dict) -> list:
         )
         result.append(disk)
     return result
+
+
+def parse_alarm_inputs(data: dict) -> list:
+    """A recorder's own alarm input terminals, from the `Alarm` config table.
+
+    The device answers with the flat keys the CGI parser preserves verbatim:
+
+        table.Alarm[0].Enable=true
+        table.Alarm[0].Name=Alarm-in Port1
+        table.Alarm[0].SensorType=NO
+
+    Returns one dict per input -- index, name, enabled -- ordered by index.
+
+    **The index is the array position and the device's own name is one more
+    than it.** Measured on a DHI-NVR5464-16P-EI by making unwired inputs read
+    active (`SensorType` NO -> NC, which makes an open circuit the alarm
+    state): flipping `Alarm[3]`, whose Name is `"Alarm-in Port4"`, produced
+    `Code=AlarmLocal;action=Start;index=3`, and `Alarm[14]` produced
+    `index=14`. So the wire counts from zero while the web interface counts
+    from one, and the name the device supplies is the only thing that says so.
+    That is why the name is carried here rather than regenerated: a recorder
+    whose ports are numbered differently, or renamed by its owner, still
+    describes itself correctly.
+
+    An empty dict in gives an empty list out, which is what a device without
+    the table answers -- `getConfig` for a table a device does not have
+    returns 200 with nothing rather than erroring.
+    """
+    inputs: dict = {}
+    for key, value in data.items():
+        if not key.startswith("table.Alarm[") or "]" not in key:
+            continue
+        index_text, _, rest = key[len("table.Alarm[") :].partition("]")
+        if not index_text.isdigit():
+            continue
+        rest = rest.lstrip(".")
+        # EventHandler.* is the linkage tree -- what the device itself does
+        # when the input trips. None of it describes the terminal, so it is
+        # skipped rather than carried into an entity.
+        if rest not in ("Enable", "Name"):
+            continue
+        index = int(index_text)
+        entry = inputs.setdefault(index, {"index": index, "name": "", "enabled": True})
+        if rest == "Name":
+            entry["name"] = str(value)
+        else:
+            entry["enabled"] = str(value).lower() == "true"
+    return [inputs[index] for index in sorted(inputs)]
+
+
+def parse_alarm_state_bitmask(data: dict, slots: int) -> set:
+    """Which alarm inputs are active now, from `alarm.cgi?action=getInState`.
+
+    The device answers one line, `result=8`, and the number is a bitmask over
+    the input indexes: 8 is 1<<3, 16384 is 1<<14. Measured against the two
+    inputs flipped above, so the bit position is the same 0-based index the
+    event carries.
+
+    `slots` bounds the scan, from `getInSlots`. Returns a set of indexes.
+    An unreadable or negative mask raises ValueError: silence is not proof
+    that every physical contact is inactive.
+
+    This matters more than it looks: without it, a restart while a door is
+    held open shows the sensor off until the next edge, and an edge may be
+    hours away.
+    """
+    raw = data.get("result")
+    try:
+        mask = int(str(raw).strip())
+    except (TypeError, ValueError) as error:
+        raise ValueError("Dahua did not return a readable alarm state") from error
+    if mask < 0:
+        raise ValueError("Dahua returned a negative alarm state")
+    return {index for index in range(max(slots, 0)) if mask & (1 << index)}
 
 
 SECURITY_LIGHT_TYPE = 1
@@ -1099,6 +1508,21 @@ def _is_login_refused(exception: aiohttp.ClientResponseError) -> bool:
     return exception.status == 401
 
 
+# The four diagonals, which carry the speed in arg1 as well as in arg2.
+#
+# A straight move sends arg1=0 and the speed in arg2 only. A diagonal sent that
+# way reached the camera with one of its two components zeroed, which is what
+# #491 reported: the four straight directions and zoom steer the camera and the
+# diagonals do not. ZoneMinder's Dahua driver makes the same split, straight
+# moves with arg1 0 and every diagonal with arg1 and arg2 both set to the speed
+# (scripts/ZoneMinder/lib/ZoneMinder/Control/Dahua.pm, moveCon* and moveRel*).
+#
+# Which axis arg1 names is not documented anywhere this could be checked, so
+# nothing here assumes one: the diagonals get the same speed in both, which is
+# right either way round.
+PTZ_DIAGONAL_CODES = frozenset({"LeftUp", "RightUp", "LeftDown", "RightDown"})
+
+
 class DahuaClient:
     """
     DahuaClient is the client for accessing Dahua IP Cameras. The APIs were discovered from the "API of HTTP Protocol Specification" V2.76 2019-07-25 document
@@ -1106,6 +1530,24 @@ class DahuaClient:
 
     events is the list of events used to monitor on the camera (For example, motion detection)
     """
+
+    # Tests build clients with `object.__new__` and set only what the case
+    # under test needs, so a read of this on an instance that skipped
+    # `__init__` must not raise. One class default rather than `getattr` at
+    # each use.
+    _session = None
+
+    # Set by `close()` before it awaits anything, and never cleared: a closed
+    # client does not reopen. See `_refuse_if_closing`.
+    _closing = False
+
+    # Whether this device is read over DHIP because it serves no HTTP at all
+    # (#949). Here for the reason above: the shared RPC2 session's tests build
+    # clients with `object.__new__`, and the first version of this attribute
+    # took 44 of them down with an AttributeError the moment the session was
+    # acquired.
+    _rpc2_over_dhip = False
+    _require_reported_serial = False
 
     def __init__(
         self,
@@ -1118,6 +1560,9 @@ class DahuaClient:
         use_https: bool = None,
         use_rpc2: bool = False,
         illuminator_restore_store=None,
+        channel_snapshot_store=None,
+        rpc2_over_dhip: bool = False,
+        require_reported_serial: bool = False,
     ) -> None:
         self._username = username
         self._password = password
@@ -1149,10 +1594,25 @@ class DahuaClient:
         # from under the other entries.
         self._rpc2_acquired = False
         self._rpc2_released = False
+        # An indoor monitor with no web server at all (#949). Every read has to
+        # go over DHIP on 5000, because there is nothing listening on the HTTP
+        # port to refuse them.
+        #
+        # Carried as a flag from the config entry rather than discovered here.
+        # The existing "this device serves no CGI" learning reads an HTTP
+        # status: configManager.cgi answers 404 and _HOST_CGI_CONFIG_ABSENT
+        # remembers it. A device with no HTTP answers connection-refused, which
+        # is what a camera that is switched off also answers, so there is
+        # nothing in it to learn from. The add flow already establishes the
+        # difference, by logging in over DHIP and asking what the device is, so
+        # the answer is recorded there and read here.
+        self._rpc2_over_dhip = rpc2_over_dhip
+        self._require_reported_serial = require_reported_serial
         # Preserve the camera's policy while the illuminator temporarily owns
         # a channel/profile. Camera config survives HA restarts, so this must.
         self._illuminator_restore_store = illuminator_restore_store
-        self._lighting_scheme_lock = asyncio.Lock()
+        self._channel_snapshot_store = channel_snapshot_store
+        self._lighting_scheme_lock = _lighting_scheme_lock(self._device)
         # True once this device has failed to report a serial number and we have had
         # to derive its identity from the connection details instead. That derivation
         # includes the password, so the identity changes if the password does.
@@ -1256,12 +1716,72 @@ class DahuaClient:
             # identity simply fell back and the entry carried on.
             if strict_auth and _is_login_refused(e):
                 raise
+            if e.status in self.CONFIG_CGI_ABSENT:
+                # A monitor with no magicBox CGI still knows its own serial, and
+                # the hash below changes when the password does (#805).
+                #
+                # #1103 held this to monitors reached over DHIP, because a VTH
+                # that serves HTTP answers 404 to magicBox.cgi as well and
+                # those have entries today: every entity `unique_id` is built
+                # from this answer, so handing them the real serial renames all
+                # of them and leaves the user's automations on `_2` names.
+                # @kmich reported that against his own three VTH2421F-P, and
+                # also made the case for doing it properly: the generated id
+                # already moved on him once, when he changed the password.
+                # `migrate.py` now moves the registry with it, so the gate is
+                # gone and every monitor gets the serial printed on it.
+                vth = await self._vth_identity_over_rpc2()
+                if vth and vth.get("serial"):
+                    return {"serialNumber": vth["serial"]}
+                if vth or self._rpc2_over_dhip:
+                    # A monitor that would not name itself this time. Either
+                    # it still says it is a VTH, or it was identified as a
+                    # DHIP monitor when it was added and has no other
+                    # transport to be anything else on. A missing model,
+                    # firmware or serial now is no reason to assign it a
+                    # different device identity, so this retries rather than
+                    # hashing: the hash would give the entry a second set of
+                    # entities on `_2` names and nothing would undo it.
+                    #
+                    # The condition carries the whole fallback for everything
+                    # else. A camera whose CGI is simply absent is not a
+                    # monitor, has never had an identity but the hash, and
+                    # must still get one here or it stops setting up at all
+                    # (an SL300, and every `Generic RTSP` device in #583 and
+                    # #728). `vth` being None is how a device says it is not
+                    # one of these.
+                    #
+                    # Retry the actual reads too: _vth_identity_over_rpc2
+                    # memoises incomplete answers.
+                    self._vth_identity_asked = False
+                    self._vth_identity = None
+                    raise
+            if self._require_reported_serial:
+                # A previously migrated HTTP monitor must retry an unavailable
+                # identity read instead of returning to credential-derived IDs.
+                self._vth_identity_asked = False
+                self._vth_identity = None
+                raise
             self.identity_derived_from_credentials = True
-            not_hashed_id = "{0}_{1}_{2}_{3}".format(
-                self._address, self._rtsp_port, self._username, self._password
-            )
-            unique_cam_id = md5(not_hashed_id.encode("UTF-8")).hexdigest()
-            return {"serialNumber": unique_cam_id}
+            return {"serialNumber": self.credential_hash()}
+
+    def credential_hash(self) -> str:
+        """The identity this device gets when it will not state its own.
+
+        An md5 of the address, RTSP port, username and password. Three
+        fallbacks return it and the migration in `migrate.py` has to recognise
+        it in the registry, so it is defined once. It was written out four
+        times, and a copy that normalised the address differently would match
+        nothing and silently migrate nobody.
+
+        It is a poor identity and #805 is why: it changes when the password
+        does, so the same device comes back as a new one and every entity is
+        rebuilt under a new id. Anything that can state a real serial should.
+        """
+        not_hashed_id = "{0}_{1}_{2}_{3}".format(
+            self._address, self._rtsp_port, self._username, self._password
+        )
+        return md5(not_hashed_id.encode("UTF-8")).hexdigest()
 
     def _note_identity_fallback(self, what: str, exception) -> None:
         """Say why this device's identity had to be invented.
@@ -1360,6 +1880,23 @@ class DahuaClient:
         firmware = rpc2_software_version(version.get("params"))
         if not model or not firmware:
             return None
+        # The serial matters more than it looks. Without it `async_get_system_info`
+        # falls back to an md5 of the address, port, username and password, which
+        # is #805: the identity changes when the password does and the same
+        # monitor comes back as a new device. A VTH answers magicBox.getSerialNo
+        # (measured on 3.000.0012000.0.R: "3E0164EPAN00095"), so there is no need
+        # to derive one. Wrapped separately, because an identity without a serial
+        # is still better than no identity.
+        serial = None
+        try:
+            answer = await self._rpc2_shared_call(
+                lambda client: client.request("magicBox.getSerialNo", params=None)
+            )
+            serial = ((answer.get("params") or {}).get("sn") or "").strip() or None
+        except Exception:  # pylint: disable=broad-except
+            _LOGGER.debug(
+                "No serial over RPC2 from the VTH at %s", self._address, exc_info=True
+            )
         _LOGGER.info(
             "%s has no magicBox CGI and is a VTH; read its identity over RPC2: %s, %s",
             self._address,
@@ -1370,6 +1907,7 @@ class DahuaClient:
             "type": model,
             "version": firmware,
             "class": "VTH",
+            "serial": serial,
             "own_video": await self._vth_own_video(),
         }
         return self._vth_identity
@@ -1390,6 +1928,36 @@ class DahuaClient:
         Only a real boolean counts; anything else is None, which changes nothing.
         The table also lists the other devices with their credentials, so nothing
         but that one flag is kept or logged.
+
+        **Not every monitor describes itself in that table.** Measured on a
+        VTH5221D on 3.000.0012000.0.R, which has no camera either:
+
+            configManager.getConfig {"name": "RemoteDevice"}
+              rows: Vto00 .. Vto19, and no Local0 at all
+
+        So the read above answers None for it, the monitor is taken for one
+        with a camera, and it gets camera entities, a Motion Detection switch
+        and a `MotionDetect` read every poll. On the live device the camera
+        answers 500 through Home Assistant's own proxy and the switch reads
+        `off` out of a key that is not in the coordinator's data, because the
+        device refuses the table it comes from.
+
+        Where the monitor does not say, the video input table is asked
+        instead. Measured on the same device:
+
+            configManager.getConfig {"name": "MotionDetect"}  refused 268959743
+            configManager.getConfig {"name": "VideoInput"}    refused 268959743
+            devVideoInput.getCaps                             Method not found
+            magicBox.getProductDefinition  VideoInputChannels 1
+
+        A device that refuses the table naming its video input has no video
+        input, and that is a measurement rather than an inference from the
+        model name. The product definition is no help, for the same reason
+        VideoInputChannels is ignored above: it claims one either way.
+
+        Deliberately only asked when the monitor did not answer for itself. A
+        VTH that carries a Local0 row has already said yes or no, and anything
+        that is not a VTH never reaches here.
         """
         try:
             response = await self._rpc2_shared_call(
@@ -1402,9 +1970,44 @@ class DahuaClient:
             return None
         local = ((response.get("params") or {}).get("table") or {}).get("Local0")
         if not isinstance(local, dict) or local.get("DeviceClass") != "VTH":
-            return None
+            return await self._vth_refuses_video_input()
         support_video = local.get("SupportVideo")
         return support_video if isinstance(support_video, bool) else None
+
+    async def _vth_refuses_video_input(self) -> bool | None:
+        """False when this monitor refuses the VideoInput table, else None.
+
+        The second half of `_vth_own_video`, for a monitor that does not
+        describe itself in RemoteDevice. False means "it has no camera"; None
+        means "it did not say", which leaves the camera entities exactly where
+        they were.
+
+        A refusal is the only answer acted on. A read that fails for any other
+        reason -- the session dropped, the device was busy -- must not take a
+        working camera away, so everything except an explicit refusal is None.
+        """
+        try:
+            await self._rpc2_shared_call(
+                lambda client: client.request(
+                    "configManager.getConfig", params={"name": "VideoInput"}
+                )
+            )
+        except Rpc2MethodRefused as refused:
+            if rpc2_refusal_is_a_stale_login(refused):
+                return None
+            _LOGGER.debug(
+                "%s refuses the VideoInput table, so it has no camera of its own",
+                self._address,
+            )
+            return False
+        except Exception:  # pylint: disable=broad-except
+            _LOGGER.debug(
+                "Could not ask %s for its VideoInput table",
+                self._address,
+                exc_info=True,
+            )
+            return None
+        return None
 
     async def async_get_vth_camera_links(self) -> dict:
         """This VTH's camera links, see vth_camera_links. Raises when it cannot read them."""
@@ -1424,17 +2027,40 @@ class DahuaClient:
         )
         return vth_camera_links(table(vto_info), table(cameras))
 
-    async def async_set_vth_camera_link(self, vto: str, camera: str) -> bool:
-        """Make calls from VTOInfo slot `vto` open on camera slot `camera`; "" for none.
+    async def _async_set_vto_slot_field(
+        self, vto: str, field: str, value, absent_reads_as=None
+    ) -> bool:
+        """Change one field of one VTOInfo slot, writing the whole table back.
 
-        The whole VTOInfo table is read and written back with only that slot's
-        LinkIPC changed, which is the write measured on a VTH2421F-P: answered
-        `result: true`, read back, and the next call opened on the camera.
-        Writing the original value back restored the table byte for byte.
+        **The whole table, deliberately.** A single-field `setConfig` on a VTH
+        REPLACES the table and answers `result: true` while doing it -- measured
+        on a VTH5221D, where a one-key write to `VideoTalkPhoneGeneral` left one
+        field of sixteen and the monitor had to be rebuilt from a copy. That is
+        the opposite of the recorder convention in AGENTS.md, where a whole-table
+        write is refused for size; these tables are small enough that the limit
+        never applies. Measured both ways here: a VTOInfo write and the original
+        written back restored the table byte for byte, twenty slots before and
+        twenty after.
 
         Returns whether the value reads back, because a device answering OK to a
-        setConfig it ignored is a known shape here (#946). Safe to run twice, as
-        _rpc2_shared_call requires: it sets a value rather than toggling one.
+        `setConfig` it ignored is a known shape here (#946). Safe to run twice,
+        as `_rpc2_shared_call` requires: it sets a value rather than toggling one.
+
+        ⚠ The read is INSIDE the action, so a retry re-reads rather than writing
+        a table captured before an expired session. That alone is not enough to
+        make two concurrent writes safe, and this docstring used to claim it
+        was: rroller paused both initial reads on #1124 after each had copied
+        the same table, and the second write put the first's old `LinkIPC`
+        back while answering True for its own `RingVolume`. Reading inside the
+        action prevents a stale SESSION, not a lost UPDATE. The device-scoped
+        lock below is what prevents that, and it is shared by every caller and
+        every client for the device.
+
+        ⚠ `absent_reads_as` is what a MISSING key means on the readback, and it
+        differs per field rather than being a convenience: an absent `LinkIPC`
+        means no camera, so writing "" to a slot that answers without the key at
+        all has landed. An absent `RingVolume` means nothing of the sort, so it
+        is left as None and never matches.
         """
 
         async def write(client):
@@ -1444,7 +2070,7 @@ class DahuaClient:
             table = (current.get("params") or {}).get("table")
             if not isinstance(table, dict) or not isinstance(table.get(vto), dict):
                 raise ValueError("VTOInfo has no slot {0}".format(vto))
-            table[vto]["LinkIPC"] = camera
+            table[vto][field] = value
             await client.request(
                 "configManager.setConfig",
                 params={"name": "VTOInfo", "table": table, "options": []},
@@ -1453,9 +2079,100 @@ class DahuaClient:
                 "configManager.getConfig", params={"name": "VTOInfo"}
             )
             slot = ((check.get("params") or {}).get("table") or {}).get(vto)
-            return isinstance(slot, dict) and slot.get("LinkIPC", "") == camera
+            return isinstance(slot, dict) and slot.get(field, absent_reads_as) == value
 
-        return await self._rpc2_shared_call(write)
+        # ⚠ Outside `_rpc2_shared_call`, so the lock covers the retry too: a
+        # second attempt re-reads, and releasing between attempts would let the
+        # other writer in between this one's read and its write. Same placement
+        # as the VideoTalkPhoneGeneral writer below.
+        lock = _HOST_VTO_INFO_LOCKS.setdefault(self._device, asyncio.Lock())
+        async with lock:
+            return await self._rpc2_shared_call(write)
+
+    async def async_set_vth_camera_link(self, vto: str, camera: str) -> bool:
+        """Make calls from VTOInfo slot `vto` open on camera slot `camera`; "" for none.
+
+        Measured on a VTH2421F-P: answered `result: true`, read back, and the
+        next call opened on the camera, on the main monitor and both extensions.
+        Writing the original value back restored the table byte for byte.
+        """
+        return await self._async_set_vto_slot_field(
+            vto, "LinkIPC", camera, absent_reads_as=""
+        )
+
+    async def async_set_vth_vto_ring_volume(self, vto: str, volume: int) -> bool:
+        """Set the ring volume a monitor uses for calls from VTOInfo slot `vto`.
+
+        Asked for in #949 and measured on two VTH5221D (3.000.0012000.0.R) with
+        the owner listening: 70 down to 10 on both and the doorbell rang audibly
+        quieter, while `VideoTalkPhoneGeneral.RingVolume` stayed at 70. So this
+        is a different setting from the monitor-wide volume beside it, not a
+        second name for it.
+        """
+        return await self._async_set_vto_slot_field(vto, "RingVolume", int(volume))
+
+    async def async_get_video_talk_phone_general(self) -> dict:
+        """An indoor monitor's call settings, flat, or {} if it has none.
+
+        `VideoTalkPhoneGeneral` carries the do-not-disturb flag and the four
+        volumes. Measured on a VTH5221D (3.000.0012000.0.R): sixteen keys,
+        with `SilenceEnable` a real boolean and the volumes plain integers.
+        A device without the table answers empty rather than erroring, which
+        is why every caller gates on the key it reads rather than on this
+        returning something.
+        """
+        return await self.async_get_config(VTH_PHONE_TABLE)
+
+    async def async_set_video_talk_phone_field(self, field: str, value) -> None:
+        """Change one field of a monitor's call settings, writing the whole table.
+
+        **The whole table, deliberately, and this is the opposite of the rule
+        everywhere else here.** AGENTS.md says a write addresses one field,
+        because a recorder refuses a whole-table `setConfig` for size
+        (`errCode 287638033, "Request length error!"`). On a VTH that rule is
+        destructive: measured on a VTH5221D, `setConfig` with a single key
+        answered `result: true` and **replaced the table**, leaving one key of
+        sixteen and dropping the other fifteen, including the ring file and
+        every volume. The monitor had to be rebuilt from a copy read
+        beforehand. These tables are small, so the size limit that forces the
+        one-field rule elsewhere never applies.
+
+        So: read, change one key, write it all back. Proved both ways on the
+        hardware -- `SilenceEnable` and `RingVolume` each took, nothing else
+        moved, and writing the original back restored the table byte for byte.
+
+        The read is inside the action so a retried call re-reads rather than
+        writing a table captured before an expired session, and so two writes
+        racing cannot put back a copy made before the other.
+        """
+
+        async def write(rpc2):
+            params = await rpc2.get_config({"name": VTH_PHONE_TABLE})
+            table = (params or {}).get("table")
+            if not isinstance(table, dict):
+                raise ValueError(
+                    "{0} does not serve {1}".format(self._address, VTH_PHONE_TABLE)
+                )
+            if field not in table:
+                # Writing a key the table does not have is how a `setConfig`
+                # answers OK and changes nothing, so it is refused here
+                # instead of being reported as a success.
+                raise ValueError(
+                    "{0} has no {1}.{2}".format(self._address, VTH_PHONE_TABLE, field)
+                )
+            wanted = dict(table)
+            wanted[field] = value
+            await rpc2.request(
+                "configManager.setConfig",
+                params={"name": VTH_PHONE_TABLE, "table": wanted},
+            )
+
+        lock = _HOST_VTH_PHONE_LOCKS.setdefault(self._device, asyncio.Lock())
+        async with lock:
+            await self._rpc2_shared_call(write)
+            # This RPC2 write bypasses get(), which normally clears the shared
+            # five-minute config cache. Refresh must see the new settings.
+            clear_host_cache(self._device)
 
     def vth_own_video(self) -> bool | None:
         """For a VTH identified over RPC2: whether it has a camera. None otherwise.
@@ -1537,12 +2254,18 @@ class DahuaClient:
         except aiohttp.ClientResponseError as e:
             if _is_login_refused(e):
                 raise
+            if e.status in self.CONFIG_CGI_ABSENT:
+                # The model is a better name than a hash of the credentials,
+                # and it is what the add form showed when the monitor was added.
+                # Ungated with the serial above: a device name is cosmetic and
+                # does not rename an entity_id that already exists, but holding
+                # the two apart would have left a monitor called after its
+                # serial and named after its credentials.
+                vth = await self._vth_identity_over_rpc2()
+                if vth:
+                    return {"name": vth["type"]}
             self.identity_derived_from_credentials = True
-            not_hashed_id = "{0}_{1}_{2}_{3}".format(
-                self._address, self._rtsp_port, self._username, self._password
-            )
-            unique_cam_id = md5(not_hashed_id.encode("UTF-8")).hexdigest()
-            return {"name": unique_cam_id}
+            return {"name": self.credential_hash()}
 
     async def get_vendor(self) -> dict:
         """get_vendor returns the vendor. Example response: vendor=Dahua"""
@@ -1590,15 +2313,50 @@ class DahuaClient:
         """Return the number of physical alarm-output slots reported by the device."""
         return await self.get("/cgi-bin/alarm.cgi?action=getOutSlots")
 
-    async def async_get_alarm_output_state(self) -> dict:
-        """Return the physical alarm-output state.
+    async def async_get_alarm_output_state(self, slots: int = 1) -> dict:
+        """Return the physical alarm-output state, one key per output.
 
-        The response is deliberately left unmodified. Single-output devices
-        return ``result=0`` or ``result=1``; the encoding for devices with
-        multiple outputs has not yet been verified.
+        **The multi-output encoding is a bitmask, and it is now measured.**
+        This used to be capped at a single output because it was not: forcing
+        `AlarmOut[5].Mode = 1` on a DHI-NVR5464-16P-EI with six relays makes
+        `getOutState` answer `result=32`, which is 1<<5, and returning it to 0
+        makes it answer `result=0` again. The same shape as `getInState`,
+        where terminal 3 read 8 and terminal 14 read 16384.
+
+        A one-output device is unaffected by construction: its only possible
+        answers are 0 and 1, and 1<<0 is 1, so the key this produces for
+        output 0 is byte for byte what it produced before.
         """
-        data = await self.get("/cgi-bin/alarm.cgi?action=getOutState")
-        return {"status.AlarmOut[0]": data.get("result")}
+        try:
+            data = await self.get("/cgi-bin/alarm.cgi?action=getOutState")
+            active = parse_alarm_state_bitmask(data, slots)
+        except (aiohttp.ClientError, TimeoutError, ValueError):
+            # Not a getConfig, so it cannot go through async_get_config, but it
+            # is read in the same fan-out and a refusal must not fail it. Empty
+            # rather than a guessed state: the switch reads the keys below, and
+            # inventing 0 would report an output as off while it is on.
+            return {}
+        return {
+            "status.AlarmOut[%d]" % index: ("1" if index in active else "0")
+            for index in range(max(slots, 1))
+        }
+
+    async def async_get_alarm_output_names(self) -> dict:
+        """What the device calls each relay, keyed by output index.
+
+        Worth reading even though it is usually useless: every one of the six
+        on the recorder measured is named `"Beep"`, which is the factory
+        default for all of them rather than a description of any one. But an
+        owner who renames a relay to "Gate" in the web interface should see
+        "Gate" here, and nothing else can tell us that.
+        """
+        data = await self.async_get_config("AlarmOut")
+        names = {}
+        for key, value in data.items():
+            match = re.fullmatch(r"table\.AlarmOut\[(\d+)\]\.Name", key)
+            if match:
+                names[int(match.group(1))] = str(value)
+        return names
 
     async def async_set_alarm_output_state(self, output: int, enabled: bool) -> dict:
         """Force one alarm output on or off.
@@ -1657,13 +2415,9 @@ class DahuaClient:
         url = "/cgi-bin/configManager.cgi?action=getConfig&name=General.MachineName"
         try:
             return await self.get(url)
-        except aiohttp.ClientResponseError as e:
+        except aiohttp.ClientResponseError:
             self.identity_derived_from_credentials = True
-            not_hashed_id = "{0}_{1}_{2}_{3}".format(
-                self._address, self._rtsp_port, self._username, self._password
-            )
-            unique_cam_id = md5(not_hashed_id.encode("UTF-8")).hexdigest()
-            return {"table.General.MachineName": unique_cam_id}
+            return {"table.General.MachineName": self.credential_hash()}
 
     async def async_get_config(self, name) -> dict:
         """async_get_config gets a config by name"""
@@ -1671,7 +2425,7 @@ class DahuaClient:
         url = "/cgi-bin/configManager.cgi?action=getConfig&name={0}".format(name)
         try:
             return await self.get(url)
-        except aiohttp.ClientResponseError as e:
+        except aiohttp.ClientResponseError:
             return {}
 
     async def async_get_config_lighting(self, channel: int, profile_mode) -> dict:
@@ -1706,7 +2460,7 @@ class DahuaClient:
         """
         try:
             return await self.async_get_config("MotionDetect")
-        except aiohttp.ClientResponseError as e:
+        except aiohttp.ClientResponseError:
             return {"table.MotionDetect[0].Enable": "false"}
 
     async def async_get_video_analyse_rules_for_amcrest(self):
@@ -1717,7 +2471,7 @@ class DahuaClient:
         """
         try:
             return await self.async_get_config("VideoAnalyseRule[0][0].Enable")
-        except aiohttp.ClientResponseError as e:
+        except aiohttp.ClientResponseError:
             return {"table.VideoAnalyseRule[0][0].Enable": "false"}
 
     async def async_get_ivs_rules(self):
@@ -1730,7 +2484,7 @@ class DahuaClient:
 
     async def async_get_remote_ivs_rules(self, channel: int) -> dict:
         """Read an NVR channel's remote rules in the coordinator's flat shape."""
-        async with asyncio.timeout(TIMEOUT_SECONDS), self._host_limit:
+        async with self._request_slot(), asyncio.timeout(TIMEOUT_SECONDS):
             table = await self._rpc2_shared_call(
                 lambda client: client.async_get_remote_ivs_rules(channel)
             )
@@ -1744,8 +2498,8 @@ class DahuaClient:
         self, channel: int, rule_id: str, enabled: bool
     ) -> None:
         """Write a remote rule through the shared authenticated RPC2 session."""
-        async with asyncio.timeout(TIMEOUT_SECONDS):
-            async with _remote_ivs_lock(self._device, channel), self._host_limit:
+        async with _remote_ivs_lock(self._device, channel), self._request_slot():
+            async with asyncio.timeout(TIMEOUT_SECONDS):
                 await self._rpc2_shared_call(
                     lambda client: client.async_set_remote_ivs_rule_by_id(
                         channel, rule_id, enabled
@@ -1861,8 +2615,10 @@ class DahuaClient:
         table.SmartMotionDetect[0].ObjectTypes.Vehicle=false
         table.SmartMotionDetect[0].Sensitivity=Middle
         """
-        url = "/cgi-bin/configManager.cgi?action=getConfig&name=SmartMotionDetect"
-        return await self.get(url)
+        # Same as async_get_disarming_linkage, and for the same reason. This
+        # one also answers for a table that only exists where the recorder
+        # recognises the camera model, so a refusal is an ordinary answer here.
+        return await self.async_get_config("SmartMotionDetect")
 
     async def async_get_video_color(self) -> dict:
         """The picture adjustments per channel. Example output:
@@ -1884,6 +2640,25 @@ class DahuaClient:
         )
         return await self.get(url)
 
+    async def async_set_motion_region(
+        self, channel: int, region: int, field: str, value: int
+    ):
+        """Set one motion region's `Sensitive` or `Threshold` (0-100).
+
+        One field per write, which is not merely tidy here. The recorder
+        refuses a whole `setConfig` as soon as any named key is one it does not
+        carry, so a write that sent both fields would fail entirely on a device
+        that has only one of them -- which is how #1115's doorbell could not
+        turn motion detection off at all.
+
+        Measured on a DHI-NVR5464-16P-EI: the recorder's own web UI writes the
+        number it displays straight into this field, on a 0 to 100 scale.
+        """
+        url = "/cgi-bin/configManager.cgi?action=setConfig&MotionDetect[{0}].MotionDetectWindow[{1}].{2}={3}".format(
+            channel, int(region), field, int(value)
+        )
+        return await self.get(url)
+
     async def async_get_storage_device_info(self) -> dict:
         """The recorder's disks: state, capacity and error flags (#745).
 
@@ -1893,6 +2668,49 @@ class DahuaClient:
         """
         url = "/cgi-bin/storageDevice.cgi?action=getDeviceAllInfo"
         return await self.get(url)
+
+    async def async_get_alarm_input_config(self) -> dict:
+        """The recorder's alarm input terminals (#1090).
+
+        Host level, not per channel: `Alarm` is the box's own table of physical
+        terminals and takes no channel. Parsed by parse_alarm_inputs.
+        """
+        return await self.async_get_config("Alarm")
+
+    async def async_get_alarm_input_slots(self) -> int:
+        """How many alarm input terminals the device has, or 0.
+
+        `alarm.cgi?action=getInSlots` answers `result=16` on a
+        DHI-NVR5464-16P-EI. Judged on what came back: a device without the
+        action answers something this cannot read as a number, and 0 is then
+        the honest answer rather than a guess.
+        """
+        data = await self.get("/cgi-bin/alarm.cgi?action=getInSlots")
+        try:
+            return max(int(str(data.get("result")).strip()), 0)
+        except (TypeError, ValueError):
+            return 0
+
+    async def async_get_alarm_input_state(self, slots: int) -> set:
+        """Which alarm inputs are active right now, as a set of indexes.
+
+        One request for every terminal on the box, which is why this is read on
+        one coordinator rather than per channel. Parsed by
+        parse_alarm_state_bitmask.
+        """
+        data = await self.get("/cgi-bin/alarm.cgi?action=getInState")
+        return parse_alarm_state_bitmask(data, slots)
+
+    async def async_get_storage_device_details(self) -> dict:
+        """What each disk is, by name. RPC2 only; {} when it cannot be read.
+
+        There is no CGI form of this, so a recorder with RPC2 switched off keeps
+        the state and capacity it already had and gains nothing, which is why
+        the caller treats an empty answer as "nothing more to say" rather than
+        as a failure.
+        """
+        params = await self._async_rpc2_value("StorageDeviceManager.getDeviceInfos")
+        return parse_storage_device_details(params)
 
     async def async_get_ptz_position(self) -> dict:
         """
@@ -1960,6 +2778,11 @@ class DahuaClient:
         can survive a failed setup; a task started in a synchronous constructor
         cannot, and that is the leak #620 was about.
         """
+        # A closing client has already given its reference back, so a login
+        # taken here would be one nobody is left to release, on a device that
+        # logs every one of them (#577).
+        self._refuse_if_closing()
+
         key = self._rpc2_key()
         holder = _HOST_RPC2.get(key)
         if holder is None:
@@ -1972,6 +2795,7 @@ class DahuaClient:
                 self._rtsp_port,
                 session,
                 self._use_https,
+                dhip_transport=self._new_dhip_transport(),
             )
             holder = _SharedRpc2Session(session, client, None)
             _HOST_RPC2[key] = holder
@@ -1983,6 +2807,18 @@ class DahuaClient:
             holder.task = asyncio.ensure_future(holder.client.login())
         try:
             response = await asyncio.shield(holder.task)
+        except DhipLoginRefused as refused:
+            if holder.task is not None and holder.task.done():
+                holder.task = None
+            # Use the same auth path as CGI so the coordinator can request
+            # corrected credentials once the host's refusal budget is spent.
+            url = URL(self._base + "/RPC2_Login")
+            raise aiohttp.ClientResponseError(
+                aiohttp.RequestInfo(url, "POST", CIMultiDict(), url),
+                (),
+                status=401,
+                message="DHIP login refused",
+            ) from refused
         except Exception:
             # Clear the login, not the holder: the entries still hold
             # references to it, and the next read should try again.
@@ -2047,6 +2883,16 @@ class DahuaClient:
         """Read camera feature definitions using the existing shared RPC2 login."""
         return await self._rpc2_shared_call(
             lambda client: client.get_product_definition(name)
+        )
+
+    async def async_get_cloud_upgrade_info(self) -> dict:
+        """Read the firmware the device's own cloud check last found, over RPC2.
+
+        Local to the device -- no Dahua server is contacted from here. Raises
+        if the firmware serves no ``_DHCloudUpgrade_`` table.
+        """
+        return await self._rpc2_shared_call(
+            lambda client: client.get_cloud_upgrade_info()
         )
 
     async def async_get_coaxial_control_io_caps_rpc2(self) -> dict[str, bool]:
@@ -2119,6 +2965,30 @@ class DahuaClient:
                 if attempt == 2:
                     raise
         return {}
+
+    async def _rpc2_set_config_field(self, name: str, value) -> dict:
+        """Write one addressed config field over RPC2, on the shared session.
+
+        The narrow sibling of `_rpc2_set_config_value` below, which reads the
+        whole table and puts it back. Use this one where the field can be
+        addressed directly: it sends no credentials or neighbouring settings
+        back to the device, and it is not refused for size.
+
+        Clears the device's shared read cache, as the CGI write path in `get`
+        does. A device reached this way serves no /cgi-bin/ config path, so its
+        `getConfig` reads were answered over RPC2 and cached under the CGI URL
+        for CONFIG_CACHE_TTL_SECONDS. Without this a switch writes, refreshes,
+        reads back the answer from before the write and snaps to its old state
+        for five minutes, which looks exactly like a device refusing the
+        change. The cloud connection switch has the same fallback and had the
+        same hole.
+        """
+
+        async def write(client):
+            return await client.set_config_field(name, value)
+
+        clear_host_cache(self._device)
+        return await self._rpc2_shared_call(write)
 
     async def _rpc2_set_config_value(
         self, name: str, channel: int, key: str, value
@@ -2225,9 +3095,9 @@ class DahuaClient:
         even when RPC2 polling is disabled. Partial CGI writes are accepted but
         do not light the emitter.
         """
-        async with self._lighting_scheme_lock, asyncio.timeout(
+        async with self._lighting_scheme_lock, self._request_slot(), asyncio.timeout(
             TIMEOUT_SECONDS
-        ), self._host_limit:
+        ):
             restore_store = self._illuminator_restore_store
             if restore_store is None:
                 raise RuntimeError("Dahua illuminator recovery storage is unavailable")
@@ -2292,9 +3162,9 @@ class DahuaClient:
         restore_store = self._illuminator_restore_store
         if restore_store is None:
             return
-        async with self._lighting_scheme_lock, asyncio.timeout(
+        async with self._lighting_scheme_lock, self._request_slot(), asyncio.timeout(
             TIMEOUT_SECONDS
-        ), self._host_limit:
+        ):
             keys = await restore_store.async_keys()
             if not keys:
                 return
@@ -2314,6 +3184,323 @@ class DahuaClient:
                     raise ValueError("Dahua lighting scheme is missing LightingMode")
                 if current_mode != "WhiteMode":
                     await restore_store.async_remove(channel, profile)
+
+    async def async_force_channel_scoped_white_light(
+        self, channel: int, enabled: bool, brightness: int
+    ) -> None:
+        """Force a recorder channel's white light on or off over channel-scoped RPC2.
+
+        The #959 fix for cameras whose LightingScheme answers per channel. ON
+        writes Lighting_V2 (WhiteLight Manual + brightness) and then switches
+        every scene to WhiteMode and disables its schedule: configure first, arm
+        last, so a half-applied ON never leaves a scene armed over an
+        unconfigured row, and any failure before the scene write leaves the
+        camera in its untouched original mode. OFF reads the tables back and
+        merges the saved original onto them, the scene table first so the camera
+        is disarmed before its old WhiteLight row goes back. The merge puts a
+        scene back only where it is still WhiteMode and a WhiteLight row back
+        only where it is still Manual, so a scene the user changed while the
+        light was on is preserved (@jays3l33t, #959). Both halves read back and
+        check the modes converged on what was written.
+
+        The pre-takeover tables are the only recovery copy and live in the
+        channel snapshot store. Saved only on the first ON, so a second ON
+        cannot overwrite the true original with an already-forced state; removed
+        only after a restore verifies, so a failed OFF is retried on the next
+        OFF or at startup. Shapes handled in white_light_override; recipe
+        measured in #959 (jays3l33t's, confirmed on a DHI-NVR5464 / VSIPP).
+        """
+        store = self._channel_snapshot_store
+        if store is None:
+            raise RuntimeError("Dahua channel snapshot storage is unavailable")
+
+        def read(name):
+            return self._rpc2_shared_call(
+                lambda client: client.get_config(
+                    {"name": name, "onlyLocal": False, "channel": channel}
+                )
+            )
+
+        def write(name, table):
+            return self._rpc2_shared_call(
+                lambda client: client.set_config(name, table, channel=channel)
+            )
+
+        async with self._lighting_scheme_lock, self._request_slot(), asyncio.timeout(
+            TIMEOUT_SECONDS
+        ):
+            if enabled:
+                scheme = (await read("LightingScheme")).get("table")
+                lighting = (await read("Lighting_V2")).get("table")
+                if wlo.lighting_shape(scheme, lighting) is None:
+                    raise ValueError(
+                        "Dahua lighting tables for channel %s are not a shape this "
+                        "white-light override can drive" % channel
+                    )
+                if await store.async_get(channel) is None:
+                    await store.async_set(
+                        channel,
+                        {"LightingScheme": scheme, "Lighting_V2": lighting},
+                    )
+                scheme_on, lighting_on = wlo.build_on(scheme, lighting, brightness)
+                # Clear before writing so the verification read-backs below are
+                # cache misses that reflect what the camera actually took. A
+                # reorder that left this after the writes would make the checks
+                # read the pre-write cache and pass vacuously.
+                clear_host_cache(self._device)
+                await write("Lighting_V2", lighting_on)
+                back = (await read("Lighting_V2")).get("table")
+                if not all(mode == "Manual" for mode in wlo.white_light_modes(back)):
+                    raise ConnectionError(
+                        "Dahua did not accept the Lighting_V2 white-light write "
+                        "on channel %s" % channel
+                    )
+                await write("LightingScheme", scheme_on)
+                back_scheme = (await read("LightingScheme")).get("table")
+                if not wlo.is_forced_on(back_scheme, back):
+                    raise ConnectionError(
+                        "Dahua did not accept the LightingScheme WhiteMode write "
+                        "on channel %s" % channel
+                    )
+                return
+
+            snapshot = await store.async_get(channel)
+            if snapshot is None:
+                return
+            orig_scheme = snapshot.get("LightingScheme")
+            orig_lighting = snapshot.get("Lighting_V2")
+            # Read what the camera reports now so a scene the user changed while
+            # the light was on is not clobbered by the snapshot. Clear first so
+            # this read is fresh rather than the pre-override copy.
+            clear_host_cache(self._device)
+            cur_scheme = (await read("LightingScheme")).get("table")
+            cur_lighting = (await read("Lighting_V2")).get("table")
+            if wlo.lighting_shape(cur_scheme, cur_lighting) is not None and len(
+                cur_scheme
+            ) == len(orig_scheme):
+                target_scheme, target_lighting = wlo.build_restore(
+                    cur_scheme, cur_lighting, orig_scheme, orig_lighting
+                )
+            else:
+                # Current tables unreadable or a different shape, so a merge
+                # cannot be trusted. Put the whole saved original back, which
+                # still disarms every scene.
+                target_scheme, target_lighting = orig_scheme, orig_lighting
+            # Scene table first so the camera is disarmed before the old
+            # WhiteLight row goes back (disarmed, a stale row is ignored).
+            await write("LightingScheme", target_scheme)
+            await write("Lighting_V2", target_lighting)
+            # Clear again so the verification reads reflect the writes, not the
+            # current-state reads taken just above.
+            clear_host_cache(self._device)
+            back_scheme = (await read("LightingScheme")).get("table")
+            back_lighting = (await read("Lighting_V2")).get("table")
+            if not wlo.modes_match(
+                back_scheme, back_lighting, target_scheme, target_lighting
+            ):
+                raise ConnectionError(
+                    "Dahua did not restore channel %s lighting to its saved state; "
+                    "keeping the snapshot for another attempt" % channel
+                )
+            await store.async_remove(channel)
+
+    async def async_get_lighting_schemes(self, channel: int) -> list[str] | None:
+        """The illumination modes this channel's camera reports having.
+
+        Read-only setup probe. Returns the device's own spellings, or None
+        where the camera does not offer the dual-light solution, so a channel
+        this was not built for simply gets no entity. Any refusal is a no:
+        a capability question must never be the thing that fails setup.
+        """
+        try:
+            return await self._rpc2_shared_call(
+                lambda client: client.get_lighting_schemes(channel)
+            )
+        except Exception as error:  # pylint: disable=broad-except
+            _LOGGER.debug(
+                "No lighting scheme capability on channel %s", channel, exc_info=error
+            )
+            return None
+
+    async def async_get_channel_lighting_scheme(self, channel: int) -> dict:
+        """Read this channel's scene modes for the illumination selector."""
+        async with self._request_slot(), asyncio.timeout(TIMEOUT_SECONDS):
+            response = await self._rpc2_shared_call(
+                lambda client: client.get_config(
+                    {"name": "LightingScheme", "onlyLocal": False, "channel": channel}
+                )
+            )
+        table = response.get("table")
+        if (
+            not isinstance(table, list)
+            or not table
+            or not all(
+                isinstance(profile, dict)
+                and isinstance(profile.get("LightingMode"), str)
+                for profile in table
+            )
+        ):
+            raise ValueError("The channel did not return its LightingScheme scenes")
+        return flatten_rpc2_config(
+            "LightingScheme", table, "table.LightingScheme[%d]" % channel
+        )
+
+    async def async_set_channel_scoped_lighting_scheme(
+        self, channel: int, mode: str
+    ) -> None:
+        """Write one illumination mode to every scene of a recorder channel.
+
+        Every scene rather than the live one. Resolving which scene is live
+        means reading `VideoInMode`, which carries three different shapes on
+        one recorder (#458), and getting that resolution wrong is most of
+        what #959 was. Setting all nine needs no resolution and matches what
+        the camera's own interface does.
+
+        Refused outright while the white-light override owns the channel: its
+        restore reverts a scene only where it is still `WhiteMode`, so a mode
+        chosen here would be silently undone by the next Illuminator OFF, or
+        overwritten by the snapshot replayed at startup. Sharing
+        `_lighting_scheme_lock` keeps the two from interleaving once past
+        that check.
+
+        Measured on a DHI-NVR5464-16P-EI driving a VSIPP-6DIRMD-I3: all three
+        of `InfraredMode`, `WhiteMode` and `AIMode` write and read back, and
+        the original restores cleanly.
+        """
+
+        def read():
+            return self._rpc2_shared_call(
+                lambda client: client.get_config(
+                    {"name": "LightingScheme", "onlyLocal": False, "channel": channel}
+                )
+            )
+
+        async with self._lighting_scheme_lock, self._request_slot(), asyncio.timeout(
+            TIMEOUT_SECONDS
+        ):
+            store = self._channel_snapshot_store
+            if store is not None and await store.async_get(channel) is not None:
+                raise HomeAssistantError(
+                    translation_domain=DOMAIN,
+                    translation_key="lighting_scheme_held_by_illuminator",
+                )
+            scheme = (await read()).get("table")
+            if not isinstance(scheme, list) or not scheme:
+                raise ValueError(
+                    "Dahua channel %s does not serve a LightingScheme table" % channel
+                )
+            wanted = [dict(profile) for profile in scheme]
+            for profile in wanted:
+                profile["LightingMode"] = mode
+            await self._rpc2_shared_call(
+                lambda client: client.set_config(
+                    "LightingScheme", wanted, channel=channel
+                )
+            )
+            # Cleared so the check below is a real read rather than the copy
+            # that was cached before the write.
+            clear_host_cache(self._address)
+            back = (await read()).get("table") or []
+            got = {
+                profile.get("LightingMode")
+                for profile in back
+                if isinstance(profile, dict)
+            }
+            if (
+                len(back) != len(wanted)
+                or not all(
+                    isinstance(profile, dict) and profile.get("LightingMode") == mode
+                    for profile in back
+                )
+                or got != {mode}
+            ):
+                # Accepted and ignored is a refusal here. These devices answer
+                # OK to writes they do not act on, so the read-back is the
+                # only thing that distinguishes the two.
+                raise HomeAssistantError(
+                    translation_domain=DOMAIN,
+                    translation_key="lighting_scheme_not_accepted",
+                    translation_placeholders={
+                        "mode": mode,
+                        "got": ", ".join(sorted(str(value) for value in got)),
+                    },
+                )
+
+    async def async_channel_scoped_white_light_supported(self, channel: int) -> bool:
+        """Whether this channel's LightingScheme + Lighting_V2 answer per channel
+        in a shape the white-light override can drive (#959).
+
+        A read-only setup probe used only to decide routing. Channel-scoped,
+        because a recorder refuses the channel-less read of these tables. Any
+        refusal or unexpected shape means no, so a camera this was not built for
+        stays on its existing path; a probe failure must never fail setup.
+        """
+        try:
+            scheme = (
+                await self._rpc2_shared_call(
+                    lambda client: client.get_config(
+                        {
+                            "name": "LightingScheme",
+                            "onlyLocal": False,
+                            "channel": channel,
+                        }
+                    )
+                )
+            ).get("table")
+            lighting = (
+                await self._rpc2_shared_call(
+                    lambda client: client.get_config(
+                        {"name": "Lighting_V2", "onlyLocal": False, "channel": channel}
+                    )
+                )
+            ).get("table")
+        except Exception:  # pylint: disable=broad-except
+            _LOGGER.debug(
+                "Channel-scoped lighting probe failed on %s channel %s",
+                self._address,
+                channel,
+                exc_info=True,
+            )
+            return False
+        return wlo.lighting_shape(scheme, lighting) is not None
+
+    def _new_dhip_transport(self):
+        """The socket a no-HTTP monitor is read over, or None for everything else.
+
+        Built here rather than in the transport, so the auth budget it spends
+        is this host's: `async_record_host_auth_refusal` is the same counter
+        the polls, the CGI event stream and the doorbell listener share, and
+        a VTH enforces `LockLoginEnable` with `LockLoginTimes: 5` and
+        `LoginFailLockTime: 300` (measured on 3.000.0012000.0.R). A transport
+        that reconnects and re-logs in on its own schedule is exactly how #729
+        happened on the other transports, and locking this device out locks its
+        owner out of correcting it.
+        """
+        if not self._rpc2_over_dhip:
+            return None
+
+        # Imported here, not at the top: host.py imports this module, so the
+        # other direction is a cycle. The counter is host state rather than
+        # client state, which is why it lives there.
+        from .host import (
+            MAX_AUTH_REFUSALS,
+            async_record_host_auth_refusal,
+            host_auth_budget_exhausted,
+        )
+
+        def refused(reason) -> bool:
+            return (
+                async_record_host_auth_refusal(self._address, "dhip transport")
+                >= MAX_AUTH_REFUSALS
+            )
+
+        return DhipTransport(
+            self._address,
+            self._username,
+            self._password,
+            on_login_refused=refused,
+            login_allowed=lambda: not host_auth_budget_exhausted(self._address),
+        )
 
     @staticmethod
     def _new_rpc2_session() -> aiohttp.ClientSession:
@@ -2338,6 +3525,26 @@ class DahuaClient:
             self._rpc2_session_instance = self._new_rpc2_session()
         return self._rpc2_session_instance
 
+    def _refuse_if_closing(self) -> None:
+        """Refuse a read this client is no longer in a position to make.
+
+        Between the flag below and `cancel_reads_issued_on`, every read of a
+        closing client falls on one side or the other, and that partition is
+        the point of setting the flag synchronously. A read registered before
+        the flag is in the cache when the sweep runs, so the sweep stops it. A
+        read asked for after the flag never starts. Nothing in `get` awaits
+        between this check and registering the entry, so there is no third
+        case.
+
+        Checking `self._session.closed` instead would leave one: `close()`
+        awaits three times before the coordinator closes the session, and a
+        read issued during those awaits sees a session that is open, registers
+        itself after the sweep has already passed, and fails exactly as
+        reported.
+        """
+        if self._closing:
+            raise ReadAfterClose(f"{self._address} is closing")
+
     async def close(self) -> None:
         """Releases anything this client owns. Safe to call more than once.
 
@@ -2345,6 +3552,15 @@ class DahuaClient:
         closed cleanly: a failed close must not leave a second call able to
         decrement the host's refcount again.
         """
+        # Before the first await, so that no read can be registered after the
+        # sweep below has looked for it. See `_refuse_if_closing`.
+        self._closing = True
+
+        # First, because everything below takes away what a read in flight is
+        # using. A read that outlives the session it was issued on fails in a
+        # way nobody is waiting for (#1043).
+        await cancel_reads_issued_on(self._session)
+
         if self._rpc2_acquired and not self._rpc2_released:
             self._rpc2_released = True
             await _release_rpc2(self._rpc2_key())
@@ -2507,8 +3723,11 @@ class DahuaClient:
         Example output:
         table.LightGlobal[0].Enable=true
         """
-        url = "/cgi-bin/configManager.cgi?action=getConfig&name=LightGlobal[0].Enable"
-        return await self.get(url)
+        # Same as async_get_disarming_linkage, and the most exposed of the
+        # four: the poll reads this one on `is_amcrest_doorbell()` alone, which
+        # is a model-name test with no probe behind it, so the first evidence
+        # that a rebadge does not serve the table was the whole entry failing.
+        return await self.async_get_config("LightGlobal[0].Enable")
 
     async def async_get_floodlightmode(self) -> int:
         """async_get_floodlightmode gets the floodlight mode as its number.
@@ -2671,15 +3890,20 @@ class DahuaClient:
         how far it goes. That is also why the stop is in a finally. A
         request that fails after the start would otherwise leave the
         camera turning until something else stopped it.
+
+        A diagonal carries the speed in both arg1 and arg2, a straight move
+        and a zoom in arg2 alone. See PTZ_DIAGONAL_CODES.
         """
+        arg1 = speed if code in PTZ_DIAGONAL_CODES else 0
         base = (
-            "/cgi-bin/ptz.cgi?action={0}&channel={1}&code={2}" "&arg1=0&arg2={3}&arg3=0"
+            "/cgi-bin/ptz.cgi?action={0}&channel={1}&code={2}"
+            "&arg1={3}&arg2={4}&arg3=0"
         )
-        await self.get(base.format("start", channel, code, speed))
+        await self.get(base.format("start", channel, code, arg1, speed))
         try:
             await asyncio.sleep(duration)
         finally:
-            await self.get(base.format("stop", channel, code, speed))
+            await self.get(base.format("stop", channel, code, arg1, speed))
 
     async def async_set_video_profile_mode(self, channel: int, mode: str):
         """
@@ -2812,10 +4036,18 @@ class DahuaClient:
             raise Exception("Could not set text")
 
     async def async_set_service_set_text_overlay(
-        self, channel: int, group: int, text1: str, text2: str, text3: str, text4: str
+        self, channel: int, group: int, *lines: str
     ):
-        """async_set_service_set_text_overlay sets the video text overlay"""
-        text = _overlay_text(text1, text2, text3, text4)
+        """async_set_service_set_text_overlay sets the video text overlay
+
+        Variadic because the number of lines is the device's to decide, not
+        ours (#312). Dahua joins them with a pipe and imposes its own cap:
+        four on some models, five on one recorder's UI, fourteen on the camera
+        in that issue. A device given more than it has answers the write with
+        `Error`, which the check below turns into a raise, so the limit
+        surfaces as a failed action rather than as a silently shorter overlay.
+        """
+        text = _overlay_text(*lines)
         url = "/cgi-bin/configManager.cgi?action=setConfig&VideoWidget[{0}].CustomTitle[{1}].Text={2}".format(
             channel, group, text
         )
@@ -2936,37 +4168,166 @@ class DahuaClient:
             raise RuntimeError("RPC2 is disabled")
 
         for attempt in (1, 2):
-            try:
-                holder = await self._shared_rpc2()
+            holder = await self._shared_rpc2()
+            login_task = getattr(holder, "task", None)
 
+            try:
                 async with asyncio.timeout(5):
                     response = await holder.client.request(
                         method="magicBox.getUpTime",
                         params=None,
                     )
 
-                info = (response.get("params") or {}).get("info") or {}
+            except Rpc2MethodRefused as refused:
+                if attempt == 1 and rpc2_refusal_is_a_stale_login(refused):
+                    # The session died under us, which is exactly what a reboot
+                    # does. Drop it and ask again on a new one.
+                    await drop_stale_rpc2_login(holder, login_task)
+                    continue
 
-                value = info.get("Last")
-
-                if value is None:
-                    raise RuntimeError("magicBox.getUpTime returned no Last value")
-
-                return int(value)
+                # The device answered, and the answer was no. Its session is
+                # fine, so leaving it alone is the whole point: a recorder that
+                # does not serve this method refuses it on every poll, and
+                # tearing the login down each time made the next read on any
+                # path log in again. Measured at two extra logins per poll
+                # cycle on a DHI-NVR5464-16P-EI, which serves the method name
+                # and refuses it with code 268632080 (#1039, #577).
+                raise
 
             except Exception:
-                # A camera reboot invalidates the old RPC2 login.
-                # Drop the login task so the second attempt / next poll
-                # establishes a fresh session.
-                holder = _HOST_RPC2.get(self._rpc2_key())
-
-                if holder is not None:
-                    holder.task = None
+                # No answer at all: a timeout, a dropped connection, a reboot
+                # ending the read mid-flight. This is the case the retry exists
+                # for, and the login we were holding went with it.
+                await drop_stale_rpc2_login(holder, login_task)
 
                 if attempt == 2:
                     raise
 
+                continue
+
+            info = (response.get("params") or {}).get("info") or {}
+
+            value = info.get("Last")
+
+            if value is None:
+                # Outside the handler deliberately. A device that answers in a
+                # shape we do not understand still has a working session, and
+                # asking again on a fresh login would get the same shape back.
+                raise RuntimeError("magicBox.getUpTime returned no Last value")
+
+            return int(value)
+
         raise RuntimeError("Unable to read camera uptime")
+
+    async def _async_rpc2_value(self, method: str, timeout: float = 5.0) -> dict:
+        """One parameterless RPC2 getter, over the shared session.
+
+        Through `_rpc2_shared_call` rather than with its own retry, which is the
+        difference between this and `async_get_uptime_last` next door. That one
+        drops the shared login on *any* exception, and a device that simply does
+        not implement a method has a perfectly good session -- so a refusal
+        there spends a fresh login for every channel that asks, on a device that
+        will never answer. `rpc2_refusal_is_a_stale_login` is the discriminator
+        the repo already settled that question with.
+
+        A read is safe to run twice, which is what `_rpc2_shared_call` asks of
+        its action.
+        """
+        if not self._use_rpc2:
+            raise RuntimeError("RPC2 is disabled")
+
+        async def ask(client):
+            async with asyncio.timeout(timeout):
+                response = await client.request(method=method, params=None)
+            return response.get("params") or {}
+
+        return await self._rpc2_shared_call(ask)
+
+    async def async_get_system_load(self) -> dict:
+        """The device's processor and memory: {"usage": %, "free": b, "total": b}.
+
+        Shared per device the way `get` shares a config read, and for a
+        stronger reason than those have. A recorder is one entry with a
+        coordinator per channel (#827) and they refresh *concurrently* -- setup
+        gathers them all -- so "answer, then remember it for a while" would
+        collapse nothing on the cycle that matters: twelve channels would each
+        find nothing remembered and ask, twenty-four requests for two numbers
+        that describe the box. Registering the task before awaiting it is what
+        makes the other eleven wait on the first one's answer instead.
+
+        The CGI reads get this from `get` for nothing, which is why the disk
+        read (`storageDevice.cgi`, one `self.get`) needs none of this. These two
+        are RPC2 calls and do not pass through there at all.
+
+        Keyed on the device rather than the address, for the reason every shared
+        read here is: two boxes behind one IP on different ports are not each
+        other (#664).
+        """
+        self._refuse_if_closing()
+
+        now = time.monotonic()
+        entry = _HOST_SYSTEM_LOAD.get(self._device)
+        if entry is None or not entry.is_usable(now):
+            # Registered before it is awaited, which is the whole point: the
+            # other eleven channels reach this line while the first one's
+            # request is still in flight and wait on it rather than asking.
+            entry = _SharedRead(
+                asyncio.ensure_future(self._async_read_system_load()), self._session
+            )
+            _HOST_SYSTEM_LOAD[self._device] = entry
+
+        # Shielded so that one channel's cancelled refresh -- a reload, a
+        # timeout -- does not take the reading away from the others.
+        answer = await asyncio.shield(entry.task)
+
+        # Stamped only once it lands. A refusal leaves the expiry unset, so
+        # is_usable rejects it and the next poll asks the device again rather
+        # than being told no for the rest of the TTL.
+        if _HOST_SYSTEM_LOAD.get(self._device) is entry and entry.expires_at is None:
+            entry.expires_at = time.monotonic() + SYSTEM_LOAD_TTL_SECONDS
+
+        return dict(answer)
+
+    async def _async_read_system_load(self) -> dict:
+        """The two reads behind async_get_system_load.
+
+        One caller per shared read reaches here, the same arrangement `get` and
+        `_request` have.
+        """
+        usage = await self.async_get_cpu_usage()
+        memory = await self.async_get_memory_info()
+        return {"usage": usage, **memory}
+
+    async def async_get_cpu_usage(self) -> int:
+        """The recorder's processor load, as a percentage.
+
+        `magicBox.getCPUUsage` answers `{"usage": 28}`. Measured on a
+        DHI-NVR5464-16P-EI, where it agreed with what the device reports over
+        ONVIF to within one point.
+
+        RPC2 only: there is no CGI form of this, so a device with RPC2 switched
+        off has no processor sensor. That is why it is probed rather than
+        assumed.
+        """
+        params = await self._async_rpc2_value("magicBox.getCPUUsage")
+        usage = params.get("usage")
+        if usage is None:
+            raise RuntimeError("magicBox.getCPUUsage returned no usage")
+        return int(usage)
+
+    async def async_get_memory_info(self) -> dict:
+        """The recorder's memory, as {"free": bytes, "total": bytes}.
+
+        `magicBox.getMemoryInfo` answers both as floats -- 540459008.0 of
+        1239031808.0 on the recorder this was measured against -- so they are
+        returned as ints and the percentage is worked out from them rather than
+        read from the device, which does not offer one.
+        """
+        params = await self._async_rpc2_value("magicBox.getMemoryInfo")
+        free, total = params.get("free"), params.get("total")
+        if free is None or total is None:
+            raise RuntimeError("magicBox.getMemoryInfo returned no free/total")
+        return {"free": int(free), "total": int(total)}
 
     async def async_get_lighting_v2_live_state(
         self,
@@ -3123,7 +4484,12 @@ class DahuaClient:
             value = await self.get(url)
             if "OK" in value or "ok" in value:
                 return
-        except aiohttp.ClientResponseError:
+        except (aiohttp.ClientResponseError, DahuaWriteDeclined):
+            # The same two shapes as the motion fallback above: a device may
+            # refuse this table with a status, or answer 200 with `Error`,
+            # which `get` raises as a declined write. Only the first was
+            # caught, so the second left this method before the VideoInOptions
+            # form below could be tried.
             pass
 
         # Plenty of devices do not have VideoInDayNight at all. Measured:
@@ -3279,8 +4645,121 @@ class DahuaClient:
         table.DisableLinkage.Enable=false
         """
 
-        url = "/cgi-bin/configManager.cgi?action=getConfig&name=DisableLinkage"
-        return await self.get(url)
+        # Through async_get_config, not self.get: it builds this exact URL and
+        # swallows a ClientResponseError. Read raw, a device that refuses the
+        # table raised into the poll's fan-out, which has no return_exceptions,
+        # and took every entity on the channel with it. That is #1006's shape.
+        return await self.async_get_config("DisableLinkage")
+
+    async def async_get_cloud_connection(self) -> dict:
+        """Read the device's cloud table (Dahua's easy4ip / DMSS connection).
+
+        Host wide rather than per channel, and served under two different
+        names by two different devices, which is why the caller judges on the
+        key rather than on the read succeeding. Measured on a VTO2311R-WP,
+        which serves both:
+
+            table.VSP_PaaS.Enable=false     the DMSS connection itself
+            table.T2UServer.Enable=false    the P2P registration beside it
+
+        and on a VTO2000A, which answers HTTP 500 to VSP_PaaS while serving
+        T2UServer and four other tables on the same request. The two are not
+        the same feature: @ScratMan measured that disabling T2UServer alone
+        does not stop a DMSS call, and VSP_PaaS does, so only VSP_PaaS is read
+        here and a device without it gets no switch.
+
+        Through async_get_config, so a refusal arrives as {} rather than
+        raising into the poll's fan-out, which has no return_exceptions.
+        """
+        return await self.async_get_config("VSP_PaaS")
+
+    async def async_set_cloud_connection(self, enabled: bool) -> dict:
+        """Turn the device's cloud connection on or off, one field at a time.
+
+        Addressed as `VSP_PaaS.Enable` rather than writing the table back: it
+        carries the device's cloud credentials and server list, and a
+        whole-table write is refused for size on at least one recorder (see
+        `DahuaRpc2Client.set_config_field`).
+
+        CGI first, with the same RPC2 fallback the smart motion writes use, so
+        a device that serves no /cgi-bin/ config path at all can still be
+        switched.
+        """
+        url = "/cgi-bin/configManager.cgi?action=setConfig&VSP_PaaS.Enable={0}".format(
+            str(bool(enabled)).lower()
+        )
+        try:
+            return await self.get(url, True)
+        except aiohttp.ClientResponseError as cgi_error:
+            if cgi_error.status not in self.CONFIG_CGI_ABSENT:
+                raise
+            _LOGGER.debug(
+                "configManager.cgi answered %s on %s; setting the cloud "
+                "connection over RPC2",
+                cgi_error.status,
+                self._address,
+            )
+            return await self._rpc2_set_config_field("VSP_PaaS.Enable", bool(enabled))
+
+    async def async_get_intelli_tour(self) -> dict:
+        """Read the AI tour plan table, every channel of it in one request.
+
+        Measured by @MassakerGU on a DH-SDT6E432-8P-MB-A-PV1, firmware
+        V3.200.0000028.0.R, a dual sensor camera that Home Assistant shows as
+        two channels:
+
+            table.IntelliTour[0]            null
+            table.IntelliTour[1].Enable     true
+            table.IntelliTour[1].TourPlan   ...
+
+        So the table is indexed by channel and a channel with no tour is
+        reported as nothing rather than omitted, which is why the caller judges
+        on `table.IntelliTour[<channel>].Enable` being present for its own
+        channel rather than on the table being non-empty.
+
+        One request for the whole table rather than one per channel: this goes
+        through the shared read cache, so a recorder's sixteen coordinators
+        asking at once cost one round trip between them.
+
+        Through async_get_config, so a refusal arrives as {} rather than
+        raising into the poll's fan-out, which has no return_exceptions.
+        """
+        return await self.async_get_config("IntelliTour")
+
+    async def async_set_intelli_tour(self, channel: int, enabled: bool) -> dict:
+        """Start or stop one channel's AI tour plan, addressing that row only.
+
+        Both transports measured by @MassakerGU on the SDT6E432 (#1051):
+
+            /cgi-bin/configManager.cgi?action=setConfig&IntelliTour[1].Enable=true
+            {"method": "configManager.setConfig",
+             "params": {"name": "IntelliTour[1].Enable", "table": true}}
+
+        The row is addressed rather than written back whole, which is what
+        keeps the tour's own plan, its presets and its timings untouched: this
+        switch starts and stops the tour and changes nothing about it. A
+        whole-table write would also be refused for size on at least one
+        recorder (see `DahuaRpc2Client.set_config_field`).
+
+        CGI first with the RPC2 field write as the fallback, in that order,
+        because that is the order the rest of the config writes here use and
+        both were measured working on the same camera.
+        """
+        field = "IntelliTour[{0}].Enable".format(channel)
+        url = "/cgi-bin/configManager.cgi?action=setConfig&{0}={1}".format(
+            field, str(bool(enabled)).lower()
+        )
+        try:
+            return await self.get(url, True)
+        except aiohttp.ClientResponseError as cgi_error:
+            if cgi_error.status not in self.CONFIG_CGI_ABSENT:
+                raise
+            _LOGGER.debug(
+                "configManager.cgi answered %s on %s; setting the tour over RPC2",
+                cgi_error.status,
+                self._address,
+            )
+            return await self._rpc2_set_config_field(field, bool(enabled))
 
     async def async_get_event_notifications(self) -> dict:
         """
@@ -3290,8 +4769,8 @@ class DahuaClient:
         table.DisableEventNotify.Enable=false
         """
 
-        url = "/cgi-bin/configManager.cgi?action=getConfig&name=DisableEventNotify"
-        return await self.get(url)
+        # Same as async_get_disarming_linkage above, and for the same reason.
+        return await self.async_get_config("DisableEventNotify")
 
     # A device answering these has no such CGI path at all, so there is
     # nothing to retry and a second transport is worth trying. Deliberately
@@ -3311,6 +4790,308 @@ class DahuaClient:
     # reboot button did nothing -- both failing as though the request were wrong
     # rather than the transport.
     CONFIG_CGI_ABSENT = (404, 501)
+
+    async def async_play_audio(
+        self,
+        audio: bytes,
+        content_type: str,
+        byte_rate: int,
+        channel_number: int = 1,
+    ) -> None:
+        """Play a clip through the device's own speaker.
+
+        `channel_number` is the device's own numbering, the one that goes on
+        the wire, not the 0-based index the coordinator holds. Spelled out
+        because this integration has got that wrong before: the number is
+        usually index + 1 but some firmware uses the same value for both,
+        which is what `async_device_is_zero_indexed` exists to settle (#724).
+
+        `audio` is already in the device's format, `content_type` names it,
+        and `byte_rate` is how many bytes of it make one second of sound. The
+        caller supplies all three because this layer cannot know them, and the
+        two candidates are a factor of four apart. Every published recipe for
+        this uses A-law at 8 kHz, which is 8000 bytes a second. A VTO2000A's
+        own `Encode` table reports PCM 16-bit at 16 kHz, which would be 32000
+        -- but that table describes what the device's *microphone* produces,
+        and nothing measured so far says the speaker consumes the same thing.
+        What little there is points the other way: a push to it settled at
+        about 21000 bytes a second, nearer 8 kHz than 16. Treat the speaker's
+        format as unconfirmed; it is the caller's to supply precisely because
+        the answer here is not in yet.
+
+        **Paced, and the device pushes back as well.** Measured on a VTO2000A
+        with the send buffer pinned to 8 KB: 194,000 bytes went out in 6.1s.
+        That averages 31,683 bytes a second, but the average is mostly the
+        device's buffer filling rather than its speaker draining -- the second
+        half of the same push settled at about 21,000. So the device does
+        apply backpressure, at a rate that has not been pinned down. Pacing
+        stays because a device with a larger buffer would not push back at
+        all, and #177's reporter heard only the last seconds of a long
+        message, which is what that sounds like.
+
+        **No response to wait for.** `postAudio` sends no status line at all,
+        so finishing the body *is* the end of the clip and the client closes.
+        Only a refusal is expected to say anything, which is what the grace
+        period after the last byte is for -- including the refusal this family
+        of devices gives as HTTP 200 with the body `Error`.
+
+        **Two limits, because they catch different things.** The send is not
+        bounded by the clip's own length, which would make a declared rate
+        that is too high end the push part way: the device would still be
+        playing and the socket would be abandoned mid-clip, which is the shape
+        a VTO2000A was found hung after. Once, and the sequence there was that
+        the device stopped taking bytes, the stalled session was held for about
+        ten minutes, and it was then killed -- any of the three could have been
+        what hung it, and nothing measured tells them apart. The design does
+        not rest on knowing which: tolerating a slow drain is right under all
+        three readings. Instead a device
+        is allowed to drain as slowly as `AUDIO_SLOWEST_TOLERATED` times the
+        declared rate before the clip is given up on, while a device that has
+        stopped taking bytes altogether is cut off after
+        `AUDIO_STALL_SECONDS`. A wrong rate then costs slow audio, and only a
+        device that has genuinely stopped is abandoned.
+
+        **What the stall window can and cannot see.** Three buffers sit
+        between handing a piece over and the device having it: aiohttp's
+        writer, which only waits once 64 KiB has built up (`LIMIT` in its
+        `http_writer`), the asyncio transport, and the kernel's send buffer.
+        So progress means "the socket took it", not "the device took it", and
+        a clip smaller than those buffers is reported as played whether the
+        device consumed it or not. Nothing here can do better: postAudio
+        answers nothing at all, so there is no acknowledgement to wait for.
+        Measured against a real server that stopped reading: an 8 MB push is
+        noticed and raised, while a short one is not. Treat the stall window
+        as the backstop that stops a long push hanging, rather than as proof
+        the clip was heard.
+
+        **Not inside `_request_slot`.** An announcement lasts as long as it
+        lasts, and holding one of this host's two request slots for it would
+        starve the poll of every other channel on the device. That is a trade
+        rather than a freebie: the cap of two is there for the device's sake as
+        much as for fairness (#577, #603), so during an announcement a device
+        sees three connections instead of two. The speaker lock bounds the
+        damage to one announcement at a time.
+        """
+        if byte_rate <= 0:
+            raise ValueError("byte_rate must be a positive number of bytes a second")
+        if not audio:
+            return
+
+        url = self._base + AUDIO_POST_PATH.format(channel_number)
+        duration = len(audio) / byte_rate
+        chunk = max(1, int(byte_rate // AUDIO_WRITES_PER_SECOND))
+
+        # Set once the last byte has been handed to aiohttp. That moment, and
+        # not the response, is what says the clip is over, so it is what the
+        # waiting below is hung on.
+        body_sent = asyncio.Event()
+        # Whether any of it ever left. A device that cannot be reached fails
+        # the wait below as well, and saying it "stopped taking audio" when
+        # nothing was ever sent would point at the wrong problem.
+        body_started = False
+        # Whether the device answered while the clip was still going out. Read
+        # inside the request, where the ordering is unambiguous.
+        answered_early = False
+        # When the device last took something. A slow device and a dead one
+        # are only told apart by this moving, so it is updated where a piece
+        # has actually been handed over rather than where one was prepared.
+        last_progress = time.monotonic()
+
+        async def paced_body():
+            """Feeds the clip at the rate it plays at.
+
+            Paced against a single start time rather than by sleeping a fixed
+            slice per write, so a write that blocks does not stretch what
+            follows it: the device hears the clip at its own speed either way.
+            """
+            nonlocal body_started, last_progress
+            started = time.monotonic()
+            sent = 0
+            try:
+                while sent < len(audio):
+                    piece = audio[sent : sent + chunk]
+                    body_started = True
+                    yield piece
+                    # Control comes back here when aiohttp wants the next
+                    # piece, which means the last one has gone to the socket.
+                    # So this is the device taking audio, and the only place
+                    # that can say so.
+                    last_progress = time.monotonic()
+                    sent += len(piece)
+                    if sent >= len(audio):
+                        # Set on handing over the last piece, not after the
+                        # loop: with Content-Length declared, aiohttp writes
+                        # exactly that many bytes and never asks the generator
+                        # for another, so the code after this loop does not run
+                        # until the generator is closed -- long after the clip
+                        # is out. Waiting for that read as the device having
+                        # answered before the body finished, on every clip.
+                        body_sent.set()
+                        return
+                    behind = (sent / byte_rate) - (time.monotonic() - started)
+                    if behind > 0:
+                        await asyncio.sleep(behind)
+            finally:
+                # The safety net for a send that was abandoned part way: it
+                # releases the waiter rather than leaving it to the timeout.
+                body_sent.set()
+
+        headers = {
+            "Content-Type": content_type,
+            # Explicit, and this is load-bearing. aiohttp sends a body of
+            # unknown size with `Transfer-Encoding: chunked`, and a 2018
+            # embedded web server is not going to de-chunk it, so the device
+            # would play the chunk-length lines as audio. Setting the length
+            # here is what keeps aiohttp from choosing chunked at all.
+            "Content-Length": str(len(audio)),
+        }
+        try:
+            authorization = DigestAuth(
+                self._username, self._password, self._session, self._digest_state
+            ).cached_authorization("POST", url)
+        except aiohttp.ClientError:
+            # A challenge this client cannot build a header from. Send without
+            # one rather than failing: the only audio path measured so far does
+            # not ask for credentials, so an unauthenticated attempt is worth
+            # more than refusing to try.
+            _LOGGER.debug(
+                "Could not reuse %s's digest challenge for audio", self._address
+            )
+            authorization = None
+        if authorization:
+            headers["AUTHORIZATION"] = authorization
+
+        _LOGGER.debug(
+            "Playing %d bytes of %s on %s channel %s, about %.1fs",
+            len(audio),
+            content_type,
+            self._address,
+            channel_number,
+            duration,
+        )
+
+        async def post():
+            nonlocal answered_early
+            async with self._session.post(
+                url,
+                headers=headers,
+                data=paced_body(),
+                # Its own clock. Without this the session default applies,
+                # which is a five minute total, and a long clip would be cut
+                # off mid-play by aiohttp rather than by anything here.
+                #
+                # Deliberately the looser of the two: the limits below decide
+                # when a push is given up on, and they can say why. aiohttp
+                # cutting in first would turn "playing slowly" into a bare
+                # TimeoutError, so this sits a grace period past the ceiling
+                # rather than level with it.
+                timeout=aiohttp.ClientTimeout(
+                    total=(
+                        duration * AUDIO_SLOWEST_TOLERATED
+                        + TIMEOUT_SECONDS
+                        + AUDIO_REFUSAL_GRACE_SECONDS
+                        + AUDIO_PROGRESS_CHECK_SECONDS
+                    ),
+                    sock_connect=TIMEOUT_SECONDS,
+                ),
+            ) as response:
+                # Read here, at the moment the headers land, rather than from
+                # the outcome of the race below: an answer and the last byte
+                # can both be ready in the same step of the loop, and then
+                # which future "finished first" says nothing about which
+                # actually came first.
+                answered_early = not body_sent.is_set()
+                response.raise_for_status()
+                # A 200 is not consent. This family answers a refused write
+                # with 200 and the body `Error`, which is why every write
+                # through `get()` is checked for it; this one does not go
+                # through `get()`, so it checks for itself.
+                body = await response.text()
+                if write_was_declined(body):
+                    raise DahuaWriteDeclined(
+                        "{0} declined the audio: {1}".format(
+                            self._address, body.strip()[:80]
+                        )
+                    )
+
+        async with _speaker_lock(self._device, channel_number):
+            # Two things are raced, because either can end the call and they
+            # mean opposite things. The post finishing first is the device
+            # answering before the clip is out, which is a refusal however
+            # polite its status code. The body finishing first is the clip
+            # having played, and then a refusal has only the grace period left
+            # to arrive in.
+            sending = asyncio.ensure_future(post())
+            sent = asyncio.ensure_future(body_sent.wait())
+            # The clip's own length times what a device is allowed to be out
+            # by, plus a flat allowance so that a one second clip is not held
+            # to a one second ceiling. Watched in slices rather than waited on
+            # in one go, because a device draining slowly and a device that
+            # has stopped need different answers and only the second is worth
+            # abandoning quickly.
+            ceiling = (
+                time.monotonic() + duration * AUDIO_SLOWEST_TOLERATED + TIMEOUT_SECONDS
+            )
+            try:
+                while True:
+                    done, _ = await asyncio.wait(
+                        {sending, sent},
+                        timeout=AUDIO_PROGRESS_CHECK_SECONDS,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if done:
+                        break
+                    now = time.monotonic()
+                    if now - last_progress > AUDIO_STALL_SECONDS:
+                        raise asyncio.TimeoutError(
+                            "{0} stopped taking audio part way through".format(
+                                self._address
+                            )
+                            if body_started
+                            else "{0} never started taking the audio".format(
+                                self._address
+                            )
+                        )
+                    if now > ceiling:
+                        raise asyncio.TimeoutError(
+                            "{0} is still taking a {1:.1f}s clip, so it is playing "
+                            "far slower than the {2} bytes a second it was sent "
+                            "as".format(self._address, duration, byte_rate)
+                        )
+                if sending in done:
+                    # Re-raises a refusal. A 2xx gets here too, and whether
+                    # that is success depends entirely on when it arrived.
+                    await sending
+                    if answered_early:
+                        raise DahuaWriteDeclined(
+                            "{0} answered before the clip had finished, so it "
+                            "played at most part of it".format(self._address)
+                        )
+                    return
+                done, _ = await asyncio.wait(
+                    {sending}, timeout=AUDIO_REFUSAL_GRACE_SECONDS
+                )
+                if sending in done:
+                    await sending
+                    return
+                _LOGGER.debug(
+                    "%s took the clip without answering, as postAudio does",
+                    self._address,
+                )
+            finally:
+                sent.cancel()
+                if not sending.done():
+                    sending.cancel()
+                # `asyncio.wait` rather than `await sending`, because awaiting
+                # a cancelled task here raises CancelledError and suppressing
+                # that would swallow a cancellation aimed at *this* method: an
+                # enclosing `asyncio.timeout` whose deadline lands during this
+                # cleanup would then never fire. wait() reports rather than
+                # raises, and leaves an outer cancel free to propagate.
+                #
+                # Bounded, so a library that declined to be cancelled could not
+                # hold the speaker lock for ever.
+                await asyncio.wait({sending}, timeout=TIMEOUT_SECONDS)
 
     async def async_access_control_open_door(self, door_id: int = 1) -> dict:
         """Open a door, over CGI, falling back to RPC2 if the CGI path is absent.
@@ -3486,14 +5267,46 @@ class DahuaClient:
             )
 
     async def _enable_motion_detection_cgi(self, channel: int, enabled: bool) -> dict:
-        """The CGI route, tried first and kept exactly as it was."""
+        """The CGI route: the two-key form first, then `Enable` on its own.
+
+        **A refusal arrives two ways, and for a while this only heard one.**
+        The fallback below was written when a declined write came back as a
+        body that was simply not `OK`. Writes now go through `get()` with
+        `reject_declined`, so a 200 carrying `Error` raises `DahuaWriteDeclined`
+        instead, and the first `await` left the function before the second form
+        could be tried. The fallback was dead for exactly the devices it was
+        added for.
+
+        Reported on #1115 against a VTO4202F-P-S2 on 4.600, with the two calls
+        made by hand:
+
+            setConfig&MotionDetect[0].Enable=false&MotionDetect[0].DetectVersion=V3.0
+              -> Error
+            setConfig&MotionDetect[0].Enable=false
+              -> OK, and getConfig shows it took
+
+        and `getConfig&name=MotionDetect` on that firmware carries no
+        `DetectVersion` key at all. So every toggle of the Motion Detection
+        switch raised, and the switch could not be turned off.
+
+        Both shapes fall through now. The second form is still the one that
+        answers for the caller, so a device that declines both reports the
+        second refusal rather than swallowing either.
+        """
         url = "/cgi-bin/configManager.cgi?action=setConfig&MotionDetect[{channel}].Enable={enabled}&MotionDetect[{channel}].DetectVersion=V3.0".format(
             channel=channel, enabled=str(enabled).lower()
         )
-        response = await self.get(url)
-
-        if "OK" in response:
-            return response
+        try:
+            response = await self.get(url)
+        except DahuaWriteDeclined:
+            _LOGGER.debug(
+                "%s declined MotionDetect with DetectVersion; asking with Enable "
+                "alone",
+                self._address,
+            )
+        else:
+            if "OK" in response:
+                return response
 
         # Some older cameras do not support the above API, so try this one
         url = "/cgi-bin/configManager.cgi?action=setConfig&MotionDetect[{0}].Enable={1}".format(
@@ -3612,6 +5425,10 @@ class DahuaClient:
             # are never split across TCP chunk boundaries.
             boundary = b"--myboundary"
             content_type = response.headers.get("Content-Type", "")
+            # Whether the device *said* this is multipart, which is a better
+            # question than whether any one chunk happens to contain the
+            # delimiter. See the loop below.
+            declared_multipart = "boundary=" in content_type
             if "boundary=" in content_type:
                 b_val = (
                     content_type.split("boundary=")[1]
@@ -3627,7 +5444,16 @@ class DahuaClient:
                 # Buffer multipart parts across TCP chunks. Content-Length lets
                 # us deliver a complete part immediately instead of waiting for
                 # the next boundary (or the next five-second heartbeat).
-                if boundary in data or boundary in buffer:
+                # A declared multipart stream always goes through the
+                # buffer. Asking whether this chunk or the buffer contains
+                # the delimiter loses a boundary split across two TCP
+                # chunks (#995): neither half contains it, so both were
+                # handed straight to the handler and the part they belonged
+                # to was never assembled. A stream that declares no
+                # boundary keeps the old test, because for those the raw
+                # dispatch is the only path and buffering would deliver
+                # nothing at all.
+                if declared_multipart or boundary in data or boundary in buffer:
                     buffer += data
                     while True:
                         complete_part, buffer = _pop_complete_multipart_part(
@@ -3701,11 +5527,6 @@ class DahuaClient:
         codes = [code for code in events if code and code != "All"]
         if not codes:
             # "All" cannot be polled, so expand it rather than watch nothing.
-            # Imported here because config_flow imports this module.
-            from .config_flow import (
-                ALL_EVENTS,
-            )  # pylint: disable=import-outside-toplevel
-
             codes = [code for code in ALL_EVENTS if code != "All"]
 
         cycle = max(
@@ -3976,7 +5797,7 @@ class DahuaClient:
         Raises the same errors async_get_snapshot would.
         """
         url = self._base + "/cgi-bin/snapshot.cgi?channel={0}".format(channel_number)
-        async with asyncio.timeout(TIMEOUT_SECONDS), self._host_limit:
+        async with self._request_slot(), asyncio.timeout(TIMEOUT_SECONDS):
             response = None
             try:
                 auth = DigestAuth(
@@ -3991,9 +5812,9 @@ class DahuaClient:
 
     async def get_bytes(self, url: str) -> bytes:
         """Get information from the API. This will return the raw response and not process it"""
-        # The timeout covers the wait for a slot as well as the request, so a
-        # busy host sheds load instead of building an unbounded queue.
-        async with asyncio.timeout(TIMEOUT_SECONDS), self._host_limit:
+        # The slot is taken before the clock starts, so this timeout is the
+        # device's and MAX_QUEUE_WAIT_SECONDS is the queue's.
+        async with self._request_slot(), asyncio.timeout(TIMEOUT_SECONDS):
             response = None
             try:
                 auth = DigestAuth(
@@ -4006,6 +5827,43 @@ class DahuaClient:
             finally:
                 if response is not None:
                     response.close()
+
+    async def async_get_event_indexes_cgi(self, code: str) -> set[int]:
+        """Return active channel indexes from the CGI event state endpoint.
+
+        This deliberately uses get_bytes rather than the shared read cache:
+        event state is short-lived and a five-second cached answer would delay
+        both the Start and Stop edge.
+        """
+        data = await self.get_bytes(
+            "/cgi-bin/eventManager.cgi?action=getEventIndexes&code={0}".format(
+                quote(code, safe="")
+            )
+        )
+        indexes = set()
+        for line in data.decode("utf-8", errors="ignore").splitlines():
+            match = re.fullmatch(r"channels\[\d+\]=(\d+)", line.strip())
+            if match:
+                indexes.add(int(match.group(1)))
+        return indexes
+
+    @asynccontextmanager
+    async def _request_slot(self):
+        """Wait for this host's turn, on a clock of its own.
+
+        Always used as `async with self._request_slot(), asyncio.timeout(...)`
+        and never the other way round. That order is the whole point:
+        TIMEOUT_SECONDS then measures the device, and MAX_QUEUE_WAIT_SECONDS
+        measures the queue this integration put in front of it (#1043).
+
+        The slot is entered through the async context manager protocol rather
+        than acquire/release so that a test may substitute anything that spells
+        it, which several already do.
+        """
+        async with AsyncExitStack() as stack:
+            async with asyncio.timeout(MAX_QUEUE_WAIT_SECONDS):
+                await stack.enter_async_context(self._host_limit)
+            yield
 
     async def get(self, url: str, verify_ok=False) -> dict:
         """Get information from the API, sharing the read across this device.
@@ -4027,6 +5885,11 @@ class DahuaClient:
             clear_host_cache(self._device)
             return await self._request(url, verify_ok, reject_declined=True)
 
+        # Reads only, and before the cache is touched. A read registered here
+        # by a client that is closing would be waited on by every other entry
+        # on this device, so it fails theirs too, not just its own.
+        self._refuse_if_closing()
+
         # Credentials are part of the key: entries for one device may be
         # configured with different users, and a successful read is not
         # otherwise scoped to who made it.
@@ -4037,7 +5900,9 @@ class DahuaClient:
             # Registering before the request starts is what makes this work:
             # the per-host limiter queues callers inside _request, so by the
             # time the first one has a slot the rest are already sharing it.
-            entry = _SharedRead(asyncio.ensure_future(self._request(url, verify_ok)))
+            entry = _SharedRead(
+                asyncio.ensure_future(self._request(url, verify_ok)), self._session
+            )
             _HOST_CACHE[key] = entry
 
         # Shielded so that one entry's cancelled refresh -- a reload, a
@@ -4054,14 +5919,122 @@ class DahuaClient:
 
         return dict(result)
 
+    def _no_dhip_equivalent(self, url: str, why: str) -> aiohttp.ClientResponseError:
+        """A 404 that can be printed, for a read this transport cannot serve.
+
+        `request_info` is built rather than left as None. aiohttp's own
+        `__str__` reads `self.request_info.real_url`, so a None there turns
+        every attempt to log or format this error into
+
+            AttributeError: 'NoneType' object has no attribute 'real_url'
+
+        which is raised from the logging call, nowhere near the read, and hides
+        the status the caller was being told about. Measured against the
+        monitor: the first probe to print one of these died on it rather than
+        on the refusal it was reporting.
+        """
+        full = URL("{0}{1}".format(getattr(self, "_base", ""), url))
+        return aiohttp.ClientResponseError(
+            aiohttp.RequestInfo(full, "GET", CIMultiDict(), full),
+            (),
+            status=404,
+            message=why,
+        )
+
+    async def _request_over_dhip(self, url: str, allow_rpc2: bool) -> dict:
+        """Serve a read for a device whose only transport is DHIP (#949).
+
+        Two outcomes, and nothing in between, because there is no second
+        transport to fall back to:
+
+        * a `configManager.cgi?action=getConfig&name=X` read is the same
+          question as `configManager.getConfig {"name": "X"}`, so it goes over
+          the socket and comes back in the same flat shape every caller
+          already expects;
+        * anything else -- a snapshot, an event attach, a capability probe --
+          has no DHIP equivalent that has been measured, and the device has no
+          web server to ask. Reported as a 404.
+
+        The 404 is the point. `CAPABILITY_REFUSED` is `(400, 404, 501)` and
+        `refusals.py` and the coordinator's probes are already built to hear it
+        and gate the entity off. Raising something new here would mean teaching
+        every one of those callers about a transport, to say a thing they can
+        already be told.
+        """
+        if not allow_rpc2:
+            # The one caller that pins itself to CGI is the per-rule IVS read,
+            # which needs the array indexes only that table has. On this
+            # device there is no such table to pin to.
+            raise self._no_dhip_equivalent(
+                url,
+                "{0} has no CGI; this read cannot be served over DHIP".format(
+                    self._address
+                ),
+            )
+        match = _CONFIG_READ.search(url)
+        if match is None:
+            raise self._no_dhip_equivalent(
+                url,
+                "{0} serves no HTTP, and {1} has no DHIP equivalent".format(
+                    self._address, url
+                ),
+            )
+        table = match.group(1)
+        try:
+            async with self._request_slot(), asyncio.timeout(TIMEOUT_SECONDS):
+                return await self._rpc2_get_config(table)
+        except Rpc2MethodRefused as refused:
+            if rpc2_refusal_is_a_stale_login(refused):
+                # Not this table's verdict. `_rpc2_get_config` has already
+                # logged in again once; letting this through keeps the
+                # existing retry rather than recording a capability that is
+                # really a session.
+                raise
+            # The device answered and declined the table, which over HTTP would
+            # be a CGI 404 and is handled everywhere as one. Over DHIP it
+            # arrives as Rpc2MethodRefused, which no caller of `get` expects:
+            # `async_get_config` swallows a ClientResponseError and returns {},
+            # the capability probes judge on CAPABILITY_REFUSED, and the poll's
+            # fan-out has no `return_exceptions`. Measured on a VTH5221D, where
+            # MotionDetect, DisableLinkage and DisableEventNotify are all
+            # refused this way: left as it was, the first refresh raised out of
+            # the gather and the entry never finished setting up (#949, and
+            # #1006 for the shape).
+            _LOGGER.debug(
+                "%s does not serve %s, reporting it the way an absent CGI table is",
+                self._address,
+                table,
+                exc_info=True,
+            )
+            raise self._no_dhip_equivalent(
+                url,
+                "{0} does not serve the {1} table".format(self._address, table),
+            ) from refused
+
     async def _request(
         self, url: str, verify_ok=False, allow_rpc2=True, reject_declined=False
     ) -> dict:
         """Make the request. One caller per shared read reaches here."""
+        # Reads reach here from `get` and from a few callers of their own, and
+        # a write is left to fail as an ordinary error: somebody pressed
+        # something, and a cancellation nobody asked for is the wrong answer
+        # to give them.
+        if not reject_declined:
+            self._refuse_if_closing()
+
         # Per-rule camera writes use CGI array indexes. Resolve and poll that
         # same CGI table even when other config reads prefer RPC2.
         if url == "/cgi-bin/configManager.cgi?action=getConfig&name=VideoAnalyseRule":
             allow_rpc2 = False
+        # A monitor with no web server (#949). There is no CGI to try first and
+        # none to fall back to, so this is a route rather than a preference:
+        # a config read goes over DHIP, and anything else is answered the way
+        # the rest of the integration already hears "this device does not have
+        # that", so capability gating and refusal learning work unchanged
+        # instead of each caller growing a special case.
+        if self._rpc2_over_dhip:
+            return await self._request_over_dhip(url, allow_rpc2)
+
         # Not after close(): this client has given its share back, and taking
         # a new one would build a session nobody is left to release.
         if (
@@ -4076,7 +6049,7 @@ class DahuaClient:
                 match = None  # this table only; the transport is still good
             if match:
                 try:
-                    async with asyncio.timeout(TIMEOUT_SECONDS), self._host_limit:
+                    async with self._request_slot(), asyncio.timeout(TIMEOUT_SECONDS):
                         return await self._rpc2_get_config(match.group(1))
                 except Exception as rpc2_exception:  # pylint: disable=broad-except
                     # Either way this read falls through to CGI rather than
@@ -4128,7 +6101,7 @@ class DahuaClient:
                         )
         url = self._base + url
         try:
-            async with asyncio.timeout(TIMEOUT_SECONDS), self._host_limit:
+            async with self._request_slot(), asyncio.timeout(TIMEOUT_SECONDS):
                 response = None
                 try:
                     auth = DigestAuth(

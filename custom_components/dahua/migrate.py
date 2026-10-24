@@ -46,22 +46,40 @@ The timing makes the copies accurate rather than approximate: this runs during
 nothing has modified them yet.
 """
 
+import asyncio
 import logging
 import os
 import shutil
+import tempfile
 import time
 
 from homeassistant.config_entries import ConfigSubentry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers import entity_platform as ep
 from homeassistant.helpers import issue_registry as ir
+from homeassistant.helpers.dispatcher import async_dispatcher_connect
+from homeassistant.helpers.event import async_call_later
 
-from . import ISSUE_SIBLINGS_REMAIN
-from .const import CHANNEL_OPTION_KEYS, CONF_ADDRESS, CONF_CHANNEL, CONF_PORT, DOMAIN
-from .host import normalize_address
+from . import ISSUE_LEFTOVER_ROWS, ISSUE_SIBLINGS_REMAIN, devices_with_identifier
+from .const import (
+    CHANNEL_OPTION_KEYS,
+    CONF_ADDRESS,
+    CONF_CHANNEL,
+    CONF_PORT,
+    DOMAIN,
+    PLATFORMS,
+)
+from .host import is_synthesised_identity, normalize_address
 
 _LOGGER: logging.Logger = logging.getLogger(__package__)
+
+# How long after the last thing the leftover gate was waiting on before the
+# registry is scanned again. See the docstring on the recheck below: an
+# entity whose add has been scheduled does not exist yet, and the scan does
+# not await, so it would otherwise read the row as a leftover.
+LEFTOVER_RECHECK_SETTLE_SECONDS = 5
 
 # The registry files worth keeping a copy of. Nothing else is touched.
 BACKED_UP = (
@@ -177,15 +195,22 @@ def _has_finished_merging(entities, devices, entry) -> bool:
     )
 
 
-def _backup(hass: HomeAssistant) -> str | None:
+def _backup(hass: HomeAssistant, label: str = "pre-merge") -> str | None:
     """Copy the registries somewhere the user can find them. Blocking."""
     storage = hass.config.path(".storage")
     target = hass.config.path(
-        "dahua-pre-merge-backup-%s" % time.strftime("%Y%m%d-%H%M%S")
+        "dahua-%s-backup-%s" % (label, time.strftime("%Y%m%d-%H%M%S"))
     )
     copied = []
     try:
-        os.makedirs(target, exist_ok=True)
+        if label == "pre-serial":
+            # Config entries contain credentials. Use a private, unique
+            # directory, including when two entries migrate in the same second.
+            target = tempfile.mkdtemp(
+                prefix="dahua-pre-serial-backup-", dir=hass.config.path()
+            )
+        else:
+            os.makedirs(target, exist_ok=True)
         for name in BACKED_UP:
             source = os.path.join(storage, name)
             if os.path.exists(source):
@@ -197,9 +222,393 @@ def _backup(hass: HomeAssistant) -> str | None:
             "Dahua entries. The merge has NOT been attempted"
         )
         return None
-    if not copied:
+    if not copied or (label == "pre-serial" and set(copied) != set(BACKED_UP)):
         return None
     return target
+
+
+DATA_SERIAL_BACKUP = "dahua_pre_serial_backup"
+
+
+def _registry_fingerprint(hass: HomeAssistant, directory: str | None = None) -> tuple:
+    """What the files a backup would copy look like right now. Blocking."""
+    storage = directory if directory is not None else hass.config.path(".storage")
+    marks = []
+    for name in sorted(BACKED_UP):
+        try:
+            stat = os.stat(os.path.join(storage, name))
+        except OSError:
+            marks.append((name, None, None))
+        else:
+            marks.append((name, stat.st_size, stat.st_mtime_ns))
+    return tuple(marks)
+
+
+async def _async_backup_once(hass: HomeAssistant) -> str | None:
+    """One copy of the registries, shared by every entry it still describes.
+
+    Reported by @kmich on three monitors migrating in one startup: three backup
+    directories written within 0.1 s of each other and byte identical. A backup
+    copies the *persisted* files, and Home Assistant saves those on a delay, so
+    nothing any of the three migrations did had reached disk yet.
+
+    Reused on the evidence rather than on a timer. The files are stat'd, and the
+    copy already taken is handed back only while their sizes and modification
+    times are what they were when it was taken. That is the whole safety
+    property a backup has -- it is the state immediately before the change --
+    and a window in seconds would have traded it for a round number. An entry
+    reloaded an hour later, after Home Assistant has persisted anything at all,
+    gets its own copy.
+
+    Behind a lock, because the case being fixed is entries setting up
+    concurrently: without it all three would stat before any of them copied,
+    see nothing, and write the three directories again.
+
+    A failed backup is not remembered, so the next entry tries rather than
+    inheriting a full disk that may since have been emptied. The caller still
+    refuses to migrate on None.
+    """
+    held = hass.data.setdefault(
+        DATA_SERIAL_BACKUP, {"lock": asyncio.Lock(), "fingerprint": None, "where": None}
+    )
+    async with held["lock"]:
+        fingerprint = await hass.async_add_executor_job(_registry_fingerprint, hass)
+        if held["where"] is not None and held["fingerprint"] == fingerprint:
+            copied = await hass.async_add_executor_job(
+                _registry_fingerprint, hass, held["where"]
+            )
+            if copied == fingerprint and all(size is not None for _, size, _ in copied):
+                _LOGGER.debug(
+                    "Reusing the complete registry backup at %s", held["where"]
+                )
+                return held["where"]
+        where = await hass.async_add_executor_job(_backup, hass, "pre-serial")
+        if where is not None:
+            held["fingerprint"] = fingerprint
+            held["where"] = where
+        return where
+
+
+def leftover_rows(hass: HomeAssistant, entry) -> list:
+    """This entry's registry rows that no entity is behind, newest state first.
+
+    A row whose entity the integration no longer creates stays in the registry
+    for ever, unavailable, and Home Assistant offers to delete it one at a
+    time. @kmich hit a monitor's worth of them at once: the `disarming` and
+    `event_notifications` switches an earlier release created on a VTH are
+    gated off now, so they moved through the serial migration and then sat
+    there with no way to be rid of them but by hand.
+
+    **A row with no live entity is one with no state object, or one whose state
+    Home Assistant marked `restored`.** Both, because which of the two it is
+    depends on timing rather than on anything meaningful: `_write_unavailable_states`
+    runs on EVENT_HOMEASSISTANT_START and only when Home Assistant was not
+    already running, so before it a leftover has no state at all and after it
+    has a restored one. Reading only `restored` would have made the answer
+    depend on listener order.
+
+    A disabled row is never a leftover. There is no entity behind it because
+    the user said so.
+    """
+    registry = er.async_get(hass)
+    rows = []
+    for row in er.async_entries_for_config_entry(registry, entry.entry_id):
+        if row.disabled_by is not None:
+            continue
+        if not entry.options.get(row.domain, True):
+            continue
+        state = hass.states.get(row.entity_id)
+        if state is None or state.attributes.get("restored"):
+            rows.append(row.entity_id)
+    return sorted(rows)
+
+
+def _entry_is_wholly_healthy(hass: HomeAssistant, entry, coordinators) -> bool:
+    """Whether this entry is in a state where a missing entity means anything.
+
+    The hazard this exists for is #1085's channel recovery. A channel that
+    failed its first refresh has every one of its rows unavailable until it
+    comes back, and a card offering to delete all of them is how the #827
+    merge card destroyed 232 entities. The same goes for a capability that has
+    not answered yet (#1057): its entity is built when the retry succeeds, and
+    until then the row looks exactly like a leftover.
+
+    So this says yes only when every channel is initialized and polling
+    cleanly. Anything else and nothing is offered, which costs a user who
+    really does have leftovers one more restart and costs a user whose camera
+    is merely offline nothing at all.
+    """
+    if not coordinators:
+        return False
+    from . import channel_configs
+
+    expected = {config.get(CONF_CHANNEL, 0) for _, config in channel_configs(entry)}
+    present = {
+        coordinator.get_channel()
+        for coordinator in coordinators
+        if callable(getattr(coordinator, "get_channel", None))
+    }
+    # Setup retains successful coordinators only. Checking that list alone
+    # cannot establish that a failed configured channel has recovered.
+    if not expected.issubset(present):
+        return False
+    ready = {
+        platform.domain
+        for platform in ep.async_get_platforms(hass, DOMAIN)
+        if platform.config_entry is entry
+        and getattr(platform, "_setup_complete", False)
+    }
+    wanted = {domain for domain in PLATFORMS if entry.options.get(domain, True)}
+    if not wanted.issubset(ready):
+        # EntityPlatform handles setup failures internally; a successful
+        # coordinator refresh does not prove the entities were loaded.
+        return False
+    for coordinator in coordinators:
+        if not getattr(coordinator, "initialized", False):
+            return False
+        if not getattr(coordinator, "last_update_success", False):
+            return False
+        # ⚠ `may_still_answer`, not `did_not_answer`. A probe is worth waiting
+        # on only while something will ask it again; one that has spent its
+        # retry budget, or that is not retried at all, will never build its
+        # entity, so holding the card back for it holds it back for ever.
+        # @kmich measured that on #1114: seventeen entries, every one of them
+        # reporting `cloud_upgrade` unanswered with its budget spent, and the
+        # card could not appear on any of them.
+        #
+        # The fallback is the older method, so a coordinator double that
+        # models only that one keeps the stricter behaviour rather than
+        # silently losing the gate.
+        pending = getattr(coordinator, "probes_that_may_still_answer", None)
+        if pending is None:
+            pending = getattr(coordinator, "probes_that_did_not_answer", None)
+        if pending is not None and pending():
+            # A probe that may still answer is one whose entity is still to
+            # come: the retry builds it when the device finally replies, and
+            # until then its row is indistinguishable from a leftover.
+            return False
+    # ⚠ And a probe that HAS answered is not the end of it. The entities it
+    # gates are built by `late.py` in a task started after the poll, so for
+    # the length of that task the question reads as resolved while the rows
+    # are still empty. @rroller on #1125 named the repair flow specifically:
+    # it confirms a removal through this same gate.
+    from .late import async_rebuilds_failed, async_rebuilds_outstanding
+
+    if async_rebuilds_outstanding(hass, entry.entry_id):
+        return False
+    # ⚠ And a rebuild that FAILED is not the same as one that found nothing.
+    # Its entities were never created, so their rows are empty because of a
+    # fault here, which is the one reading this gate exists to refuse. It
+    # stays refused until that channel rebuilds cleanly or the entry reloads.
+    if async_rebuilds_failed(hass, entry.entry_id):
+        return False
+    return True
+
+
+@callback
+def async_recheck_leftover_rows_when_late_work_settles(
+    hass: HomeAssistant, entry, coordinators
+) -> None:
+    """Offer the card again whenever something the gate was waiting on resolves.
+
+    ⭐ @rroller on #1125. `async_offer_leftover_rows` is called once, from
+    `async_setup_entry` after the platforms are forwarded. At that moment a
+    retryable probe that has not answered still has its whole budget, so the
+    gate rightly refuses and no card appears. The budget is then spent over
+    the next few polls, `probes_that_may_still_answer` empties -- and nothing
+    asks again. The card stays absent for ever, which is @kmich's #1114
+    reached by a second road, and the first fix on this branch did not close
+    it: the test that proved it called the offer a second time by hand.
+
+    So the two places where that waiting ends now say so, and this listens:
+    the retry loop when its last question is settled, and `late.py` when a
+    rebuild it started has finished creating entities.
+
+    ⚠ **Delayed, and that is not a style choice.** `async_add_entities` only
+    SCHEDULES the add, and after setup is complete the EntityPlatform tracks
+    that task nowhere this code can await. Home Assistant starts it eagerly,
+    so it runs as far as its first await and hands control straight back,
+    which means a rebuild can finish, this fire, and the scan read the rows of
+    entities that are a few awaits away from existing. The scan itself does
+    not await, so it would run to the end before they arrived. A few seconds
+    is far longer than an add takes and costs nothing for a tidy-up card.
+    Collapsed too, so a recorder settling nineteen channels scans once.
+
+    Wrapped like the setup call site. This runs on the event loop beside a
+    poll, and a tidy-up card must never be what stops a camera working.
+    """
+    due: list = []
+
+    @callback
+    def _settled() -> None:
+        while due:
+            due.pop()()
+        due.append(
+            async_call_later(hass, LEFTOVER_RECHECK_SETTLE_SECONDS, _recheck_now)
+        )
+
+    @callback
+    def _recheck_now(_now) -> None:
+        due.clear()
+        hass.async_create_task(_async_recheck_leftover_rows(hass, entry, coordinators))
+
+    from .late import async_forget_entry, late_work_settled_signal
+
+    entry.async_on_unload(
+        async_dispatcher_connect(
+            hass, late_work_settled_signal(entry.entry_id), _settled
+        )
+    )
+
+    @callback
+    def _forget_what_was_outstanding() -> None:
+        """Unload clears both the pending scan and the late-work record.
+
+        ⚠ Registered here rather than in `late.py`, which runs once per
+        PLATFORM: an unload hook added there would be added ten times, and
+        two tests count an entry's hooks to check that every platform is
+        listening for a late answer.
+
+        The record matters as much as the timer. A channel whose rebuild
+        failed before a reload would otherwise keep the card shut after it,
+        on evidence from a run that no longer exists.
+        """
+        while due:
+            due.pop()()
+        async_forget_entry(hass, entry.entry_id)
+
+    entry.async_on_unload(_forget_what_was_outstanding)
+
+
+async def _async_recheck_leftover_rows(
+    hass: HomeAssistant, entry, coordinators
+) -> None:
+    # ⚠ Read now, not closed over from setup. A channel that failed its first
+    # refresh and recovered later (#1085) is in `runtime_data` and was not in
+    # the list setup built, and the gate requires every configured channel to
+    # be present before it offers anything.
+    live = getattr(entry, "runtime_data", None)
+    if isinstance(live, dict) and live:
+        coordinators = list(live.values())
+    try:
+        await async_offer_leftover_rows(hass, entry, coordinators)
+    except Exception:  # pylint: disable=broad-except
+        _LOGGER.exception(
+            "Could not re-check %s for leftover registry rows. Nothing is wrong "
+            "with the device and the entry is set up normally",
+            entry.data.get(CONF_ADDRESS),
+        )
+
+
+async def async_offer_leftover_rows(hass: HomeAssistant, entry, coordinators) -> int:
+    """Raise a card listing this entry's leftover rows, or clear one that is stale.
+
+    Returns how many were found, for the caller's log and for the tests.
+
+    **Recomputed on every start and never persisted.** The merge card that
+    deleted a recorder was persistent, so it outlived the evidence it was
+    raised on and then described a situation that no longer existed. This one
+    is rebuilt from the registry each time, and the flow rebuilds it again
+    before it deletes anything.
+
+    A reload is fine, and this used to claim otherwise. Unloading writes every
+    row as unavailable with `restored: True` (`Entity.async_remove`, the
+    `write_unavailable_state` branch), so after a reload a row that really has
+    stopped being created is correctly found. What that also means is that
+    every row of an entry which has not finished coming back reads as a
+    leftover, which is what the health gate above is for, and what the repair
+    flow re-checks before it removes anything. The earlier wording here said a
+    reload writes no restored states, which is wrong, and it was the reasoning
+    the safety rested on (@kmich on #1114).
+    """
+    issue_id = ISSUE_LEFTOVER_ROWS.format(entry.entry_id)
+    if not _entry_is_wholly_healthy(hass, entry, coordinators):
+        ir.async_delete_issue(hass, DOMAIN, issue_id)
+        return 0
+    rows = leftover_rows(hass, entry)
+    if not rows:
+        ir.async_delete_issue(hass, DOMAIN, issue_id)
+        return 0
+    ir.async_create_issue(
+        hass,
+        DOMAIN,
+        issue_id,
+        is_fixable=True,
+        is_persistent=False,
+        severity=ir.IssueSeverity.WARNING,
+        translation_key="leftover_rows",
+        translation_placeholders={
+            "name": entry.title or "untitled",
+            "count": str(len(rows)),
+        },
+        data={"entry_id": entry.entry_id},
+    )
+    return len(rows)
+
+
+async def async_drop_duplicate_disk_sensors(hass: HomeAssistant, entry) -> None:
+    """Remove the disk sensors every channel of a recorder used to create.
+
+    `storageDevice.cgi?action=getDeviceAllInfo` takes no channel: the disks
+    belong to the box. Every channel coordinator answered that question anyway
+    and created its own sensor for each disk, so a twelve channel recorder with
+    four bays carried forty eight entities describing four disks, each filed
+    under a device named after a camera.
+
+    They are created once now, keyed on the device serial. On channel 0 that is
+    the same string as before, so the surviving four keep their ids, their
+    history and anything pointing at them. These are the rest.
+
+    **The safety property, and the reason this is not a pattern match alone: a
+    duplicate is only removed when the surviving id is present.** So if a
+    recorder's entry has no channel 0 -- the canonical id would be one nothing
+    has created yet -- this leaves every row alone rather than deleting the only
+    copy of a disk. Clutter is a better failure than loss, and #891 is why that
+    is spelled out.
+    """
+    registry = er.async_get(hass)
+    rows = er.async_entries_for_config_entry(registry, entry.entry_id)
+    by_unique_id = {row.unique_id: row for row in rows}
+
+    doomed = []
+    for unique_id, row in by_unique_id.items():
+        head, separator, slug = (unique_id or "").partition("_disk_")
+        if not separator or not slug:
+            continue
+        # `<serial>_<channel>_disk_<slug>` is a duplicate; `<serial>_disk_<slug>`
+        # is the one that stays. rpartition so a serial containing an underscore
+        # cannot be mistaken for a channel.
+        serial, underscore, channel = head.rpartition("_")
+        if not underscore or not channel.isdigit():
+            continue
+        survivor = "%s_disk_%s" % (serial, slug)
+        if survivor != unique_id and survivor in by_unique_id:
+            doomed.append(row)
+
+    if not doomed:
+        return
+
+    where = await hass.async_add_executor_job(_backup, hass, "pre-disk-cleanup")
+    if where is None:
+        _LOGGER.warning(
+            "Could not back up the registries, so the %d duplicate Dahua disk "
+            "sensors have been left alone. They are disabled by default and "
+            "harmless; remove them from the entity list if you want them gone",
+            len(doomed),
+        )
+        return
+
+    for row in doomed:
+        registry.async_remove(row.entity_id)
+
+    _LOGGER.info(
+        "Removed %d duplicate disk sensors: a recorder's channels each created "
+        "one per disk, and they are now created once for the device. The ones "
+        "that remain keep their entity ids and history. Registries backed up to "
+        "%s first",
+        len(doomed),
+        where,
+    )
 
 
 async def async_merge_channel_entries(hass: HomeAssistant) -> None:
@@ -454,3 +863,149 @@ async def _async_merge_host(hass: HomeAssistant, address: str, group: list) -> N
         removed,
         survived,
     )
+
+
+async def async_adopt_the_real_serial(hass: HomeAssistant, entry, coordinators) -> int:
+    """Adopt a reported serial while preserving entity IDs and device metadata.
+
+    Recognise legacy hashes in this entry's registries even if credentials
+    have since changed. Check every target for collisions before changing any
+    registry, copy all three persisted registries, then check again after the
+    backup yields. Conflicts and backup failures propagate so setup cannot
+    create duplicate entities under a partially migrated identity.
+
+    Entity unique IDs move before device identifiers and the config entry ID;
+    entity IDs and device IDs remain intact. Return the entity count.
+    """
+    old = None
+    for coordinator in coordinators:
+        client = getattr(coordinator, "client", None)
+        candidate = getattr(client, "credential_hash", None)
+        if candidate is None:
+            continue
+        old = candidate()
+        source = coordinator
+        break
+    if not old:
+        return 0
+
+    entities = er.async_get(hass)
+    devices = dr.async_get(hass)
+    entry_rows = er.async_entries_for_config_entry(entities, entry.entry_id)
+    entry_devices = dr.async_entries_for_config_entry(devices, entry.entry_id)
+    # The stored identity may predate a password change. The registries, not
+    # today's credentials, are authoritative about which legacy IDs need moving.
+    roots = {old}
+    for value in [
+        entry.unique_id,
+        *[v for d in entry_devices for domain, v in d.identifiers if domain == DOMAIN],
+        *[row.unique_id for row in entry_rows if row.platform == DOMAIN],
+    ]:
+        root = (value or "").split("_", 1)[0]
+        if is_synthesised_identity(root):
+            roots.add(root)
+
+    def is_legacy(value):
+        return any(
+            value == root or (value or "").startswith(root + "_") for root in roots
+        )
+
+    if not (
+        is_legacy(entry.unique_id)
+        or any(is_legacy(row.unique_id) for row in entry_rows)
+        or any(
+            domain == DOMAIN and is_legacy(value)
+            for device in entry_devices
+            for domain, value in device.identifiers
+        )
+    ):
+        return 0
+    serial = source.get_device_serial_number()
+    if not serial or serial in roots:
+        return 0
+
+    def replacement(value):
+        for root in roots:
+            if value == root or (value or "").startswith(root + "_"):
+                return serial + value[len(root) :]
+        return value
+
+    rows = [
+        (row, replacement(row.unique_id))
+        for row in entry_rows
+        if replacement(row.unique_id) != row.unique_id
+    ]
+    stale_devices = [
+        (
+            device,
+            {
+                (domain, replacement(value) if domain == DOMAIN else value)
+                for domain, value in device.identifiers
+            },
+        )
+        for device in entry_devices
+        if any(
+            domain == DOMAIN and replacement(value) != value
+            for domain, value in device.identifiers
+        )
+    ]
+    new_entry_id = replacement(entry.unique_id)
+    if not rows and not stale_devices and new_entry_id == entry.unique_id:
+        return 0
+
+    def preflight():
+        targets = set()
+        for row, target in rows:
+            key = (row.domain, row.platform, target)
+            held = entities.async_get_entity_id(*key)
+            if key in targets or (held is not None and held != row.entity_id):
+                raise ValueError("Serial migration entity conflict: " + row.entity_id)
+            targets.add(key)
+            current = entities.async_get(row.entity_id)
+            if current is None or current.unique_id != row.unique_id:
+                raise ValueError("Serial migration registry changed; retry setup")
+        device_targets = set()
+        for device, identifiers in stale_devices:
+            for identifier in identifiers:
+                if identifier[0] != DOMAIN:
+                    continue
+                held = devices_with_identifier(devices, identifier)
+                if identifier in device_targets or any(
+                    other.id != device.id for other in held
+                ):
+                    raise ValueError("Serial migration device conflict: " + device.id)
+                device_targets.add(identifier)
+            current = devices.async_get(device.id)
+            if current is None or current.identifiers != device.identifiers:
+                raise ValueError("Serial migration registry changed; retry setup")
+        if new_entry_id != entry.unique_id and any(
+            other.entry_id != entry.entry_id and other.unique_id == new_entry_id
+            for other in hass.config_entries.async_entries(DOMAIN)
+        ):
+            raise ValueError("Serial migration config entry conflict")
+
+    preflight()
+    backup = await _async_backup_once(hass)
+    if backup is None:
+        raise ValueError(
+            "Could not back up all three registries before serial migration"
+        )
+    # Backup yields to other entry setups. Recheck every target afterwards;
+    # no await separates the checks from the registry mutations below.
+    preflight()
+    _LOGGER.warning(
+        "%s reports serial %s. Moving %d entities and %d devices; persisted "
+        "registry files were copied to %s first",
+        entry.data.get(CONF_ADDRESS),
+        serial,
+        len(rows),
+        len(stale_devices),
+        backup,
+    )
+    for row, target in rows:
+        entities.async_update_entity(row.entity_id, new_unique_id=target)
+    for device, identifiers in stale_devices:
+        devices.async_update_device(device.id, new_identifiers=identifiers)
+    if new_entry_id != entry.unique_id:
+        hass.config_entries.async_update_entry(entry, unique_id=new_entry_id)
+    return len(rows)

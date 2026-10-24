@@ -204,6 +204,64 @@ affected by this: a sub stream camera you are already using stays exactly as it 
 
 ![Dahua Setup](static/setup1.png)
 
+### Taking a backup before you upgrade
+
+Home Assistant will not offer you one, and this integration cannot add it. Worth
+knowing why, because the thing at risk is probably not what you expect.
+
+**What an upgrade puts at risk is your entity and device registry, not the files.**
+Replacing `custom_components/dahua/` is reversible by replacing it again. What is not
+reversible is an entity losing its id, or a repair card offering to remove entries:
+in one measured case confirming such a card deleted **232 entities**, and no copy of
+the integration's own directory would have helped. A Home Assistant backup would.
+
+**Why there is no checkbox.** Home Assistant shows "create a backup before updating"
+only for update entities that declare support for it, which in practice means add-ons
+and the operating system. HACS does not declare it for the integrations it manages,
+and that was asked for and declined:
+[hacs/integration#3538](https://github.com/hacs/integration/issues/3538) — *"Backups
+are not supported by this integration for update entities, and I highly doubt it ever
+will be."* Home Assistant also retired the pre-update backup option generally in
+2025.1.0, because it accumulated backups until people ran out of disk
+([core#134005](https://github.com/home-assistant/core/issues/134005)). The intended
+replacement is automatic backups with a retention policy.
+
+**How to take one anyway.** Home Assistant's backup integration exposes actions you
+can call yourself:
+
+```yaml
+# Script: back up, then update this integration.
+sequence:
+  - action: backup.create_automatic      # obeys your retention settings
+  - action: update.install
+    target:
+      entity_id: update.dahua_update
+```
+
+`backup.create_automatic` rather than `backup.create` for exactly the reason the
+checkbox was removed: it is subject to the retention you have configured instead of
+growing without limit. Passing `backup: true` to `update.install` does nothing here,
+because that option only works on entities that declare support for it.
+
+**Do not keep a copy inside `custom_components/`.** Two directories whose manifest
+declares `"domain": "dahua"` means Home Assistant may serve the *backup's* code, and
+restarting does not help because it is not a cache. This costs real time to diagnose:
+the config flow shows one version while the files on disk show another. Keep rollback
+copies somewhere else, such as `/config/dahua_backup_<date>/`.
+
+This matters beyond your own machine. A rollback script that has circulated on
+[#728](https://github.com/rroller/dahua/issues/728) and
+[#767](https://github.com/rroller/dahua/issues/767) copies to
+`$COMPONENTS_DIR/dahua_backup_<stamp>`, so anyone using it to bisect versions may be
+testing a version they are not actually running — which can make a report of "the last
+working version" point at the wrong release.
+
+**The device's own settings are a separate thing**, and this integration can record
+those: see [`backup_config` and `compare_config`](#services). An upgrade does not
+change them, but a service call or a mistaken switch can, and several Dahua config
+writes cannot be undone from Home Assistant.
+
+
 ### Upgrading from a version before 1.0
 
 Earlier versions added **one config entry per channel**, so a sixteen channel recorder
@@ -257,8 +315,10 @@ Two cases the form cannot diagnose for you:
 - **Some devices have no local API at all.** Cloud-only Imou and Lechange models, and
   some doorbells whose firmware moved to the cloud app, serve no `/cgi-bin/` API.
   There is nothing this integration can do for those; ONVIF or the vendor's cloud
-  integration is the route. A downgrade to earlier firmware has restored the local
-  API for some people.
+  integration is the route -- and ONVIF needs
+  [its own user on the device](#onvif-needs-its-own-user) and
+  [delivers less than you would expect](#what-onvif-gave-one-recorder). A downgrade
+  to earlier firmware has restored the local API for some people.
 - **Cameras behind a recorder's own PoE ports** often sit on a private subnet, such
   as `10.1.1.x`, that Home Assistant cannot route to. Add them through the
   recorder's address and channel number instead of trying to reach them directly.
@@ -413,10 +473,15 @@ Brand | 2 Megapixels | 4 Megapixels | 5 Megapixels | 8 Megapixels
 Model | Firmware
 :------------ | :------------
 VTH2421F-P | 4.800.0000000.1.R
+VTH5221D | 3.000.0012000.0.R
 
 Add an indoor monitor like any other device, by its address and an account on the
 monitor itself (usually the same as the VTO's). A VTH serves no CGI at all, so the
 integration identifies it over RPC2 and shows its real model and firmware.
+
+Monitors without a web server can use the same add flow. The integration identifies
+them over DHIP on local TCP port 5000 and saves that transport for later reads.
+This was measured on a VTH5221D; HTTP does not need to be enabled on that monitor.
 
 What it gets:
 
@@ -424,16 +489,30 @@ What it gets:
   when that VTO calls. `none` is the VTO's own picture; the other options are the cameras in
   the monitor's own camera list (Monitor > IPC on its screen). The monitor's screen has no
   control for this on the measured firmware, though its manual describes it.
+- **Do not disturb** and sliders for door station ring, indoor ring, talk and alarm
+  volume (0–100), for each setting the monitor reports in `VideoTalkPhoneGeneral`.
+  Do not disturb is separate from the quiet-period schedule configured on the monitor.
 - Reboot, firmware version and serial number.
 
 A monitor that reports it has no camera of its own (`SupportVideo` false in its
 `RemoteDevice` table, as on the VTH2421F-P) gets no camera entities, no camera event
 sensors, no event stream, no motion detection switch, no Day/Night select, no Preset
-Position, and no License Plate or Authorized Vehicle entities.
+Position, and no License Plate or Authorized Vehicle entities. If the monitor has no
+local row in `RemoteDevice`, an explicit refusal of `VideoInput` also identifies it as
+having no camera. This removes the same nonworking camera-related entities on affected
+monitors; existing registry rows can remain unavailable. Session failures leave the
+capability undecided rather than removing entities.
 
-The serial number shown is generated from the address and login, as for every device
-whose CGI does not answer, so that it stays stable; it is not the serial printed on the
-monitor.
+The serial number is read from the monitor itself on both HTTP and DHIP.
+Existing HTTP monitors move from the ID generated from their credentials to their real
+serial. **Take a Home Assistant backup before upgrading.** Entity and device registry
+rows are updated in place: entity IDs, dashboards and automations keep their references.
+Copies of all three persisted registries are also made in a private directory named
+`dahua-pre-serial-backup-…` under the Home Assistant configuration directory; the log
+records its location. If a backup cannot be made or an identity conflicts with another
+registry row, setup retries without loading platforms. Resolve the logged conflict or
+backup error rather than removing the existing entities. Once adopted, an unavailable
+serial read causes a retry rather than another generated identity.
 
 To ring a monitor, use [`dahua.vto_call`](#services) on the VTO, not on the monitor.
 
@@ -452,13 +531,57 @@ What this integration cannot do, as distinct from the bugs and firmware quirks u
   `dahua.set_infrared_mode` or `dahua.set_illuminator_mode` to hand Auto back.
 - **A device with no local API cannot be used at all.** Cloud only Imou and Lechange
   models, and some doorbells whose firmware moved to the vendor's app, serve no
-  `/cgi-bin/` API. ONVIF or the vendor's own integration is the route for those.
+  `/cgi-bin/` API. ONVIF or the vendor's own integration is the route for those, and
+  ONVIF needs [its own user on the device](#onvif-needs-its-own-user). Read
+  [what it gave one recorder](#what-onvif-gave-one-recorder) before counting on it:
+  twelve channels produced one camera.
 - **Cameras on a recorder's own PoE ports are usually not reachable directly**, because
   they sit on a private subnet Home Assistant cannot route to. Add them through the
   recorder's address and channel number instead.
 - **Channels a recorder reaches over ONVIF cannot be driven**, and are not offered when
   adding one. This integration speaks Dahua's own API and an ONVIF channel does not
-  answer it.
+  answer it. Home Assistant's own ONVIF integration, pointed at the **recorder**, does
+  reach them, with two caveats below that are worth reading first: it needs its own
+  user on the device, and on the recorder measured here it turned twelve channels into
+  one camera.
+
+  <a name="onvif-needs-its-own-user"></a>
+  **If you use ONVIF, create an ONVIF user on the device first.** Dahua keeps ONVIF
+  accounts in a separate list from device accounts, under **System > Account > ONVIF
+  User**. A device account does not authenticate over ONVIF however much else it is
+  granted, so the account this integration uses is not usable there.
+
+  **The two lists can hold the same name, and that is confusing on purpose-built
+  hardware.** An ONVIF user called `admin`, or called the same thing as your device
+  account, is a *different* account with its own password. So a working ONVIF setup
+  whose username matches the one in this integration does not mean the device account
+  was accepted -- it means somebody created an ONVIF user with that name. Worth
+  knowing before concluding from a working setup that no ONVIF user is needed, which
+  is a mistake made while writing this note.
+
+  This matters more than a wrong password usually does. These devices lock the source
+  IP for about **thirty minutes** after repeated failed logins, and Home Assistant
+  makes every one of its requests from one address -- so a few failed ONVIF attempts
+  take **every** Dahua entity offline, including the ones that were working, and the
+  reauth dialog is refused along with everything else. Create the ONVIF user before
+  starting the flow rather than discovering the requirement through failed attempts.
+
+  Two other things worth knowing before you add it.
+
+  <a name="what-onvif-gave-one-recorder"></a>
+  **Expect far fewer cameras than channels.** Home Assistant's ONVIF integration skips
+  any profile whose video encoding is not exactly `H264`, and a recorder commonly
+  reports no encoding at all. Measured on a DHI-NVR5464-16P-EI: it offers **31 profiles
+  across all twelve channels**, and **28 of them have `Encoding` unset** -- only one
+  channel's three profiles report `H264`, so that is the only channel that becomes a
+  camera. Note the cause: the encoding is *unreported*, not H.265. The channel that
+  worked is the one whose streams happen to be H.264 throughout, which makes the codec
+  look like the reason when it is not, and why the encoder configuration comes back
+  empty for the rest is not something this has established.
+
+  **And it creates its own camera entities** alongside this integration's for the same
+  channels, so expect duplicates -- on that recorder, 101 entities for 3 cameras, 89 of
+  them binary sensors for capabilities it reports generically.
 - **Active deterrence through a recorder is undocumented and unreliable.** Whether an
   NVR passes a siren or white light command through to the camera behind it varies by
   model, and on some it accepts the command and does nothing at all. That is why those
@@ -490,6 +613,24 @@ What this integration cannot do, as distinct from the bugs and firmware quirks u
   Reported as [#236](https://github.com/rroller/dahua/issues/236), [#244](https://github.com/rroller/dahua/issues/244), [#257](https://github.com/rroller/dahua/issues/257), [#262](https://github.com/rroller/dahua/issues/262) and [#272](https://github.com/rroller/dahua/issues/272), among others.
 
   If the stream error is `Operation timed out` rather than a demuxing failure, that is a different problem: the device is not answering RTSP at all, which points at the RTSP port or at how many simultaneous streams it allows. Recorders in particular cap that quite low.
+
+* **Home Assistant may offer to set up "Imou" for your Dahua device. That card is
+  not from this integration, and it will not work.** Home Assistant 2026.10 added a
+  core `Imou` integration which, like this one, discovers devices by MAC address
+  prefix. Imou is Dahua's consumer brand and the two share OUIs, so a Dahua
+  doorbell, recorder or indoor monitor matches both and can raise two discovery
+  cards.
+
+  Measured here: `3C:EF:8C` covers a VTO2000A doorbell and two VTH5221D indoor
+  monitors, and `30:DD:AA` a DHI-NVR5464 recorder. The core integration claims
+  `3CEF8C*` among eleven prefixes; this one claims `3CEF8C*` and `30DDAA*`.
+
+  Nothing is wrong with your device and nothing is misconfigured. Dismiss the Imou
+  card and use this integration's. There is no fix available to either side, because
+  a MAC prefix cannot tell you which brand sells the hardware. The reverse also
+  happens: a genuine Imou device may be offered this integration, and whether that
+  works depends on whether its firmware still serves the local API — see
+  [If it will not connect](#if-it-will-not-connect).
 
 * IPC-D2B20-ZS doesn't work. Needs a [wrapper](https://gist.github.com/gxfxyz/48072a72be3a169bc43549e676713201), [7](https://github.com/bp2008/DahuaSunriseSunset/issues/7#issuecomment-829513144), [8](https://github.com/mcw0/Tools/issues/8#issuecomment-830669237)
 * **Versions between 0.9.84 and 0.9.92 could leave the illuminator switched on in a profile you are not using.** In that window the illuminator wrote to the wrong day/night profile on some cameras ([#605](https://github.com/rroller/dahua/issues/605), [#582](https://github.com/rroller/dahua/issues/582)); which versions affected you depends on the camera, and 0.9.93 fixed the write for both kinds. It does not undo what the earlier versions wrote. If you turned the illuminator on during that window, `Lighting_V2[<channel>][0][0].Mode` may still be `Manual` on the Day profile.
@@ -740,7 +881,7 @@ Service | Parameters | Description
 `dahua.set_video_profile_mode` | `target`: camera.cam13_main <br /> `mode`: Day, Night| Sets the video profile mode to day or night
 `dahua.set_focus_zoom` | `target`: camera.cam13_main <br /> `focus`: The focus level, e.g.: 0.81 0 - 1 inclusive <br /> `zoom`: The zoom level, e.g.: 0.72 0 - 1 inclusive | Sets the focus and zoom level
 `dahua.set_channel_title` | `target`: camera.cam13_main <br /> `channel`: The camera channel, e.g.: 0 <br /> `text1`: The text 1<br /> `text2`: The text 2| Sets the channel title
-`dahua.set_text_overlay` | `target`: camera.cam13_main <br /> `channel`: The camera channel, e.g.: 0 <br /> `group`: The group, used to apply multiple of text as an overly, e.g.: 1 <br /> `text1`: The text 1<br /> `text3`: The text 3 <br /> `text4`: The text 4 <br /> `text2`: The text 2 | Sets the text overlay on the video
+`dahua.set_text_overlay` | `target`: camera.cam13_main <br /> `channel`: The camera channel, e.g.: 0 <br /> `group`: The group, used to apply multiple of text as an overly, e.g.: 1 <br /> `text1`: The text 1<br /> `text3`: The text 3 <br /> `text4`: The text 4 <br /> `text2`: The text 2 | Sets the custom text overlay on the video. Pass as many lines as the camera accepts; the old four-line limit is gone. Some cameras label this overlay "Location title" rather than "Custom title" in their own web interface
 `dahua.set_custom_overlay` | `target`: camera.cam13_main <br /> `channel`: The camera channel, e.g.: 0 <br /> `group`: The group, used to apply multiple of text as an overly, e.g.: 0 <br /> `text1`: The text 1<br /> `text2`: The text 2 | Sets the custom overlay on the video
 `dahua.enable_channel_title` | `target`: camera.cam13_main <br /> `channel`: The camera channel, e.g.: 0 <br /> `enabled`: True to enable, False to disable | Enables or disables the channel title overlay on the video
 `dahua.enable_time_overlay` | `target`: camera.cam13_main <br /> `channel`: The camera channel, e.g.: 0 <br /> `enabled`: True to enable, False to disable | Enables or disables the time overlay on the video
@@ -752,6 +893,7 @@ Service | Parameters | Description
 `dahua.enable_ivs_rule` | `target`: camera.cam13_main <br /> `channel`: The camera channel, e.g.: 0 <br /> `index`: The rule index <br /> enabled`: True to enable the IVS rule, False to disable the IVS rule | Enable or disable an IVS rule
 `dahua.vto_open_door` | `target`: camera.cam13_main <br /> `door_id`: The door ID to open, e.g.: 1 <br /> Opens a door via a VTO
 `dahua.vto_cancel_call` | `target`: camera.cam13_main <br />Cancels a call on a VTO device (Doorbell)
+`dahua.play_audio` | `target`: camera.front_door_main <br /> `media_content_id`: the clip, as a media source, a TTS result, a URL or a file path <br /> `audio_format`: `g711a_8000` (default), `g711u_8000`, `pcm_8000` | Plays a clip through the device's own speaker, for a doorbell announcement or a camera deterrent message. The clip is converted with ffmpeg, so anything it can open works. A VTO2000A has been verified with G.711 A-law and little-endian PCM at 8 kHz. Other devices may need a different supported format; please report results on [#177](https://github.com/rroller/dahua/issues/177)
 `dahua.vto_call` | `target`: camera.cam13_main <br /> `room`: The room to ring, e.g.: 9901 | Rings an indoor monitor (VTH) from a VTO, as its call button does. `9901#0` is dialled as `9901`, which rings the main monitor and its extensions. Measured on a DHI-VTO2211G-WP-S2
 `dahua.set_video_in_day_night_mode` | `target`: camera.cam13_main <br /> `config_type`: The config type: general, day, night <br /> `mode`: The mode: Auto, Color, BlackWhite. Note Auto is also known as Brightness by Dahua|Set the camera's Day/Night Mode. For example, Color, BlackWhite, or Auto
 `dahua.reboot` | `target`: camera.cam13_main <br />Reboots the device
@@ -759,6 +901,8 @@ Service | Parameters | Description
 `dahua.ptz_move` | `target`: camera.cam13_main <br /> `direction`: up, down, left, right, up_left, up_right, down_left, down_right, zoom_in, zoom_out <br /> `speed`: 1 - 8 <br /> `duration`: 0.1 - 10 seconds | Pans, tilts or zooms for a moment. The camera moves while the command runs and is stopped afterwards, so the duration is how far it travels
 `dahua.set_privacy_mode` | `target`: camera.cam13_main <br /> `enabled`: True to cover the lens, False to uncover it | Physically covers the lens on cameras with a motorised cover, so the camera sees nothing at all. Only cameras reporting a `LeLensMask` table have this; on any other camera the call fails. To blank part of the picture instead, use `dahua.set_privacy_masking`
 `dahua.get_overlay_text` | `target`: camera.cam13_main <br /> `group`: 0 - 100, default 0 | Returns the overlay text the camera is currently showing, for when it may have been changed on the camera rather than from Home Assistant. This one responds with data
+`dahua.get_channel_title` | `target`: camera.cam13_main | Returns the channel title overlay this channel is showing, which is the companion to `dahua.set_channel_title`. Returns an empty string for a channel the device does not list. This one responds with data
+`dahua.get_config` | `target`: camera.cam13_main <br /> `name`: a configuration table, e.g.: `Encode`, `Lighting[0][0]`, `General.LocalNo` | Reads any configuration table from the device, for working out what a model does and does not serve. Read only: `getConfig` cannot change anything, which is why this exists where an arbitrary-CGI passthrough does not. This one responds with data
 
 
 ## Camera
@@ -768,6 +912,10 @@ This will provide a normal HA camera entity (can take snapshots, etc)
 Recordings on the device's own storage (an SD card, or the NVR's disks) are browsable
 from **Media** in the sidebar, under **Dahua**. Pick a camera, then a day, then a clip,
 and it plays in the dashboard the same way a live view does.
+
+RPC2 login accepts both numeric and string session IDs returned by the device;
+neither requires a different account or authentication setting. Responses with a
+leading UTF-8 byte-order marker are also accepted.
 
 Playback uses the device's RTSP `cam/playback` stream, which Home Assistant's `stream`
 integration turns into HLS, so nothing is downloaded to the Home Assistant host.
@@ -790,7 +938,7 @@ Siren | If the camera has a siren, will turn on the siren. Note, it seems sirens
 Event Notifications | Enables or disables the device's event notifications
 Smart Motion Detection | If the device supports it, enables or disables smart motion detection (human and vehicle filtering rather than plain pixel motion). Only created on channels the device reports as supporting it
 IVS Rule | One switch per IVS rule the camera reports (tripwire, intrusion and so on), each keyed on the rule's own stable Dahua ID, so it is named after the rule as the device names it. Configuration entities
-Alarm Output | A physical alarm or relay output on the device, switched directly
+Alarm Output | A physical alarm or relay output on the device, switched directly. A recorder with several relays gets one switch per relay, on the recorder's own device rather than on a camera, named by the recorder where it names them distinctly and numbered where it does not. The state is read back from the device rather than assumed from the last write
 Privacy Mode | Covers the lens on cameras with a motorised cover. See `dahua.set_privacy_mode`
 Disarming Linkage | Newer firmwares introduce a "disarming" feature, accessible from the camera web UI under Event → One-click disarm / Disarming. When enabled, the disarm toggle suppresses the linkage actions configured in the Disarming section specifically, while leaving all other alarm linkage actions untouched. Detection remains fully active throughout. This allows one to turn it on/off.
 
@@ -807,6 +955,7 @@ Sensor |  Description |
 Motion | A sensor that turns on when the camera detects motion
 Button Pressed | A sensor that turns on when a doorbell button is pressed
 Authorized Vehicle | Turns on when the camera's ANPR recognises a plate you have listed as authorized, and stays on for the hold time you set. Attributes carry the plate that matched and what the camera reported about the vehicle. Created on every camera and every channel of a recorder, so it existing does not mean that camera can read plates: it stays off unless the camera reports one and it is on your list
+Alarm-in Port&lt;n&gt; | One per physical alarm input terminal on a recorder's back panel, on the recorder's own device rather than on a camera. Named by the recorder, so a terminal you renamed keeps that name. The attributes carry both numbers: `alarm_input_number` is the one printed on the chassis and `alarm_input_index` is the zero-based one the device sends, which is one lower. Only created on a recorder that reports the terminals. On such a recorder the per-channel Alarm Local sensors are not created, because the only thing that ever fed them was the terminal number being read as a camera channel
 Others | A binary senor is created for evey event type selected when setting up the camera (Such as cross line, and face detection)
 
 ## Sensors
@@ -828,6 +977,14 @@ Preset Position | Moves a PTZ camera to one of its stored preset positions, and 
 Day/Night Mode | The camera's colour mode: Color, BlackWhite, or Auto (which Dahua also calls Brightness). Readable as well as settable, which is what makes it possible to notice a camera that changed mode by itself, such as one reverting to Auto after a power cut and then rendering black and white at night
 Camera for &lt;VTO&gt; calls | On an indoor monitor (VTH), which camera its screen opens on when that VTO calls it, or `none` for the VTO's own picture. See [Indoor monitors](#indoor-monitors-vth)
 
+## Motion region sliders
+
+**Motion region 1 sensitivity** and **Motion region 1 threshold** appear on channels
+that report the corresponding `MotionDetectWindow[0]` fields. Each is a 0–100 slider
+for Region 1, as shown in the recorder's interface, and writes only that channel's
+selected field. Devices with only the whole-channel `Level` setting do not get these
+sliders; its valid range has not been established.
+
 ## Event entities
 
 Entity |  Description |
@@ -840,6 +997,11 @@ Button |  Description |
 Reboot | Reboots the device
 Open Door | On a VTO (doorbell), opens the door
 Cancel Call | On a VTO (doorbell), hangs up a call in progress. Reports whether the doorbell agreed, rather than always looking as though it worked
+
+## Update
+Update |  Description |
+:------------ | :------------ |
+Firmware | Compares the firmware the device is running against the newest one its own cloud check found. Informational only: there is no install button, because a wrong or interrupted image bricks the camera, so flashing stays a deliberate act on the device's own web UI or app. The entity is only created on a device whose firmware serves the `_DHCloudUpgrade_` record and that record names a version; reading it is a local request, Home Assistant never contacts Dahua itself
 
 # Example automations
 
@@ -1013,7 +1175,7 @@ Configure form.
 Option | Default | Description
 :------------ | :------------ | :------------
 Seconds between device polls | 30 | How often the device is asked for the state of its settings. The minimum is 10. Events do not use this: they arrive on a separate connection and are unaffected by a longer interval. See [How data is updated](#how-data-is-updated)
-Camera, Switch, Light, Select, Binary sensor, Button, Sensor, Event | on | Which platforms this entry creates. These also stop the requests that exist only to feed a platform, so turning one off reduces how much the device is asked, not just how many entities you see
+Camera, Switch, Light, Select, Binary sensor, Button, Sensor, Event, Update | on | Which platforms this entry creates. These also stop the requests that exist only to feed a platform, so turning one off reduces how much the device is asked, not just how many entities you see
 Read configuration over one RPC2 session per device | off | Reads settings over a single logged in RPC2 session instead of a separate authenticated HTTP call each. Far fewer lines in the device's own log. Off by default because not every firmware serves RPC2; leave it off if unsure, and see [Reducing entries in your device's log](#reducing-entries-in-your-devices-log)
 Authorized license plates | empty | A comma separated list, for example `ABC1234, XYZ5678`. The Authorized Vehicle binary sensor exists either way; this is what it matches against, so while the list is empty it never turns on. Needs a camera that reports ANPR to turn on at all
 Authorized vehicle hold time | 60 seconds | How long the Authorized Vehicle sensor stays on after a plate it recognises. It also resumes correctly across a restart, so a car recognised just before a reload does not lose the remaining time
@@ -1030,6 +1192,7 @@ Name | the channel's name | What this channel is called
 Area | unset | Moves this channel into an area. A channel does not inherit the recorder's area, so channels can be filed by room
 Events to subscribe to | motion and the common smart-detection events | Which of the device's events become binary sensors. Most of the rest do nothing on most cameras, and each one selected adds an entity. An empty selection is honoured, which turns the event connection off for this channel. If you want an event that is not listed, open an issue
 Auto-detect channel index | on | Some firmwares number channels from 0 and others from 1. Turn this off if the detection gets it wrong on your camera
+Poll ordinary motion state | off | Some recorders and XVRs keep sending smart-detection events normally while never pushing ordinary `VideoMotion`, so the motion sensors never turn on. This reads the motion state from the device instead of waiting to be told. Off by default because it is one extra request per device every two seconds, which buys nothing on a device that does push them. The integration raises a repair card suggesting this when it catches a device detecting motion it is not reporting
 Enable NVR active deterrence controls | off | Adds Warning Light and Alarm entities for a camera behind an NVR. Off by default because whether the NVR relays these commands varies by model: on some it accepts them and does nothing
 Manually enable Siren entity | off | Turn this on if the camera has a working siren and the integration did not create the Siren entity
 Manually enable Security Light entity | off | Turn this on if the camera has a working security light and the integration did not create the Security Light entity
