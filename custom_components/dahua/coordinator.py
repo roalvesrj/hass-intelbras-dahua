@@ -616,6 +616,17 @@ PULSE_STATE_CODES = frozenset({"DoorbellPressed", "AccessControl"})
 # 9 unlock failed, 11 rebooted. Only a ring should raise the button sensor.
 DOORBELL_RINGING_STATES = frozenset({1, 2})
 
+# The raw codes whose payload really does carry the call state above, so an
+# absent one from them is a device saying something unexpected rather than a
+# code with no such field. Anything else translated into DoorbellPressed was
+# decided to be a press before it got here and has nothing left to test.
+#
+# A list of the codes that DO carry it, rather than of the ones that do not:
+# a new spelling arriving is the common case, and the safe default for one
+# nobody has measured is to trust the translation rather than read a missing
+# field as "not ringing", which is what made @DrSpaldo's press silent (#1121).
+DOORBELL_STATE_SOURCES = frozenset({"BackKeyLight"})
+
 # How many recent events diagnostics keeps per device.
 #
 # Ten rather than fifty: an ANPR event measured about 5 KB, so ten is a diagnostics
@@ -3360,17 +3371,48 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
                     # That project also warns the values vary by model, so this
                     # widens what counts as a ring rather than claiming a
                     # complete mapping.
-                    state = event_payload(event).get("State", 0)
-                    try:
-                        numeric_state = int(state)
-                    except (TypeError, ValueError):
-                        numeric_state = None
-                    pressed = numeric_state in DOORBELL_RINGING_STATES
-                    if pressed:
+                    payload = event_payload(event)
+                    # Absent, not merely unreadable. A `State` that is
+                    # present and cannot be read is a state nobody can
+                    # judge, and that still must not ring.
+                    if (
+                        code == "DoorbellPressed"
+                        and raw_code not in DOORBELL_STATE_SOURCES
+                        and "State" not in payload
+                    ):
+                        # A press derived from a code that carries no call
+                        # state at all. `translate_event_code` has already
+                        # decided it is a press -- `_DoTalkAction_` only on
+                        # `Action: Invite` -- and there is nothing further
+                        # to test.
+                        #
+                        # Measured by @DrSpaldo on #1121: the subscription
+                        # and the translation both worked, the Invite
+                        # reached its listeners, and the sensor still never
+                        # moved, because a missing State read as 0 and 0 is
+                        # not a ring, and 0 is the value for idle so
+                        # the unknown-state note returns without logging.
+                        #
+                        # `BackKeyLight` is excluded above because it does
+                        # carry a state, so a missing one there is a device
+                        # being unexpected and must still not ring.
+                        # `PhoneCallDetect` has no State in the fixture
+                        # this repo has always carried for it, so the same
+                        # silence would follow for any device that sends it
+                        # as a Pulse. Not measured on Amcrest hardware.
                         self._dahua_event_timestamp[event_key] = int(time.time())
                     else:
-                        self._dahua_event_timestamp[event_key] = 0
-                        self._note_unknown_doorbell_state(numeric_state, state)
+                        state = payload.get("State", 0)
+                        try:
+                            numeric_state = int(state)
+                        except (TypeError, ValueError):
+                            numeric_state = None
+                        pressed = numeric_state in DOORBELL_RINGING_STATES
+                        if pressed:
+                            self._dahua_event_timestamp[event_key] = int(time.time())
+                        else:
+                            self._dahua_event_timestamp[event_key] = 0
+                            self._note_unknown_doorbell_state(numeric_state, state)
             else:
                 continue
 
@@ -3518,6 +3560,26 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
                     codes.append("SmartMotionVehicle")
 
             return codes if codes else [code]
+
+        # A door station that talks SIP reports the whole call on one code,
+        # and only the invitation is a button press (#1121). Measured by
+        # @DrSpaldo on a DHI-ASI7214S and a DHI-ASI6214S-PW: one press sends
+        # four _DoTalkAction_ events, Invite then Answer then two Hangups,
+        # sharing a CallID. A sensor built straight from the code would come
+        # on again when the call was answered and twice more when it ended.
+        #
+        # So only Invite is the press, and it joins the translation that is
+        # already here rather than becoming a code of its own. Everything
+        # else returns the raw code, which nothing subscribes to, so it is
+        # dropped where every other unselected code is dropped.
+        #
+        # RoomNo is deliberately not read: it is the room the station is
+        # calling, set per device in its web UI, so it identifies the
+        # destination rather than the press, and Answer does not carry it.
+        if code == "_DoTalkAction_":
+            if event_payload(event).get("Action") == "Invite":
+                return ["DoorbellPressed"]
+            return [code]
 
         # Convert doorbell pressed related events to common event name, DoorbellPressed.
         # VTO devices will use the event BackKeyLight and the Amcrest devices seem to use PhoneCallDetect
@@ -4176,8 +4238,23 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         Deleted rather than left standing when the condition clears, so somebody
         who changes the codec and reloads sees it go.
         """
-        issue_id = ISSUE_WEBRTC_CANNOT_PLAY.format(self._address)
-        affected = _HOST_UNPLAYABLE.setdefault(self._address, set())
+        # ⚠ Per DEVICE, not per address, @rroller on #1127. Two Dahua boxes can
+        # sit behind one IP on different ports, and this is encoder state, which
+        # AGENTS.md puts squarely in the per-device scope. Keyed by address, the
+        # two shared one card and one affected-channel set, so one recorder's
+        # channel 0 stood in for the other's: he configured an H.265 channel 0
+        # on port 80 and an H.264 channel 0 on port 8080 and had the repair
+        # write to the wrong box and clear the warning of the right one.
+        #
+        # The address-keyed card from #1048 is deleted alongside, or an install
+        # that already carries one keeps it for ever: nothing raises that id
+        # again, so nothing ever deletes it either.
+        device = self._unplayable_key()
+        issue_id = ISSUE_WEBRTC_CANNOT_PLAY.format(device)
+        legacy_issue_id = ISSUE_WEBRTC_CANNOT_PLAY.format(self._address)
+        if legacy_issue_id != issue_id:
+            ir.async_delete_issue(self.hass, DOMAIN, legacy_issue_id)
+        affected = _HOST_UNPLAYABLE.setdefault(device, set())
 
         if dahua_utils.webrtc_cannot_play(self._stream_codecs):
             affected.add(self._channel)
@@ -4188,19 +4265,152 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
             ir.async_delete_issue(self.hass, DOMAIN, issue_id)
             return
 
+        # Asked and answered. The card describes a conditional failure, and
+        # somebody who has looked at live view and found H.265 plays in the
+        # browsers they use has answered the condition for their install
+        # (#1138). Raising it again every refresh is then nagging about a
+        # problem they do not have, and a fixable issue offers its flow rather
+        # than an Ignore, so there was no way to put it down.
+        #
+        # Deleted as well as not raised, so the decision clears a card that is
+        # already standing instead of waiting for the condition to change.
+        #
+        # `getattr`, because this is a new reader of `config_entry` on a path
+        # the test doubles reach with `object.__new__` and only the attributes
+        # each case needs. Demanding it here took nine of them down with an
+        # AttributeError, and a card shown to somebody who never chose is the
+        # right way to be wrong anyway.
+        from . import h265_was_accepted
+
+        if h265_was_accepted(getattr(self, "config_entry", None)):
+            ir.async_delete_issue(self.hass, DOMAIN, issue_id)
+            return
+
         ir.async_create_issue(
             self.hass,
             DOMAIN,
             issue_id,
-            is_fixable=False,
+            is_fixable=True,
             severity=ir.IssueSeverity.WARNING,
             translation_key="webrtc_cannot_play",
+            # The device, so the flow reaches exactly the box this is about.
+            # The address as well, because that is what the text shows and a
+            # port is noise to a reader with one recorder.
+            data={"address": self._address, "device": device},
             translation_placeholders={
                 "address": self._address,
                 "channels": ", ".join(str(channel) for channel in sorted(affected)),
                 "count": str(len(affected)),
             },
         )
+
+    async def async_recheck_stream_codecs(self) -> bool:
+        """Read `Encode` again and re-judge the card. True if it really said.
+
+        The codecs are read once, in the one-time init block, because nothing
+        changes them while Home Assistant runs. Something now does: the repair
+        flow writes a codec and the card has to answer for the new state rather
+        than the state at setup. A reload would also do it and costs the user
+        every entity on the device, so this is the narrow version.
+
+        ⚠ Deliberately NOT `_async_read_stream_codecs`, @rroller on #1127.
+        That one assigns whatever came back and re-judges from it, and
+        `async_get_config` answers {} for a refusal, so a read-back that
+        failed erased the known H.265 state and then deleted the warning
+        having learned nothing at all. He reproduced exactly that: a write
+        followed by {}, reported as `write_refused` by the flow and leaving no
+        issue in the registry.
+
+        So an answer with nothing about this channel changes nothing and
+        returns False. The caller treats that as "not confirmed" rather than
+        as success, and the card it was about stays up.
+
+        True means the answer stated this channel's MAIN stream codec, which
+        is the only thing the repair writes and the only thing the card
+        judges. An answer that moved the audio flag, or spoke only about a
+        sub stream, is applied where it was specific and still returns False.
+        """
+        try:
+            encode = await self.client.async_get_config("Encode")
+        except Exception as exception:  # pylint: disable=broad-except
+            _LOGGER.debug(
+                "Could not re-read Encode on %s", self._address, exc_info=exception
+            )
+            return False
+
+        codecs = dahua_utils.parse_stream_codecs(encode, self._channel)
+        if not codecs:
+            _LOGGER.debug(
+                "Re-read of Encode on %s said nothing about channel %s; keeping "
+                "what is held",
+                self._address,
+                self._channel,
+            )
+            return False
+
+        # ⚠ Merged per FIELD, and "nonempty" was one question short of this,
+        # @rroller on #1127. `parse_stream_codecs` seeds every field it did not
+        # see with None, so a reply carrying only this channel's `AudioEnable`,
+        # or only an `ExtraFormat` row, produces a nonempty map whose main
+        # stream has codec None. Assigning that erased the H.265 this channel
+        # really has and then let the card be re-judged on the erasure, so the
+        # warning went while the flow was reporting the write refused.
+        #
+        # None already means "the answer did not say" in the parser, so the
+        # rule falls out of a convention it already keeps: a field the answer
+        # stated wins, a field it did not keeps what is held, and a stream it
+        # did not mention is untouched.
+        merged = {
+            index: dict(held) for index, held in (self._stream_codecs or {}).items()
+        }
+        for index, stream in codecs.items():
+            into = merged.setdefault(index, {"codec": None, "audio": None})
+            into.update(
+                {field: value for field, value in stream.items() if value is not None}
+            )
+        self._stream_codecs = merged
+
+        # ⚠ And confirmation is about the MAIN stream's codec specifically,
+        # which is the only thing the repair wrote and the only thing the card
+        # judges. An answer that moved the audio flag, or another stream, has
+        # told us nothing about whether the write landed.
+        said_main_codec = (codecs.get(0) or {}).get("codec") is not None
+
+        try:
+            self._async_report_unplayable_stream()
+        except Exception as exception:  # pylint: disable=broad-except
+            _LOGGER.debug(
+                "Could not re-report the unplayable stream on %s",
+                self._address,
+                exc_info=exception,
+            )
+        return said_main_codec
+
+    @callback
+    def _unplayable_key(self) -> str:
+        """The device this card is about, falling back to the address.
+
+        Tolerated rather than demanded: a great many tests here build a
+        coordinator with `object.__new__` and set only the attributes their
+        own subject touches, so insisting on a client would break doubles that
+        have nothing to do with codecs (the pattern that cost a day in #1006).
+        A real coordinator always has one, so the fallback is not a path any
+        device takes.
+        """
+        client = getattr(self, "client", None)
+        return getattr(client, "device_key", None) or self._address
+
+    @callback
+    def channels_that_cannot_be_played(self) -> set:
+        """Which channels on this device are behind the card, by index.
+
+        Per device rather than per channel, because the card is: one box
+        raises one issue naming every channel in the pair, and the repair that
+        fixes it needs the same list. Read from the shared table rather than
+        recomputed, so the flow and the card cannot disagree about who is
+        affected.
+        """
+        return set(_HOST_UNPLAYABLE.get(self._unplayable_key()) or ())
 
     def get_stream_codec(self, stream_index: int):
         """The codec one stream carries, or None if the device did not say."""
@@ -4742,11 +4952,17 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         Deliberately additive. A device that answers `VTO` is one, whatever its
         model string says, which is what the list of prefixes below keeps
         failing to cover for rebadges (#690). But a device that answers
-        something else, or does not answer at all, still gets the list: no
-        Amcrest or Imou doorbell has been measured here, and a wrong negative
-        would take every doorbell entity away from people who have them today.
+        something else, or does not answer at all, still gets the list, and a
+        wrong negative would take every doorbell entity away from people who
+        have them today.
+
+        `DB` is the second answer that means doorbell, measured by @phabibjr
+        on a DH-DB6I in #1131: HTTP 200, `class=DB`, not `VTO`. So the Amcrest
+        and Imou family names itself too, and it names itself something the
+        VTO check alone does not recognise. Additive for the same reason as
+        above: it can only make a device a doorbell, never stop one being one.
         """
-        if getattr(self, "_device_class", "") == "VTO":
+        if getattr(self, "_device_class", "") in ("VTO", "DB"):
             return True
         m = self.model.upper()
         return (
@@ -4759,10 +4975,26 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         )
 
     def is_amcrest_doorbell(self) -> bool:
-        """Returns true if this is an Amcrest doorbell - IMOU DB61i is identical"""
-        return self.model.upper().startswith("AD") or self.model.upper().startswith(
-            "DB6"
-        )
+        """Returns true if this is an Amcrest doorbell - IMOU DB61i is identical
+
+        The `DB6` family is matched as a prefix and also after a vendor prefix,
+        which is the same shape `is_doorbell` already allows for VTO: a rebadge
+        reports `DH-DB6I` rather than `DB6I`, and a prefix test alone takes
+        every doorbell entity away from it.
+
+        Reported and verified on hardware by @phabibjr in #1131: a DH-DB6I on
+        firmware 1.000.020000000.9.R, where the four doorbell sensors never
+        appeared and the button press was doing nothing, and where making this
+        match brought them back and lit `button_pressed` for about 5 seconds.
+
+        This gates more than those sensors. The illuminator light, the security
+        light select and one poll read are all behind it, so a device that
+        falls through here loses all of them silently. Deliberately not
+        extended to `AD`: two letters that short appear inside unrelated model
+        strings, and nothing has been measured for a vendor-prefixed one.
+        """
+        m = self.model.upper()
+        return m.startswith(("AD", "DB6")) or "-DB6" in m or "_DB6" in m
 
     def is_empiretech_doorbell(self) -> bool:
         """Returns true if this is an EmpireTech doorbell"""

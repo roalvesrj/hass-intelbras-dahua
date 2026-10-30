@@ -1,5 +1,6 @@
 """Dahua API Client."""
 
+import datetime
 import logging
 import re
 import socket
@@ -715,6 +716,33 @@ def _cache_lifetime(url: str) -> int:
 # ptz control, door open -- is a write. Unrecognised is treated as a write,
 # which is the safe way round.
 READ_ACTION_PREFIX = "action=get"
+
+# How far a clock may land from what it was sent before the write is called a
+# refusal. Generous on purpose: the value goes out over a round trip and the
+# device's own clock is only accurate to the second, so a couple of seconds is
+# the write working. Anything beyond this is the device having ignored it, or
+# having read the value as a different timezone.
+CLOCK_SET_TOLERANCE_SECONDS = 90
+
+# What `NTP.Port` holds when nobody has changed it, on both devices measured
+# for #436. Only used to decide whether a device with no port field at all is
+# a problem: asking for the default on a device that has no field for it is
+# not, and asking for 8123 is.
+NTP_DEFAULT_PORT = 123
+
+
+def _same_setting(held, wanted) -> bool:
+    """Whether a CGI read-back value is the one that was asked for.
+
+    Everything a CGI read returns is a string, and a device may answer `True`
+    for a boolean it was sent as `true`, so booleans compare without case.
+    Everything else compares exactly once stripped.
+    """
+    held = str(held).strip()
+    wanted = str(wanted).strip()
+    if wanted.lower() in ("true", "false"):
+        return held.lower() == wanted.lower()
+    return held == wanted
 
 
 class DahuaWriteDeclined(ConnectionError):
@@ -1548,6 +1576,12 @@ class DahuaClient:
     # acquired.
     _rpc2_over_dhip = False
     _require_reported_serial = False
+    # Whether this device's identity came from `getSerialNo` after
+    # `getSystemInfo` refused (#1128). Read by `async_setup_entry`, which
+    # persists the requirement above so the next setup cannot undo it. A class
+    # level default because the test suite builds clients with `object.__new__`
+    # and every reader would otherwise need a getattr.
+    identity_from_alternate_cgi = False
 
     def __init__(
         self,
@@ -1756,14 +1790,85 @@ class DahuaClient:
                     self._vth_identity_asked = False
                     self._vth_identity = None
                     raise
+            # ⚠ Recorded, and this is the one that matters most. The three
+            # calls that record below are cosmetic: a wrong vendor or a wrong
+            # model is a label. THIS one decides the device's identity, and
+            # when it falls back every entity is rebuilt under a new id the
+            # next time a credential changes (#805). It recorded nothing, so
+            # a dump could say `serial_is_derived_from_credentials: true` and
+            # `identity_fallbacks: {}` in the same breath and leave nobody any
+            # way to find out why (#1128).
+            self._note_identity_fallback("getSystemInfo (serial)", e)
+
+            # Before inventing one, ask the other way. `getSystemInfo` is not
+            # the only CGI that knows the serial, and on at least one camera
+            # it is the only one that refuses: @Masterz69's DH-C4K-P answers
+            # `getSystemInfo` with HTTP 400 and `getSerialNo` with `sn=...`
+            # (#1128). The recorder and the doorbell here answer both, so this
+            # is an extra question for the devices that need it rather than a
+            # replacement for the one that works.
+            #
+            # Worth the extra round trip precisely here, because the thing
+            # being decided is the device's identity. The hash below changes
+            # when the password does and every entity is rebuilt under a new
+            # id (#805); a reported serial never does.
+            reported = await self._serial_over_cgi()
+            if reported:
+                # Remembered on the entry, so a later setup that cannot read
+                # it retries rather than quietly going back to the hash.
+                # @rroller found that on #1141: adopt the serial, migrate the
+                # registry onto it, then have `getSerialNo` refuse on the next
+                # setup, and the entry comes up under the old generated id
+                # while the registry still holds the real one. Every platform
+                # then builds a second set of entities beside the first.
+                self.identity_from_alternate_cgi = True
+                return {"serialNumber": reported}
+
             if self._require_reported_serial:
-                # A previously migrated HTTP monitor must retry an unavailable
-                # identity read instead of returning to credential-derived IDs.
+                # An entry that has already been given a reported serial does
+                # not get to fall back. Retrying an unavailable identity read
+                # is recoverable; a duplicate set of entities under the old
+                # generated id is not, and nothing undoes it.
+                #
+                # ⚠ This sits AFTER the alternate CGI rather than before it.
+                # The devices that reach it are exactly the ones that need
+                # that second question asked, so checking the policy first
+                # would stop the read that would have satisfied it.
                 self._vth_identity_asked = False
                 self._vth_identity = None
                 raise
+
             self.identity_derived_from_credentials = True
             return {"serialNumber": self.credential_hash()}
+
+    async def _serial_over_cgi(self) -> str | None:
+        """The serial from `magicBox.cgi?action=getSerialNo`, or None.
+
+        Only ever called where the identity would otherwise be invented, so a
+        device that answers `getSystemInfo` never pays for it.
+
+        Never raises. This runs inside the branch whose whole job is to keep
+        setup alive with some identity, so a second refusal has to fall
+        through to the hash rather than take the entry down with it.
+        """
+        try:
+            answer = await self.get("/cgi-bin/magicBox.cgi?action=getSerialNo")
+        except Exception as error:  # pylint: disable=broad-except
+            self._note_identity_fallback("getSerialNo", error)
+            return None
+        serial = str((answer or {}).get("sn") or "").strip()
+        if not serial:
+            # An empty answer is not a serial. Taking it would give every
+            # device that answers this way the same identity.
+            _LOGGER.debug("%s answered getSerialNo with no serial in it", self._address)
+            return None
+        _LOGGER.info(
+            "%s would not serve getSystemInfo but named its serial through "
+            "getSerialNo, so it keeps a real identity rather than one derived "
+            "from its credentials",
+            self._address,
+        )
+        return serial
 
     def credential_hash(self) -> str:
         """The identity this device gets when it will not state its own.
@@ -1797,6 +1902,16 @@ class DahuaClient:
         serve that action, which is a fact about the firmware; a 401 is it
         refusing the credentials, which is a different problem wearing the same
         device page.
+
+        ⚠ Called by the identity-DERIVING calls as well as the cosmetic ones,
+        and they are the ones worth having. A wrong vendor or model is a label.
+        A serial that falls back becomes an md5 of address, RTSP port, username
+        and password, so the same camera returns as a new device the next time
+        any of those changes (#805) and the old record stays behind as a
+        duplicate. Those three recorded nothing, so @Masterz69's dump on #1128
+        could say `serial_is_derived_from_credentials: true` and
+        `identity_fallbacks: {}` three lines apart and leave no way to find out
+        why.
 
         Once per client per question, because these are asked on every setup
         and a warning per poll would be worse than the silence it replaces.
@@ -2174,6 +2289,183 @@ class DahuaClient:
             # five-minute config cache. Refresh must see the new settings.
             clear_host_cache(self._device)
 
+    async def async_get_ntp_config(self) -> dict:
+        """The device's NTP table, or an empty one if it serves none.
+
+        **Two shapes, and one recorder carries both at once.** Measured on a
+        DHI-NVR5464-16P-EI:
+
+            table.NTP.Address=au.pool.ntp.org            the flat one
+            table.NTP.ServerList[0].Address=...          the list
+            table.NTP.ServerList[1].Address=...
+
+        Which of the two that recorder actually follows is not known, and
+        nothing it reports says. `async_set_ntp_server` writes every shape the
+        table has rather than guessing, which is the lesson of #458 where
+        `VideoInMode` has three shapes and only one was handled.
+
+        **A doorbell may have no server field at all.** A VTO2000A serves this
+        table with `TimeZone` and `TimeZoneDesc` and nothing else, identically
+        over CGI and over RPC2, so there is no server on it to set. That is
+        the device class #436 was raised about, which is why callers check
+        what came back instead of assuming the fields are there.
+        """
+        return await self.async_get_config("NTP")
+
+    @staticmethod
+    def ntp_server_slots(table: dict) -> list[str]:
+        """The key prefixes this table will take a server on, in write order.
+
+        Empty means the device has no NTP server field, which is a real answer
+        and not a failed read: see `async_get_ntp_config`.
+        """
+        slots = []
+        if "table.NTP.Address" in table:
+            slots.append("NTP")
+        if "table.NTP.ServerList[0].Address" in table:
+            slots.append("NTP.ServerList[0]")
+        return slots
+
+    async def async_set_ntp_server(
+        self, address: str, port: int = 123, update_period: int = None
+    ) -> None:
+        """Point the device's clock at an NTP server, and check it took.
+
+        Every shape the table has is written, for the reason in
+        `async_get_ntp_config`. `ServerList[1]` is left alone, so a device
+        following the list keeps whatever fallback it had.
+
+        **Read back, because this family says no in two voices.** A refused
+        write comes back as HTTP 200 with the body `Error`, which `get` already
+        catches, and a field the device does not have comes back as 200 with
+        nothing changed at all, which only a read-back can see (#937, #647).
+        """
+        if not address or not address.strip():
+            raise ValueError("an NTP server address is required")
+        address = address.strip()
+
+        table = await self.async_get_ntp_config()
+        slots = self.ntp_server_slots(table)
+        if not slots:
+            held = sorted(k.split(".", 2)[-1] for k in table) or ["nothing"]
+            raise ValueError(
+                "{0} has no NTP server field, so there is nothing to point at "
+                "{1}. Its NTP table holds only {2}".format(
+                    self._address, address, ", ".join(held)
+                )
+            )
+
+        # Only fields this table actually has. A `setConfig` naming a field the
+        # device does not serve is refused outright for the whole request, so
+        # asking for one would lose the fields that would have worked.
+        wanted = {}
+        if "table.NTP.Enable" in table:
+            wanted["NTP.Enable"] = "true"
+        for slot in slots:
+            wanted["{0}.Address".format(slot)] = address
+            if "table.{0}.Port".format(slot) in table:
+                wanted["{0}.Port".format(slot)] = str(int(port))
+            if slot != "NTP" and "table.{0}.Enable".format(slot) in table:
+                wanted["{0}.Enable".format(slot)] = "true"
+        if update_period is not None:
+            if "table.NTP.UpdatePeriod" not in table:
+                raise ValueError(
+                    "{0} has no NTP.UpdatePeriod field, so the poll interval "
+                    "cannot be set on it".format(self._address)
+                )
+            wanted["NTP.UpdatePeriod"] = str(int(update_period))
+        if int(port) != NTP_DEFAULT_PORT and not [
+            key for key in wanted if key.endswith(".Port")
+        ]:
+            raise ValueError(
+                "{0} has no NTP port field, so it cannot be pointed at port "
+                "{1}".format(self._address, int(port))
+            )
+
+        await self.get(
+            "/cgi-bin/configManager.cgi?action=setConfig&"
+            + "&".join(
+                "{0}={1}".format(key, quote(value, safe=""))
+                for key, value in wanted.items()
+            )
+        )
+
+        # ⚠ Every requested field, not just the address. @rroller found on
+        # #1139 that checking the address alone reports success for a write
+        # the device ignored entirely, whenever the address it already held
+        # was the one being asked for: Enable could stay false, the port could
+        # stay 123, the poll interval could stay 60, and Home Assistant said
+        # it was done. A clock left pointed at the wrong UDP port, reported as
+        # set, is worse than a refusal.
+        written = await self.async_get_ntp_config()
+        refused = []
+        for key, value in sorted(wanted.items()):
+            held = written.get("table.{0}".format(key))
+            if held is None:
+                refused.append("{0} is not in the table it read back".format(key))
+            elif not _same_setting(held, value):
+                refused.append("{0} is {1!r}, not {2!r}".format(key, str(held), value))
+        if refused:
+            raise DahuaWriteDeclined(
+                "{0} took the NTP write and did not apply all of it: {1}".format(
+                    self._address, "; ".join(refused)
+                )
+            )
+
+    async def async_set_device_time(self, when) -> None:
+        """Set the device's own clock. `when` is a naive local datetime.
+
+        **Local time, and measured rather than assumed.** On a VTO2000A at
+        firmware 3.120.0000.0.R the clock moved by exactly the 299 seconds it
+        was sent, and no daylight saving shift was applied on top of it, so
+        what goes on the wire is the device's local time and not UTC. The
+        device keeps its own `NTP.TimeZone` and its `Locales` DST table, and
+        this touches neither.
+
+        **The whole box, not one channel.** A clock belongs to an address.
+        Calling this against one channel of a recorder sets the recorder's
+        clock and every channel with it, which is what the service
+        description has to say.
+
+        **Read back.** `result: true` from a device that changed nothing is a
+        shape this family has, so the answer is not taken as consent.
+        """
+        stamp = when.strftime("%Y-%m-%d %H:%M:%S")
+
+        async def write(rpc2):
+            await rpc2.request("global.setCurrentTime", params={"time": stamp})
+
+        await self._rpc2_shared_call(write)
+
+        async def read(rpc2):
+            answer = await rpc2.request("global.getCurrentTime", params=None)
+            return ((answer.get("params") or {}) or {}).get("time")
+
+        now_on_device = await self._rpc2_shared_call(read)
+        if not now_on_device:
+            # The clock was set and the device would not say what it now
+            # reads. Not worth failing the call over: the write itself was
+            # acknowledged, and the next read will show it.
+            _LOGGER.debug("%s set its clock but would not read it back", self._address)
+            return
+        try:
+            landed = datetime.datetime.strptime(now_on_device, "%Y-%m-%d %H:%M:%S")
+        except (TypeError, ValueError):
+            _LOGGER.debug(
+                "%s answered its clock as %r, which is not a time",
+                self._address,
+                now_on_device,
+            )
+            return
+        out_by = abs((landed - when).total_seconds())
+        if out_by > CLOCK_SET_TOLERANCE_SECONDS:
+            raise DahuaWriteDeclined(
+                "{0} answered the clock write and still reads {1}, {2:.0f}s "
+                "from the {3} it was sent".format(
+                    self._address, now_on_device, out_by, stamp
+                )
+            )
+
     def vth_own_video(self) -> bool | None:
         """For a VTH identified over RPC2: whether it has a camera. None otherwise.
 
@@ -2264,6 +2556,7 @@ class DahuaClient:
                 vth = await self._vth_identity_over_rpc2()
                 if vth:
                     return {"name": vth["type"]}
+            self._note_identity_fallback("getMachineName", e)
             self.identity_derived_from_credentials = True
             return {"name": self.credential_hash()}
 
@@ -2308,6 +2601,64 @@ class DahuaClient:
             # what this comment has always said -- the code returned 3.
             return DEFAULT_EXTRA_STREAMS
         return parse_extra_streams(result.get("table.MaxExtraStream"))
+
+    async def async_get_encode_caps(self) -> dict:
+        """What the encoder may be set to, for every channel at once.
+
+        `encode.cgi?action=getConfigCaps` is the only read that says what a
+        stream *can* carry rather than what it carries now. Measured on a
+        DHI-NVR5464-16P-EI it answers for all channels in one 44 KB reply, so
+        this is deliberately host-wide and deliberately not called per channel.
+
+        It is also deliberately not called at setup or in the poll. Nothing
+        needs it until somebody opens the repair that offers to change a codec,
+        and the fan-out there has no `return_exceptions`, so a read this large
+        with no entity depending on it has no business in either
+        (#1006, and the gather note in AGENTS.md).
+
+        Returns {} rather than raising, like `async_get_config`: a device with
+        no such endpoint has nothing to offer, and that is an answer.
+        """
+        try:
+            return await self.get("/cgi-bin/encode.cgi?action=getConfigCaps")
+        except aiohttp.ClientResponseError:
+            return {}
+
+    async def async_set_stream_compression(
+        self, channel: int, stream_index: int, compression: str
+    ) -> bool:
+        """Set one stream's video codec, one field, one stream.
+
+        The address mirrors `parse_stream_codecs`' index convention: stream 0 is
+        `MainFormat[0]`, stream n is `ExtraFormat[n-1]`.
+
+        One field deliberately. A whole-table `setConfig` over RPC2 is refused
+        for size on at least one recorder, and naming any key the table does not
+        have makes the device decline the whole write while still answering 200
+        (#818, and the `Error` body note above). `verify_ok` is what turns that
+        declined write into a failure here instead of a success the caller
+        believes.
+
+        Answering True means the device accepted the write, which is not the
+        same as the stream having changed. The caller reads it back; see
+        `async_recheck_stream_codecs`.
+
+        Measured on a DHI-NVR5464-16P-EI, channel 11, both directions, with
+        ffprobe on the stream rather than a read of the config: H.264 to
+        H.265 gave `codec_name:hevc` and back again gave `codec_name:h264`.
+        So this firmware does follow the write. That is one firmware, which
+        is why the read back stays.
+        """
+        if stream_index == 0:
+            address = "Encode[{0}].MainFormat[0].Video.Compression".format(channel)
+        else:
+            address = "Encode[{0}].ExtraFormat[{1}].Video.Compression".format(
+                channel, stream_index - 1
+            )
+        url = "/cgi-bin/configManager.cgi?action=setConfig&{0}={1}".format(
+            address, compression
+        )
+        return await self.get(url, True)
 
     async def async_get_alarm_output_slots(self) -> dict:
         """Return the number of physical alarm-output slots reported by the device."""
@@ -2415,7 +2766,11 @@ class DahuaClient:
         url = "/cgi-bin/configManager.cgi?action=getConfig&name=General.MachineName"
         try:
             return await self.get(url)
-        except aiohttp.ClientResponseError:
+        except aiohttp.ClientResponseError as e:
+            # Named rather than bare, so the status survives. This one
+            # discarded the exception entirely, so not even the log said what
+            # the device had answered.
+            self._note_identity_fallback("General.MachineName", e)
             self.identity_derived_from_credentials = True
             return {"table.General.MachineName": self.credential_hash()}
 
@@ -4881,140 +5236,162 @@ class DahuaClient:
         duration = len(audio) / byte_rate
         chunk = max(1, int(byte_rate // AUDIO_WRITES_PER_SECOND))
 
-        # Set once the last byte has been handed to aiohttp. That moment, and
-        # not the response, is what says the clip is over, so it is what the
-        # waiting below is hung on.
-        body_sent = asyncio.Event()
-        # Whether any of it ever left. A device that cannot be reached fails
-        # the wait below as well, and saying it "stopped taking audio" when
-        # nothing was ever sent would point at the wrong problem.
-        body_started = False
-        # Whether the device answered while the clip was still going out. Read
-        # inside the request, where the ordering is unambiguous.
-        answered_early = False
-        # When the device last took something. A slow device and a dead one
-        # are only told apart by this moving, so it is updated where a piece
-        # has actually been handed over rather than where one was prepared.
-        last_progress = time.monotonic()
-
-        async def paced_body():
-            """Feeds the clip at the rate it plays at.
-
-            Paced against a single start time rather than by sleeping a fixed
-            slice per write, so a write that blocks does not stretch what
-            follows it: the device hears the clip at its own speed either way.
-            """
-            nonlocal body_started, last_progress
-            started = time.monotonic()
-            sent = 0
-            try:
-                while sent < len(audio):
-                    piece = audio[sent : sent + chunk]
-                    body_started = True
-                    yield piece
-                    # Control comes back here when aiohttp wants the next
-                    # piece, which means the last one has gone to the socket.
-                    # So this is the device taking audio, and the only place
-                    # that can say so.
-                    last_progress = time.monotonic()
-                    sent += len(piece)
-                    if sent >= len(audio):
-                        # Set on handing over the last piece, not after the
-                        # loop: with Content-Length declared, aiohttp writes
-                        # exactly that many bytes and never asks the generator
-                        # for another, so the code after this loop does not run
-                        # until the generator is closed -- long after the clip
-                        # is out. Waiting for that read as the device having
-                        # answered before the body finished, on every clip.
-                        body_sent.set()
-                        return
-                    behind = (sent / byte_rate) - (time.monotonic() - started)
-                    if behind > 0:
-                        await asyncio.sleep(behind)
-            finally:
-                # The safety net for a send that was abandoned part way: it
-                # releases the waiter rather than leaving it to the timeout.
-                body_sent.set()
-
-        headers = {
-            "Content-Type": content_type,
-            # Explicit, and this is load-bearing. aiohttp sends a body of
-            # unknown size with `Transfer-Encoding: chunked`, and a 2018
-            # embedded web server is not going to de-chunk it, so the device
-            # would play the chunk-length lines as audio. Setting the length
-            # here is what keeps aiohttp from choosing chunked at all.
-            "Content-Length": str(len(audio)),
-        }
-        try:
-            authorization = DigestAuth(
-                self._username, self._password, self._session, self._digest_state
-            ).cached_authorization("POST", url)
-        except aiohttp.ClientError:
-            # A challenge this client cannot build a header from. Send without
-            # one rather than failing: the only audio path measured so far does
-            # not ask for credentials, so an unauthenticated attempt is worth
-            # more than refusing to try.
-            _LOGGER.debug(
-                "Could not reuse %s's digest challenge for audio", self._address
-            )
-            authorization = None
-        if authorization:
-            headers["AUTHORIZATION"] = authorization
-
-        _LOGGER.debug(
-            "Playing %d bytes of %s on %s channel %s, about %.1fs",
-            len(audio),
-            content_type,
-            self._address,
-            channel_number,
-            duration,
+        auth = DigestAuth(
+            self._username, self._password, self._session, self._digest_state
         )
 
-        async def post():
-            nonlocal answered_early
-            async with self._session.post(
-                url,
-                headers=headers,
-                data=paced_body(),
-                # Its own clock. Without this the session default applies,
-                # which is a five minute total, and a long clip would be cut
-                # off mid-play by aiohttp rather than by anything here.
-                #
-                # Deliberately the looser of the two: the limits below decide
-                # when a push is given up on, and they can say why. aiohttp
-                # cutting in first would turn "playing slowly" into a bare
-                # TimeoutError, so this sits a grace period past the ceiling
-                # rather than level with it.
-                timeout=aiohttp.ClientTimeout(
-                    total=(
-                        duration * AUDIO_SLOWEST_TOLERATED
-                        + TIMEOUT_SECONDS
-                        + AUDIO_REFUSAL_GRACE_SECONDS
-                        + AUDIO_PROGRESS_CHECK_SECONDS
-                    ),
-                    sock_connect=TIMEOUT_SECONDS,
-                ),
-            ) as response:
-                # Read here, at the moment the headers land, rather than from
-                # the outcome of the race below: an answer and the last byte
-                # can both be ready in the same step of the loop, and then
-                # which future "finished first" says nothing about which
-                # actually came first.
-                answered_early = not body_sent.is_set()
-                response.raise_for_status()
-                # A 200 is not consent. This family answers a refused write
-                # with 200 and the body `Error`, which is why every write
-                # through `get()` is checked for it; this one does not go
-                # through `get()`, so it checks for itself.
-                body = await response.text()
-                if write_was_declined(body):
-                    raise DahuaWriteDeclined(
-                        "{0} declined the audio: {1}".format(
-                            self._address, body.strip()[:80]
-                        )
-                    )
+        def authorization():
+            """The header to open with, or None to go without one."""
+            try:
+                return auth.cached_authorization("POST", url)
+            except aiohttp.ClientError:
+                # A challenge this client cannot build a header from. Send
+                # without one rather than failing: a device that does not ask
+                # for credentials takes it anyway, and one that does will say
+                # so in a 401 that the retry below can answer properly.
+                _LOGGER.debug(
+                    "Could not reuse %s's digest challenge for audio", self._address
+                )
+                return None
 
-        async with _speaker_lock(self._device, channel_number):
+        async def attempt(header, may_retry):
+            """Send the whole clip once.
+
+            Returns True if the device challenged and a retry now has
+            something better to send, False if this push is the end of it.
+
+            Everything a single push needs is built in here rather than
+            outside, because a retry needs its own. `body_sent` is the one
+            that bites: the abandoned generator's `finally` sets it, so a
+            second attempt sharing it would read "the clip has finished"
+            before it had sent a byte.
+            """
+            # Set once the last byte has been handed to aiohttp. That moment,
+            # and not the response, is what says the clip is over, so it is
+            # what the waiting below is hung on.
+            body_sent = asyncio.Event()
+            # Whether any of it ever left. A device that cannot be reached
+            # fails the wait below as well, and saying it "stopped taking
+            # audio" when nothing was ever sent would point at the wrong
+            # problem.
+            body_started = False
+            # Whether the device answered while the clip was still going out.
+            # Read inside the request, where the ordering is unambiguous.
+            answered_early = False
+            # Whether that answer was a challenge this client can now meet.
+            challenged = False
+            # When the device last took something. A slow device and a dead
+            # one are only told apart by this moving, so it is updated where a
+            # piece has actually been handed over rather than where one was
+            # prepared.
+            last_progress = time.monotonic()
+
+            async def paced_body():
+                """Feeds the clip at the rate it plays at.
+
+                Paced against a single start time rather than by sleeping a fixed
+                slice per write, so a write that blocks does not stretch what
+                follows it: the device hears the clip at its own speed either way.
+                """
+                nonlocal body_started, last_progress
+                started = time.monotonic()
+                sent = 0
+                try:
+                    while sent < len(audio):
+                        piece = audio[sent : sent + chunk]
+                        body_started = True
+                        yield piece
+                        # Control comes back here when aiohttp wants the next
+                        # piece, which means the last one has gone to the socket.
+                        # So this is the device taking audio, and the only place
+                        # that can say so.
+                        last_progress = time.monotonic()
+                        sent += len(piece)
+                        if sent >= len(audio):
+                            # Set on handing over the last piece, not after the
+                            # loop: with Content-Length declared, aiohttp writes
+                            # exactly that many bytes and never asks the generator
+                            # for another, so the code after this loop does not run
+                            # until the generator is closed -- long after the clip
+                            # is out. Waiting for that read as the device having
+                            # answered before the body finished, on every clip.
+                            body_sent.set()
+                            return
+                        behind = (sent / byte_rate) - (time.monotonic() - started)
+                        if behind > 0:
+                            await asyncio.sleep(behind)
+                finally:
+                    # The safety net for a send that was abandoned part way: it
+                    # releases the waiter rather than leaving it to the timeout.
+                    body_sent.set()
+
+            headers = {
+                "Content-Type": content_type,
+                # Explicit, and this is load-bearing. aiohttp sends a body of
+                # unknown size with `Transfer-Encoding: chunked`, and a 2018
+                # embedded web server is not going to de-chunk it, so the
+                # device would play the chunk-length lines as audio. Setting
+                # the length here is what keeps aiohttp from choosing chunked
+                # at all.
+                "Content-Length": str(len(audio)),
+            }
+            if header:
+                headers["AUTHORIZATION"] = header
+
+            async def post():
+                nonlocal answered_early, challenged
+                async with self._session.post(
+                    url,
+                    headers=headers,
+                    data=paced_body(),
+                    # Its own clock. Without this the session default applies,
+                    # which is a five minute total, and a long clip would be cut
+                    # off mid-play by aiohttp rather than by anything here.
+                    #
+                    # Deliberately the looser of the two: the limits below decide
+                    # when a push is given up on, and they can say why. aiohttp
+                    # cutting in first would turn "playing slowly" into a bare
+                    # TimeoutError, so this sits a grace period past the ceiling
+                    # rather than level with it.
+                    timeout=aiohttp.ClientTimeout(
+                        total=(
+                            duration * AUDIO_SLOWEST_TOLERATED
+                            + TIMEOUT_SECONDS
+                            + AUDIO_REFUSAL_GRACE_SECONDS
+                            + AUDIO_PROGRESS_CHECK_SECONDS
+                        ),
+                        sock_connect=TIMEOUT_SECONDS,
+                    ),
+                ) as response:
+                    # Read here, at the moment the headers land, rather than from
+                    # the outcome of the race below: an answer and the last byte
+                    # can both be ready in the same step of the loop, and then
+                    # which future "finished first" says nothing about which
+                    # actually came first.
+                    answered_early = not body_sent.is_set()
+                    if response.status == 401 and may_retry:
+                        # Read here rather than left to `raise_for_status`,
+                        # because the challenge is only in hand while the
+                        # response is. A device that reissues on every call
+                        # refuses the header the push opened with and says in
+                        # the same breath what it would accept, which is what
+                        # `curl --digest` does and this did not (#1136).
+                        challenged = auth.absorb_challenge(response)
+                        if challenged:
+                            return
+                    response.raise_for_status()
+                    # A 200 is not consent. This family answers a refused write
+                    # with 200 and the body `Error`, which is why every write
+                    # through `get()` is checked for it; this one does not go
+                    # through `get()`, so it checks for itself.
+                    body = await response.text()
+                    if write_was_declined(body):
+                        raise DahuaWriteDeclined(
+                            "{0} declined the audio: {1}".format(
+                                self._address, body.strip()[:80]
+                            )
+                        )
+
             # Two things are raced, because either can end the call and they
             # mean opposite things. The post finishing first is the device
             # answering before the clip is out, which is a refusal however
@@ -5062,18 +5439,24 @@ class DahuaClient:
                     # Re-raises a refusal. A 2xx gets here too, and whether
                     # that is success depends entirely on when it arrived.
                     await sending
+                    if challenged:
+                        # A challenge arrives before the clip is out, so it
+                        # would otherwise be read as the refusal below. It is
+                        # not one: the device has not turned the clip down,
+                        # it has asked to be asked properly.
+                        return True
                     if answered_early:
                         raise DahuaWriteDeclined(
                             "{0} answered before the clip had finished, so it "
                             "played at most part of it".format(self._address)
                         )
-                    return
+                    return False
                 done, _ = await asyncio.wait(
                     {sending}, timeout=AUDIO_REFUSAL_GRACE_SECONDS
                 )
                 if sending in done:
                     await sending
-                    return
+                    return challenged
                 _LOGGER.debug(
                     "%s took the clip without answering, as postAudio does",
                     self._address,
@@ -5092,6 +5475,33 @@ class DahuaClient:
                 # Bounded, so a library that declined to be cancelled could not
                 # hold the speaker lock for ever.
                 await asyncio.wait({sending}, timeout=TIMEOUT_SECONDS)
+
+            return challenged
+
+        _LOGGER.debug(
+            "Playing %d bytes of %s on %s channel %s, about %.1fs",
+            len(audio),
+            content_type,
+            self._address,
+            channel_number,
+            duration,
+        )
+
+        # Both attempts under one lock. A device that challenges would
+        # otherwise let a second announcement in between the push and its
+        # retry, and the two would then be interleaved on the same speaker.
+        async with _speaker_lock(self._device, channel_number):
+            if await attempt(authorization(), True):
+                _LOGGER.debug(
+                    "%s challenged the audio push, so it is being sent again "
+                    "with the challenge answered",
+                    self._address,
+                )
+                # Exactly one more, and this one may not swallow a 401. A
+                # device locks out after a few refusals and the whole host
+                # shares the count, so a wrong password must cost two
+                # attempts per clip rather than a loop of them.
+                await attempt(authorization(), False)
 
     async def async_access_control_open_door(self, door_id: int = 1) -> dict:
         """Open a door, over CGI, falling back to RPC2 if the CGI path is absent.
