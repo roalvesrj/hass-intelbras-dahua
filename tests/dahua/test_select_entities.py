@@ -10,12 +10,17 @@ name looks exactly like the camera being in that mode.
 """
 
 import pytest
+from homeassistant.exceptions import HomeAssistantError
 
 from custom_components.dahua import select as select_module
+from custom_components.dahua.const import VIDEO_COLOR_STYLE_OPTIONS
+from custom_components.dahua.coordinator import DahuaDataUpdateCoordinator
 from custom_components.dahua.select import (
     DahuaCameraPresetPositionSelect,
     DahuaDayNightModeSelect,
     DahuaDoorbellLightSelect,
+    DahuaImageRotationSelect,
+    DahuaVideoColorStyleSelect,
 )
 
 from . import adds_entities
@@ -38,6 +43,18 @@ class _Coordinator:
     # `async_add_entities` wants for an entry that has no subentries.
     subentry_id = None
 
+    # The real methods rather than copies of them. The platform asks the
+    # coordinator to write, because the table the field lives in is something
+    # only the coordinator learned, and a hand-written forwarder here would
+    # assert this file's idea of that rule instead of production's.
+    # The real coordinator carries this as a class default, so a double that
+    # borrows its methods has to carry it too.
+    _video_image_control_table = "VideoImageControl"
+    video_image_control_table = DahuaDataUpdateCoordinator.video_image_control_table
+    async_set_video_image_control = (
+        DahuaDataUpdateCoordinator.async_set_video_image_control
+    )
+
     def __init__(self, data=None, channel=0, day_night=None):
         self.client = _Client()
         self.data = data or {}
@@ -53,6 +70,12 @@ class _Coordinator:
 
     def get_day_night_color(self):
         return self._day_night
+
+    def get_video_color_style(self):
+        return self.data.get("table.VideoColor[{0}][0].Style".format(self._channel))
+
+    def get_video_image_control(self, field):
+        return self.data.get(f"table.VideoImageControl[{self._channel}].{field}")
 
     async def async_refresh(self):
         self.refreshed += 1
@@ -256,6 +279,53 @@ async def test_an_option_the_select_does_not_offer_is_ignored():
     assert c.refreshed == 0
 
 
+# --- VideoColor Style --------------------------------------------------------
+
+
+@pytest.mark.parametrize("style", VIDEO_COLOR_STYLE_OPTIONS)
+def test_style_reports_only_values_the_device_supports(style):
+    c = _Coordinator(
+        {"table.VideoColor[2][0].Style": style},
+        channel=2,
+    )
+    s = _select(DahuaVideoColorStyleSelect, c)
+
+    assert s.current_option == style
+    assert s.options == ["Soft", "Standard", "Vivid"]
+    assert s.unique_id == "SERIAL1_video_color_style"
+    assert s.entity_category.value == "config"
+
+
+def test_unknown_style_is_reported_as_unknown():
+    s = _select(
+        DahuaVideoColorStyleSelect,
+        _Coordinator({"table.VideoColor[0][0].Style": "Custom"}),
+    )
+
+    assert s.current_option is None
+
+
+@pytest.mark.parametrize("style", VIDEO_COLOR_STYLE_OPTIONS)
+async def test_selecting_a_style_writes_the_exact_value_and_refreshes(style):
+    c = _Coordinator(channel=3)
+    s = _select(DahuaVideoColorStyleSelect, c)
+
+    await s.async_select_option(style)
+
+    assert c.client.calls == [("async_set_video_color_style", 3, style)]
+    assert c.refreshed == 1
+
+
+async def test_an_invalid_style_is_ignored_without_a_write_or_refresh():
+    c = _Coordinator(channel=3)
+    s = _select(DahuaVideoColorStyleSelect, c)
+
+    await s.async_select_option("Custom")
+
+    assert c.client.calls == []
+    assert c.refreshed == 0
+
+
 # --- which selects an entry creates ------------------------------------------
 
 
@@ -286,6 +356,8 @@ async def _added_for(coordinator, cgi_presets=None):
         DahuaDoorbellLightSelect=lambda *a, **k: "light",
         DahuaCameraPresetPositionSelect=lambda *a, **k: ("preset", k.get("preset_ids")),
         DahuaDayNightModeSelect=lambda *a, **k: "day_night",
+        DahuaVideoColorStyleSelect=lambda *a, **k: "style",
+        DahuaImageRotationSelect=lambda *a, **k: "rotation",
         _async_preset_ids=_preset_ids,
     ):
         await select_module.async_setup_entry(
@@ -304,10 +376,14 @@ class _SetupCoordinator(_Coordinator):
         preset_error=None,
         day_night_supported=False,
         infrared_supported=False,
+        style_supported=False,
+        image_control_fields=(),
     ):
         super().__init__()
         self._day_night_supported = day_night_supported
         self._infrared_supported = infrared_supported
+        self._style_supported = style_supported
+        self._image_control_fields = frozenset(image_control_fields)
         self._amcrest = amcrest
         self._security_light = security_light
         self._model = model
@@ -335,6 +411,12 @@ class _SetupCoordinator(_Coordinator):
 
     def supports_day_night_color(self):
         return self._day_night_supported
+
+    def supports_video_color(self, field):
+        return field == "Style" and self._style_supported
+
+    def supports_video_image_control(self, field):
+        return field in self._image_control_fields
 
     def supports_infrared_light(self):
         return self._infrared_supported
@@ -368,6 +450,97 @@ async def test_the_doorbell_light_select_needs_a_doorbell_with_one():
     )
 
 
+@pytest.mark.parametrize(
+    "flip,rotate,expected",
+    [
+        (False, 0, "0°"),
+        (True, 0, "180°"),
+        (False, 1, None),
+        (False, 2, None),
+        (True, 1, None),
+        (None, 0, None),
+    ],
+)
+def test_image_rotation_reads_only_supported_combinations(flip, rotate, expected):
+    c = _Coordinator(
+        {
+            "table.VideoImageControl[3].Flip": flip,
+            "table.VideoImageControl[3].Rotate90": rotate,
+        },
+        channel=3,
+    )
+    entity = _select(DahuaImageRotationSelect, c)
+
+    assert entity.current_option == expected
+
+
+@pytest.mark.parametrize(
+    "option,expected_flip",
+    [("0°", False), ("180°", True)],
+)
+async def test_image_rotation_writes_only_flip_and_refreshes(option, expected_flip):
+    c = _Coordinator(
+        {"table.VideoImageControl[3].Rotate90": 0},
+        channel=3,
+    )
+    entity = _select(DahuaImageRotationSelect, c)
+
+    await entity.async_select_option(option)
+
+    assert c.client.calls == [
+        ("async_set_video_image_control", 3, "Flip", expected_flip, "VideoImageControl")
+    ]
+    assert c.refreshed == 1
+
+
+@pytest.mark.parametrize(
+    "rotate,option",
+    [
+        (1, "0°"),
+        (1, "180°"),
+        (2, "0°"),
+        (2, "180°"),
+        (None, "0°"),
+        (None, "180°"),
+    ],
+)
+async def test_image_rotation_rejects_unsupported_rotate90(rotate, option):
+    c = _Coordinator(
+        {"table.VideoImageControl[3].Rotate90": rotate},
+        channel=3,
+    )
+    entity = _select(DahuaImageRotationSelect, c)
+
+    with pytest.raises(HomeAssistantError):
+        await entity.async_select_option(option)
+
+    assert c.client.calls == []
+    assert c.refreshed == 0
+
+
+async def test_invalid_image_rotation_does_not_write_or_refresh():
+    c = _Coordinator()
+    entity = _select(DahuaImageRotationSelect, c)
+
+    await entity.async_select_option("90°")
+
+    assert c.client.calls == []
+    assert c.refreshed == 0
+
+
+@pytest.mark.parametrize("fields", [{"Flip"}, {"Rotate90"}])
+async def test_image_rotation_requires_both_reported_fields(fields):
+    coordinator = _SetupCoordinator(image_control_fields=fields)
+
+    assert "rotation" not in await _added_for(coordinator)
+
+
+async def test_image_rotation_is_created_when_both_fields_are_reported():
+    coordinator = _SetupCoordinator(image_control_fields={"Flip", "Rotate90"})
+
+    assert "rotation" in await _added_for(coordinator)
+
+
 async def test_a_device_that_refuses_to_list_its_presets_still_gets_a_select():
     """The enumeration is over RPC2 and can fail. Losing the entity with it would leave a
     PTZ camera with no preset control at all, where an empty list still offers Manual and
@@ -394,6 +567,11 @@ async def test_the_day_night_select_needs_a_device_that_reports_the_mode():
     would leave a control showing unknown for ever."""
     assert "day_night" not in await _added_for(_SetupCoordinator())
     assert "day_night" in await _added_for(_SetupCoordinator(day_night_supported=True))
+
+
+async def test_style_select_requires_reported_style_support():
+    assert "style" not in await _added_for(_SetupCoordinator())
+    assert "style" in await _added_for(_SetupCoordinator(style_supported=True))
 
 
 async def test_a_camera_that_holds_no_presets_gets_no_preset_control():

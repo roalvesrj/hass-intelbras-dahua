@@ -23,9 +23,11 @@ from aiohttp import ClientError, ClientResponseError, ClientSession
 
 from homeassistant.components.tag import async_scan_tag
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import ATTR_DEVICE_ID
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers import area_registry as ar
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
@@ -69,6 +71,9 @@ from .const import (
     SENSOR,
     SWITCH,
     UPDATE,
+    VIDEO_IMAGE_CONTROL_FIELDS,
+    VIDEO_IMAGE_CONTROL_TABLE,
+    VIDEO_IMAGE_CONTROL_TABLES,
 )
 from .dahua_utils import cloud_upgrade_version, parse_event
 from .deterrence import (
@@ -456,9 +461,8 @@ def day_night_color_name(data: dict, channel: int):
     return DAY_NIGHT_NAMES.get(str(value).strip())
 
 
-# The picture adjustments the number platform offers, as the device spells them
-# in its VideoColor table.
-VIDEO_COLOR_FIELDS = ("Brightness", "Contrast", "Saturation", "Hue")
+# The picture controls exposed from VideoColor, as the device spells them.
+VIDEO_COLOR_FIELDS = ("Brightness", "Contrast", "Saturation", "Hue", "Gamma", "Style")
 
 
 def video_color_fields(data: dict, channel: int) -> frozenset:
@@ -471,8 +475,8 @@ def video_color_fields(data: dict, channel: int) -> frozenset:
     and taking another channel's row as evidence is how a control comes to
     report a camera it is not attached to.
 
-    Per field rather than a single yes, so a device reporting three of the four
-    gets three sliders instead of a fourth that can only ever read unknown.
+    Per field rather than a single yes, so a device gets entities only for the
+    fields it reports.
 
     Empty when the device named none, which covers both a table it does not
     have and the empty 200 some firmware answers for one -- the same thing
@@ -949,6 +953,8 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
     # and the number platform read this. Only ever reassigned, never mutated, so
     # one shared empty default is safe.
     _video_color_fields: frozenset = frozenset()
+    _video_image_control_fields: frozenset = frozenset()
+    _video_image_control_table: str = VIDEO_IMAGE_CONTROL_TABLE
 
     # Whether the device never answered what kind of device it is, as opposed to
     # answering that it does not serve the question. On the class for the reason
@@ -1102,6 +1108,8 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         self._supports_lighting = False
         self._supports_day_night_color = False
         self._video_color_fields: frozenset = frozenset()
+        self._video_image_control_fields: frozenset = frozenset()
+        self._video_image_control_table: str = VIDEO_IMAGE_CONTROL_TABLE
         # What the device said when a probe failed, keyed by probe name.
         self._probe_refusals: Dict[str, dict] = {}
         self._channel_model = None
@@ -1977,7 +1985,7 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
     async def _async_retry_video_color(self) -> bool:
         """Whether picture adjustments turned up that were missed at setup.
 
-        Four sliders are gated on this, one per field, and the poll decides
+        VideoColor entities are gated on this, one per field, and the poll decides
         each cycle whether to read the table, so they work from the next poll
         rather than reading unknown until a reload.
 
@@ -1986,6 +1994,49 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         """
         already = bool(self._video_color_fields)
         return await self._async_probe_video_color() and not already
+
+    async def _async_probe_video_image_control(self) -> bool:
+        """Ask which image controls this channel reports, and from which table.
+
+        `VideoImageControl` is asked first and, when it reports a field, is the
+        only table read, so nothing changes for a camera. A doorbell answers it
+        empty and keeps the same fields in `VideoInOptions`, which is asked
+        second. An empty answer is what a device sends for a table it does not
+        have, so the next table is tried on an empty answer as well as on a
+        refusal.
+        """
+        answered = False
+        refusal = None
+        for table_name in VIDEO_IMAGE_CONTROL_TABLES:
+            try:
+                table = await self.client.async_get_video_image_control(table_name)
+            except PROBE_FAILED as probe_error:
+                refusal = probe_error
+                continue
+            answered = True
+            fields = frozenset(
+                field
+                for field in VIDEO_IMAGE_CONTROL_FIELDS
+                if table.get(f"table.{table_name}[{self.get_channel()}].{field}")
+                is not None
+            )
+            if fields:
+                self._note_probe_answered("video_image_control")
+                self._video_image_control_table = table_name
+                self._video_image_control_fields = fields
+                return True
+        self._video_image_control_table = VIDEO_IMAGE_CONTROL_TABLE
+        self._video_image_control_fields = frozenset()
+        if answered:
+            self._note_probe_answered("video_image_control")
+        else:
+            self._note_probe_refusal("video_image_control", refusal)
+        return False
+
+    async def _async_retry_video_image_control(self) -> bool:
+        """Whether image controls turned up after an unanswered probe."""
+        already = bool(self._video_image_control_fields)
+        return await self._async_probe_video_image_control() and not already
 
     async def _async_probe_profile_mode(self) -> bool:
         """Ask whether this channel has selectable day/night/general profiles.
@@ -2475,17 +2526,17 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
                     "Device supports day/night mode=%s", self._supports_day_night_color
                 )
 
-                # The picture adjustments, probed rather than read blind on
+                # The picture controls, probed rather than read blind on
                 # every poll. #1006 is a camera account in the device's `user`
                 # group, which answers 403 to this table: the read sat in the
                 # poll's gather with no capability check and no handler, so one
                 # refusal failed the whole refresh, and on the first one that is
                 # ConfigEntryNotReady -- every entity of a working camera
-                # unavailable for four sliders it was never going to serve.
+                # unavailable for controls it was never going to serve.
                 #
                 # Judged on this channel's own row, not on the request
                 # succeeding; see video_color_fields. A device that names none
-                # gets no number entities, which is the rule the profile sensor
+                # gets no VideoColor entities, which is the rule the profile sensor
                 # established (#641): an entity that can only read unknown is
                 # worse than no entity.
                 #
@@ -2493,12 +2544,14 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
                 # URL carries no channel, so the shared read cache answers it
                 # once for every channel setting up and holds it for
                 # CONFIG_CACHE_TTL_SECONDS.
-                # Inside the gate: a device whose number platform is switched
-                # off is never asked, and saying it reports none would read as
-                # the device refusing. The probe itself is shared with the
-                # retry a later poll makes (#1057).
-                if self._wanted_by(NUMBER):
+                # Inside the gate: a device whose number and select platforms
+                # are switched off is never asked. The probe itself is shared
+                # with the retry a later poll makes (#1057).
+                if self._wanted_by(NUMBER, SELECT):
                     await self._async_probe_video_color()
+
+                if self._wanted_by(SWITCH, SELECT):
+                    await self._async_probe_video_image_control()
 
                 # Which camera is actually on this channel. Every channel of a
                 # recorder reports the recorder's model, so a doorbell behind an
@@ -2903,14 +2956,18 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
             # reason every read here is.
             if self._supports_system_load and self._wanted_by(SENSOR):
                 coros.append(asyncio.ensure_future(self._async_fetch_system_load()))
-            # Picture adjustments for the number platform (brightness, contrast,
-            # saturation, hue): one read per poll, and only where the device
-            # actually reported them at setup. Gated on the probe rather than on
-            # the platform alone, so a device that refuses the table is never
-            # asked again, and wrapped, so a permissions change made after setup
-            # cannot take the entry down the way #1006 did.
-            if self._video_color_fields and self._wanted_by(NUMBER):
+            # Picture controls for the number and select platforms: one read per
+            # poll, and only where the device actually reported them at setup.
+            # Gated on the probe rather than on the platform alone, so a device
+            # that refuses the table is never asked again, and wrapped, so a
+            # permissions change made after setup cannot take the entry down
+            # the way #1006 did.
+            if self._video_color_fields and self._wanted_by(NUMBER, SELECT):
                 coros.append(asyncio.ensure_future(self._async_fetch_video_color()))
+            if self._video_image_control_fields and self._wanted_by(SWITCH, SELECT):
+                coros.append(
+                    asyncio.ensure_future(self._async_fetch_video_image_control())
+                )
             # Lighting_V2 is the light platform's table -- except that the
             # Amcrest doorbell's "Security Light" is a *select*, and its
             # current_option reads table.Lighting_V2[0][0][1].Mode/.State. A
@@ -3117,6 +3174,7 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         # as the device having sent nothing.
         self._remember_event(event)
         event["DeviceName"] = self.get_device_name()
+        self._tag_event_with_device_id(event)
         _LOGGER.debug(f"VTO Data received: {event}")
         self._handle_anpr_plate(event)
         self.hass.bus.fire("dahua_event_received", event)
@@ -3419,6 +3477,24 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
             for listener in listeners:
                 listener()
 
+    @callback
+    def _tag_event_with_device_id(self, event: dict) -> None:
+        """Name the sending device on an event about to reach the bus.
+
+        Called on both transports, after `_remember_event`, for the same reason
+        `DeviceName` is: the diagnostics buffer is meant to hold what the device
+        sent rather than what we added to it, and `_remember_event` takes its own
+        `dict(event)` copy, so anything set after this point stays out of it.
+
+        The key is absent rather than None when the device cannot be resolved.
+        An automation filtering on `event_data` matches on the keys present, so a
+        null would match nothing and read as "sent by no device" instead of "not
+        known yet".
+        """
+        device_id = self.event_device_id()
+        if device_id is not None:
+            event[ATTR_DEVICE_ID] = device_id
+
     def _remember_event(self, event: dict) -> None:
         """Keep the last few events, so diagnostics can show what arrived.
 
@@ -3466,6 +3542,7 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         # Put the event on the HA event bus
         event["name"] = self.get_device_name()
         event["DeviceName"] = self.get_device_name()
+        self._tag_event_with_device_id(event)
         self.hass.bus.fire("dahua_event_received", event)
 
         # When there's an event start we'll update the a map x to the current timestamp in seconds for the event.
@@ -4645,6 +4722,31 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         """
         return field in getattr(self, "_video_color_fields", frozenset())
 
+    def supports_video_image_control(self, field: str) -> bool:
+        """Whether this channel reported the requested image-control field."""
+        return field in getattr(self, "_video_image_control_fields", frozenset())
+
+    def video_image_control_table(self) -> str:
+        """Which table this channel reported its image controls in.
+
+        A plain attribute read, so the class default is the only thing holding
+        the answer for a coordinator built without `__init__` -- which is how
+        much of the suite and every `object.__new__` path builds one. A
+        `getattr` fallback here would answer correctly with the class default
+        deleted, which is a second copy of the same decision and hides the loss
+        of the first.
+        """
+        return self._video_image_control_table
+
+    async def async_set_video_image_control(self, field: str, value: bool):
+        """Write one image control back to the table it was read from."""
+        return await self.client.async_set_video_image_control(
+            self.get_channel(),
+            field,
+            value,
+            self.video_image_control_table(),
+        )
+
     # Which region's sensitivity and threshold are exposed, of the four the
     # recorder's own UI offers.
     #
@@ -4725,10 +4827,10 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         return {"true": True, "false": False}.get(str(raw).strip().lower())
 
     def get_video_color(self, field: str):
-        """A picture adjustment for this channel's general profile, or None.
+        """A numeric picture adjustment for this channel's general profile.
 
         Read from the poll's VideoColor table by the image-adjustment number
-        entities (brightness, contrast, saturation, hue).
+        entities.
         """
         raw = self.data.get(
             "table.VideoColor[{0}][0].{1}".format(self.get_channel(), field)
@@ -4739,6 +4841,27 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
             return int(raw)
         except (TypeError, ValueError):
             return None
+
+    def get_video_image_control(self, field: str) -> bool | int | None:
+        """Read a reported image-control field from this channel's latest poll."""
+        raw = self.data.get(
+            f"table.{self.video_image_control_table()}[{self.get_channel()}].{field}"
+        )
+        if raw is None:
+            return None
+        if field in {"Flip", "Mirror"}:
+            return {"true": True, "false": False}.get(str(raw).strip().lower())
+        if field == "Rotate90":
+            try:
+                return int(raw)
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    def get_video_color_style(self) -> str | None:
+        """The supported Style value for this channel's general profile."""
+        raw = self.data.get("table.VideoColor[{0}][0].Style".format(self.get_channel()))
+        return raw if isinstance(raw, str) else None
 
     async def _async_retry_device_class(self) -> None:
         """Ask again for a device class the device did not answer.
@@ -5021,6 +5144,27 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         others do. I don't know of a better way to detect this
         """
         if not self._supports_lighting:
+            return False
+        if self.is_indoor_monitor_without_video():
+            # A VTH5221D answers the Lighting table with exactly one key,
+            # `Mode=Off`, and no light bank at all -- so the probe above reads
+            # "this channel has an infrared light" from a table that is there
+            # rather than from an emitter that is there. A camera on the same
+            # recorder returns Mode, Correction, Sensitive and MiddleLight.
+            #
+            # The device has already said it has no camera, in its own
+            # RemoteDevice entry, and every other camera capability is gated on
+            # that answer. These two were the last ones that were not, so an
+            # indoor monitor kept an Infrared light and an Infrared Mode select
+            # and nothing else.
+            #
+            # Here rather than in light.py and select.py because the poll reads
+            # the same rule: this also stops `async_get_config_lighting` being
+            # fetched every scan interval for the life of the entry.
+            #
+            # Judged on `is_indoor_monitor_without_video` and not on the class,
+            # because some indoor monitors do have a camera and this says
+            # nothing about those.
             return False
         return (
             "-AS-PV" not in self.model
@@ -5477,6 +5621,59 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
             # We need a unique identifier. For NVRs we get back the same serial, so add the channel to the end of the sn
             return "{0}_{1}".format(self._serial_number, self._channel)
         return self._serial_number
+
+    @callback
+    def device_identifier(self) -> tuple[str, str]:
+        """The registry identifier of this channel's device.
+
+        The same pair `entity.py` files every entity against, which is the
+        device `event_device_id` has to find. It is not called from there: most
+        of the doubles in the suite are not coordinator instances, so demanding
+        this method of them reddens twenty-two tests that only ever needed
+        `get_serial_number`. The two are held together by a test that registers
+        a device under what `device_info` reports and looks it up with this,
+        which is the coupling that matters rather than the shared expression.
+        """
+        return (DOMAIN, self.get_serial_number())
+
+    @callback
+    def event_device_id(self) -> str | None:
+        """This channel's device registry id, or None if it has none yet.
+
+        What Home Assistant means by "which device sent this", and what core
+        integrations put on a bus event they fire: rfxtrx, deconz, zwave_js, zha
+        and others all carry `device_id`, holding the registry entry id rather
+        than a vendor serial. A device trigger matches on it, so it is also the
+        prerequisite for offering one.
+
+        None rather than an exception for every way this can fail to resolve.
+        The device is registered when the first entity is added, so an event
+        arriving before that has no id to carry, and an entry being removed
+        unregisters it. This runs on the event stream, where an unguarded
+        exception takes every camera on the host down until the stream
+        reconnects (#705, #706), so it is written to be incapable of raising.
+
+        The lookup is not cached. `DeviceRegistryItems.get_entry` is index
+        backed, two dict reads, so caching would buy nothing and cost a stale id
+        after a device is deleted and recreated.
+        """
+        try:
+            device = dr.async_get(self.hass).async_get_device_by_identifier(
+                self.device_identifier(),
+                self.config_entry.entry_id,
+            )
+        except Exception:  # pylint: disable=broad-except
+            return None
+
+        device_id = getattr(device, "id", None)
+
+        # A str and nothing else. Much of the suite hands the coordinator a
+        # MagicMock for `hass`, and a mock registry answers every lookup with a
+        # mock whose `.id` is itself a mock: without this the payload would
+        # carry that object and every assertion about it would still pass.
+        if isinstance(device_id, str) and device_id:
+            return device_id
+        return None
 
     def get_last_plate(self) -> str:
         """Return the last recognized license plate string, or 'unknown'."""
@@ -6454,6 +6651,26 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
             }
             return carried or None
 
+    async def _async_fetch_video_image_control(self) -> dict | None:
+        """Poll image controls, keeping the last answer on a refusal."""
+        try:
+            return await self.client.async_get_video_image_control(
+                self.video_image_control_table()
+            )
+        except Exception as exception:  # pylint: disable=broad-except
+            _LOGGER.debug(
+                "Could not read image controls for channel %s",
+                self._channel,
+                exc_info=exception,
+            )
+            previous = getattr(self, "data", None) or {}
+            carried = {
+                key: value
+                for key, value in previous.items()
+                if key.startswith(f"table.{self.video_image_control_table()}[")
+            }
+            return carried or None
+
     async def _async_fetch_ivs_rules(self) -> dict | None:
         """Poll the IVS rules, keeping the last answer on a refusal.
 
@@ -6619,4 +6836,5 @@ RETRYABLE_CAPABILITIES = {
     # also rename the field the diagnostics dump has been reporting.
     "system load": DahuaDataUpdateCoordinator._async_retry_system_load,
     "video_color": DahuaDataUpdateCoordinator._async_retry_video_color,
+    "video_image_control": DahuaDataUpdateCoordinator._async_retry_video_image_control,
 }

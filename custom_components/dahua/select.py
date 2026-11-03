@@ -1,23 +1,25 @@
 """Select entity platform for Dahua."""
 
 import logging
+from typing import ClassVar
 
-from homeassistant.core import HomeAssistant
 from homeassistant.components.select import SelectEntity
 from homeassistant.const import EntityCategory
+from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
+
 from custom_components.dahua import DahuaDataUpdateCoordinator
 
 from . import dahua_utils, entry_coordinators
-from .const import DOMAIN
+from .const import DOMAIN, VIDEO_COLOR_STYLE_OPTIONS
 from .entity import DahuaBaseEntity
-from .late import async_add_and_keep_watching
 from .infrared import (
     MODE_BY_OPTION,
     OPTION_BY_MODE,
     async_write_infrared_mode,
     infrared_write_is_refused,
 )
+from .late import async_add_and_keep_watching
 from .model_profiles import is_sdt4e425
 
 _LOGGER = logging.getLogger(__package__)
@@ -102,6 +104,16 @@ async def async_setup_entry(hass: HomeAssistant, entry, async_add_devices):
 
         if coordinator.supports_day_night_color():
             devices.append(DahuaDayNightModeSelect(coordinator, entry))
+
+        if (
+            not coordinator.is_indoor_monitor_without_video()
+            and coordinator.supports_video_color("Style")
+        ):
+            devices.append(DahuaVideoColorStyleSelect(coordinator, entry))
+        if coordinator.supports_video_image_control(
+            "Flip"
+        ) and coordinator.supports_video_image_control("Rotate90"):
+            devices.append(DahuaImageRotationSelect(coordinator, entry))
 
         if coordinator.supports_infrared_light():
             devices.append(DahuaInfraredModeSelect(coordinator, entry))
@@ -304,6 +316,45 @@ class DahuaSmartMotionSensitivitySelect(DahuaBaseEntity, SelectEntity):
         await self._coordinator.async_refresh()
 
 
+class DahuaImageRotationSelect(DahuaBaseEntity, SelectEntity):
+    """Rotate the image by flipping it vertically when supported."""
+
+    _attr_translation_key = "image_rotation"
+    _attr_entity_category = EntityCategory.CONFIG
+    _attr_options: ClassVar[list[str]] = ["0°", "180°"]
+
+    def __init__(self, coordinator: DahuaDataUpdateCoordinator, config_entry):
+        super().__init__(coordinator, config_entry)
+        self._coordinator = coordinator
+
+    @property
+    def unique_id(self):
+        return self._coordinator.get_serial_number() + "_image_rotation"
+
+    @property
+    def current_option(self):
+        if self._coordinator.get_video_image_control("Rotate90") != 0:
+            return None
+        flip = self._coordinator.get_video_image_control("Flip")
+        if flip is True:
+            return "180°"
+        if flip is False:
+            return "0°"
+        return None
+
+    async def async_select_option(self, option: str) -> None:
+        if option not in self._attr_options:
+            return
+        rotate90 = self._coordinator.get_video_image_control("Rotate90")
+        if type(rotate90) is not int or rotate90 != 0:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="image_rotation_unsupported",
+            )
+        await self._coordinator.async_set_video_image_control("Flip", option == "180°")
+        await self._coordinator.async_refresh()
+
+
 class DahuaCameraPresetPositionSelect(DahuaBaseEntity, SelectEntity):
     """Select a camera preset position."""
 
@@ -406,6 +457,35 @@ class DahuaDayNightModeSelect(DahuaBaseEntity, SelectEntity):
             return
         await self._coordinator.client.async_set_video_in_day_night_mode(
             self._coordinator.get_channel(), "general", option
+        )
+        await self._coordinator.async_refresh()
+
+
+class DahuaVideoColorStyleSelect(DahuaBaseEntity, SelectEntity):
+    """Select the camera's picture style on its general VideoColor profile."""
+
+    _attr_translation_key = "video_color_style"
+    _attr_entity_category = EntityCategory.CONFIG
+    _attr_options = list(VIDEO_COLOR_STYLE_OPTIONS)
+
+    def __init__(self, coordinator: DahuaDataUpdateCoordinator, config_entry):
+        super().__init__(coordinator, config_entry)
+        self._coordinator = coordinator
+
+    @property
+    def unique_id(self):
+        return self._coordinator.get_serial_number() + "_video_color_style"
+
+    @property
+    def current_option(self):
+        value = self._coordinator.get_video_color_style()
+        return value if value in VIDEO_COLOR_STYLE_OPTIONS else None
+
+    async def async_select_option(self, option: str) -> None:
+        if option not in VIDEO_COLOR_STYLE_OPTIONS:
+            return
+        await self._coordinator.client.async_set_video_color_style(
+            self._coordinator.get_channel(), option
         )
         await self._coordinator.async_refresh()
 

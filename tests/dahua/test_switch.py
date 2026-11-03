@@ -2,12 +2,13 @@
 
 import pytest
 
-from custom_components.dahua.client import SECURITY_LIGHT_TYPE, SIREN_TYPE
 from custom_components.dahua import DahuaDataUpdateCoordinator
+from custom_components.dahua.client import SECURITY_LIGHT_TYPE, SIREN_TYPE
 from custom_components.dahua.switch import (
     DahuaAlarmOutputSwitch,
     DahuaDisarmingEventNotificationsLinkageBinarySwitch,
     DahuaDisarmingLinkageBinarySwitch,
+    DahuaMirrorSwitch,
     DahuaMotionDetectionBinarySwitch,
     DahuaPrivacyModeBinarySwitch,
     DahuaSirenBinarySwitch,
@@ -43,6 +44,18 @@ class _Coordinator:
     # the same drift that change removes. It derives from uses_recorder_deterrence and
     # supports_siren below, exactly as production does.
     creates_siren_entity = DahuaDataUpdateCoordinator.creates_siren_entity
+
+    # The real methods rather than copies of them. The platform asks the
+    # coordinator to write, because the table the field lives in is something
+    # only the coordinator learned, and a hand-written forwarder here would
+    # assert this file's idea of that rule instead of production's.
+    # The real coordinator carries this as a class default, so a double that
+    # borrows its methods has to carry it too.
+    _video_image_control_table = "VideoImageControl"
+    video_image_control_table = DahuaDataUpdateCoordinator.video_image_control_table
+    async_set_video_image_control = (
+        DahuaDataUpdateCoordinator.async_set_video_image_control
+    )
 
     def __init__(self, channel=4, amcrest=False):
         self.client = _Client()
@@ -101,6 +114,9 @@ class _Coordinator:
         Off by default: these are cameras and recorders.
         """
         return field in self.states.get("vth_phone_fields", ())
+
+    def supports_video_image_control(self, field):
+        return field in self.states.get("video_image_control_fields", ())
 
     def supports_intelli_tour(self):
         """Whether this channel reports IntelliTour, which the tour switch writes.
@@ -171,6 +187,9 @@ class _Coordinator:
 
     def is_siren_on(self):
         return self.states.get("siren", False)
+
+    def get_video_image_control(self, field):
+        return self.states.get("video_image_control", {}).get(field)
 
     async def async_refresh(self):
         self.refreshed += 1
@@ -624,6 +643,7 @@ async def _added_for(coordinator):
         DahuaDisarmingEventNotificationsLinkageBinarySwitch=lambda *a, **k: "notifications",
         DahuaSmartMotionDetectionBinarySwitch=lambda *a, **k: "smart",
         DahuaPrivacyModeBinarySwitch=lambda *a, **k: "privacy",
+        DahuaMirrorSwitch=lambda *a, **k: "mirror",
         DahuaAlarmOutputSwitch=lambda *a, **k: "alarm_output",
         # The multi-relay variant is a different class, because an
         # entity that names itself cannot also translate its name.
@@ -731,6 +751,45 @@ async def test_an_indoor_monitor_without_a_camera_gets_no_motion_detection_switc
 
 async def test_a_camera_still_gets_one():
     assert "motion" in await _switches_for(_Coordinator())
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_mirror_switch_writes_one_field_and_refreshes(enabled):
+    coordinator = _Coordinator(channel=3)
+    switch = _switch(DahuaMirrorSwitch, coordinator)
+
+    await (switch.async_turn_on() if enabled else switch.async_turn_off())
+
+    assert coordinator.client.calls == [
+        ("async_set_video_image_control", 3, "Mirror", enabled, "VideoImageControl")
+    ]
+    assert coordinator.refreshed == 1
+
+
+async def test_mirror_switch_reads_the_reported_state():
+    coordinator = _Coordinator()
+    switch = _switch(DahuaMirrorSwitch, coordinator)
+    coordinator.states["video_image_control"] = {"Mirror": True}
+
+    assert switch.is_on is True
+    coordinator.states["video_image_control"]["Mirror"] = False
+    assert switch.is_on is False
+
+
+async def test_mirror_switch_is_created_only_when_the_field_is_reported():
+    unsupported = _Coordinator()
+    assert "mirror" not in await _added_for(unsupported)
+
+    supported = _Coordinator()
+    supported.states["video_image_control_fields"] = {"Mirror"}
+    assert "mirror" in await _added_for(supported)
+
+
+async def test_channel_three_mirror_is_not_created_from_row_zero_state():
+    coordinator = _Coordinator(channel=3)
+    coordinator.states["video_image_control"] = {"Mirror": True}
+
+    assert "mirror" not in await _added_for(coordinator)
 
 
 # --- naming several relays ----------------------------------------------------

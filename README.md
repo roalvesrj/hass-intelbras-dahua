@@ -733,7 +733,8 @@ Here's example event data:
             ],
             "SmartMotionEnable": false
         },
-        "DeviceName": "Cam13"
+        "DeviceName": "Cam13",
+        "device_id": "9b1f0e2c4a7d8e3f5061728394a5b6c7"
     },
     "origin": "LOCAL",
     "time_fired": "2021-06-30T04:00:28.605290+00:00",
@@ -754,6 +755,39 @@ event_data:
   Code: VideoMotion
   action: Start
 ```
+
+## Telling two devices apart
+
+`device_id` is the Home Assistant device the event came from, and it is the one
+field here that cannot change underneath an automation. Everything else is
+either the device's own wording or a name you chose: rename a device and
+`name`/`DeviceName` change with it, and a channel of a recorder reports the
+channel's device rather than the recorder's.
+
+Use it when you have more than one of something and the bus has to tell them
+apart, which is the case a doorbell or an access controller runs into first:
+
+```yaml
+platform: event
+event_type: dahua_event_received
+event_data:
+  Code: _DoTalkAction_
+  device_id: 9b1f0e2c4a7d8e3f5061728394a5b6c7
+```
+
+To find a device's id, open the device page and copy it out of the URL, or in
+**Developer tools -> Template** render
+`{{ device_id('binary_sensor.your_doorbell_button_pressed') }}`.
+
+Two things worth knowing before you build on it:
+
+- **It is absent, not empty, until the device exists.** A device is registered
+  when its first entity is added, so a very early event carries no `device_id`
+  at all rather than a null.
+- **An entity is usually the better trigger.** `binary_sensor.<device>_button_pressed`
+  and `event.<device>_doorbell` are already one per device, so they do not have
+  this problem to solve, and the event entity also collapses a doorbell that
+  reports one press as two states into a single ring.
 
 And that's it! You can enable debug logging (See at the end of this readme) to print out events to the Home Assisant log
 as they fire. That can help you understand the events. Or you can HA and open Developer Tools -> Events -> and under
@@ -914,6 +948,7 @@ Service | Parameters | Description
 `dahua.set_infrared_mode` | `target`: camera.cam13_main <br /> `mode`: Auto, On, Off <br /> `brightness`: 0 - 100 inclusive| Sets the infrared mode. Useful to set the mode back to Auto
 `dahua.goto_preset_position` | `target`: camera.cam13_main <br /> `position`: 1 - 10 inclusive| Go to a preset position
 `dahua.set_video_profile_mode` | `target`: camera.cam13_main <br /> `mode`: Day, Night| Sets the video profile mode to day or night
+`dahua.autofocus` | `target`: camera.cam13_main | Asks a camera with a motorized lens to focus itself, so the focus does not have to be set by number. Carries no channel, the same scope as `dahua.set_focus_zoom` has, and untested against a recorder. A camera with a fixed lens is expected to refuse it.
 `dahua.set_focus_zoom` | `target`: camera.cam13_main <br /> `focus`: The focus level, e.g.: 0.81 0 - 1 inclusive <br /> `zoom`: The zoom level, e.g.: 0.72 0 - 1 inclusive | Sets the focus and zoom level
 `dahua.set_channel_title` | `target`: camera.cam13_main <br /> `channel`: The camera channel, e.g.: 0 <br /> `text1`: The text 1<br /> `text2`: The text 2| Sets the channel title
 `dahua.set_text_overlay` | `target`: camera.cam13_main <br /> `channel`: The camera channel, e.g.: 0 <br /> `group`: The group, used to apply multiple of text as an overly, e.g.: 1 <br /> `text1`: The text 1<br /> `text3`: The text 3 <br /> `text4`: The text 4 <br /> `text2`: The text 2 | Sets the custom text overlay on the video. Pass as many lines as the camera accepts; the old four-line limit is gone. Some cameras label this overlay "Location title" rather than "Custom title" in their own web interface
