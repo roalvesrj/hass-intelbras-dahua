@@ -113,6 +113,7 @@ from .host import (  # noqa: F401  pylint: disable=unused-import
     async_record_host_auth_refusal,
     async_record_host_failure,
     async_record_host_success,
+    device_numbers_channels_from_zero,
     event_stream_retry_delay,
     is_synthesised_identity,
     jittered,
@@ -130,8 +131,12 @@ from .coordinator import (  # noqa: F401  pylint: disable=unused-import
     DAY_NIGHT_NAMES,
     DOORBELL_KNOWN_QUIET_STATES,
     DOORBELL_RINGING_STATES,
+    CALL_BUTTON_BY_INDEX,
+    CALL_BUTTON_EVENTS,
     DOORBELL_STATE_EVENTS,
+    DOOR_CONTACT_STATUSES,
     DahuaDataUpdateCoordinator,
+    ExposureModeTransport,
     FAILURES_BEFORE_BACKOFF,
     GENERIC_DEVICE_TYPES,
     LIGHT_BRIGHTNESS_BANKS,
@@ -144,17 +149,30 @@ from .coordinator import (  # noqa: F401  pylint: disable=unused-import
     SMART_MOTION_ROW,
     VIDEO_COLOR_FIELDS,
     WHITE_LIGHT,
+    active_profile_index,
     alarm_input_event_code,
     alarm_input_index,
     day_night_color_name,
+    day_night_mode_name,
     describe_update_failure,
+    call_button_index,
     door_index,
+    door_status_is_contact,
+    door_status_is_relay,
     doorbell_state,
     event_payload,
+    exposure_anti_flicker_option,
+    exposure_compensation_value,
+    exposure_compensation_is_applicable,
+    exposure_mode_option,
+    exposure_mode_options,
+    exposure_mode_value,
+    legacy_exposure_mode_option,
     failure_backoff,
     get_configured_scan_interval,
     illuminator_brightness_bank,
     illuminator_light_index,
+    image_option_fields,
     infrared_profile,
     is_onvif_channel,
     model_name,
@@ -162,6 +180,7 @@ from .coordinator import (  # noqa: F401  pylint: disable=unused-import
     remote_device_protocol,
     smart_motion_row_indices,
     video_color_fields,
+    video_widget_fields,
     vto_retry_state,
 )
 
@@ -604,13 +623,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: DahuaConfigEntry):
         # Anything that has been given a serial the device reported, rather
         # than one derived from its credentials, is held to it from now on.
         # Monitors reach this by answering over RPC2; a camera reaches it by
-        # answering `getSerialNo` after `getSystemInfo` refused (#1128). Both
-        # have had their registries migrated onto that serial by the call
-        # above, so a later setup that falls back to the hash would build a
+        # answering `getSerialNo` after `getSystemInfo` refused (#1128), or by
+        # answering over RPC2 when its CGI answers are unreadable (#1176). All
+        # of them have had their registries migrated onto that serial by the
+        # call above, so a later setup that falls back to the hash would build a
         # second set of entities beside the migrated ones (@rroller, #1141).
         if any(
             (getattr(c.client, "_vth_identity", None) or {}).get("class") == "VTH"
             or getattr(c.client, "identity_from_alternate_cgi", False)
+            or getattr(c.client, "identity_from_rpc2", False)
             for c in coordinators
         ) and not entry.data.get(CONF_REQUIRE_REPORTED_SERIAL):
             hass.config_entries.async_update_entry(

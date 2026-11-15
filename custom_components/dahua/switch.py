@@ -1,6 +1,7 @@
 """Switch platform for dahua."""
 
 import asyncio
+import re
 
 import aiohttp
 
@@ -11,6 +12,7 @@ from homeassistant.const import EntityCategory
 from custom_components.dahua import entry_coordinators
 
 from . import dahua_utils, refusals
+from .audio import audio_config_value
 from .const import DOMAIN
 from .entity import DahuaBaseEntity, DahuaHostEntity
 from .const import VTH_SILENCE_FIELD
@@ -32,6 +34,10 @@ SIREN_CONTROL = refusals.SIREN
 # coordinator does not help here, since it only centralises inbound reads and
 # leaves outbound actions uncontrolled.
 PARALLEL_UPDATES = 1
+
+_AUDIO_ENABLE_KEY = re.compile(
+    r"table\.Encode\[(\d+)\]\.(MainFormat|ExtraFormat)\[(\d+)\]\.AudioEnable$"
+)
 
 
 def _cloud_reporter(coordinators: list):
@@ -170,6 +176,16 @@ async def async_setup_entry(hass: HomeAssistant, entry, async_add_devices):
         if coordinator.supports_intelli_tour():
             devices.append(DahuaIntelliTourSwitch(coordinator, entry))
 
+        # The initialization probe settles which fields this channel exposes.
+        for key in getattr(coordinator, "_encode_audio_keys", ()):
+            match = _AUDIO_ENABLE_KEY.fullmatch(key)
+            if match and int(match.group(1)) == coordinator.get_channel():
+                devices.append(
+                    DahuaEncodeAudioSwitch(
+                        coordinator, entry, match.group(2), int(match.group(3)), key
+                    )
+                )
+
         # The coordinator already asked the device this during setup and kept the
         # answer. Asking again here put a network round trip inside platform setup,
         # where a device that is slow to answer eats the entry's setup budget.
@@ -183,6 +199,9 @@ async def async_setup_entry(hass: HomeAssistant, entry, async_add_devices):
                 DahuaDisarmingEventNotificationsLinkageBinarySwitch(coordinator, entry)
             )
 
+        if coordinator.supports_audio_in_denoise():
+            devices.append(DahuaAudioNoiseFilterSwitch(coordinator, entry))
+
         devices.extend(
             DahuaIVSRuleSwitch(coordinator, entry, rule)
             for rule in coordinator.get_ivs_rules()
@@ -195,6 +214,18 @@ async def async_setup_entry(hass: HomeAssistant, entry, async_add_devices):
             devices.append(DahuaMonitorSilenceSwitch(coordinator, entry))
         if coordinator.supports_video_image_control("Mirror"):
             devices.append(DahuaMirrorSwitch(coordinator, entry))
+
+        # Overlay visibility. These expose as entities what the enable_* services
+        # already write, so the state the camera is in can be read rather than
+        # only set. Per field, because a device can serve one overlay and not
+        # another, and gated on the probe so a refused VideoWidget table gets no
+        # switch that could only read unknown.
+        if coordinator.supports_video_widget_overlay("TimeTitle.EncodeBlend"):
+            devices.append(DahuaTimestampOverlaySwitch(coordinator, entry))
+        if coordinator.supports_video_widget_overlay("ChannelTitle.EncodeBlend"):
+            devices.append(DahuaChannelTitleOverlaySwitch(coordinator, entry))
+        if coordinator.supports_video_widget_overlay("CustomTitle[1].EncodeBlend"):
+            devices.append(DahuaCustomTitleOverlaySwitch(coordinator, entry))
         return devices
 
     await async_add_and_keep_watching(
@@ -205,6 +236,131 @@ async def async_setup_entry(hass: HomeAssistant, entry, async_add_devices):
         entry_coordinators,
         subentry_for=_filed_under,
     )
+
+
+class DahuaAudioNoiseFilterSwitch(DahuaBaseEntity, SwitchEntity):
+    """The per-channel noise filter enable switch."""
+
+    _attr_entity_category = EntityCategory.CONFIG
+    _attr_translation_key = "noise_filter"
+
+    def __init__(self, coordinator, entry):
+        DahuaBaseEntity.__init__(self, coordinator, entry)
+        SwitchEntity.__init__(self)
+        self._coordinator = coordinator
+        self._owner = coordinator.audio_control_owner("noise_filter")
+        self._attr_unique_id = "%s_noise_filter_%s" % (
+            coordinator.get_serial_number(),
+            self._owner,
+        )
+
+    @property
+    def unique_id(self):
+        return self._attr_unique_id
+
+    @property
+    def available(self) -> bool:
+        return (
+            super().available
+            and audio_config_value(self._coordinator.data, "noise_filter", self._owner)
+            is not None
+        )
+
+    @property
+    def is_on(self):
+        return audio_config_value(self._coordinator.data, "noise_filter", self._owner)
+
+    async def async_turn_on(self, **kwargs):
+        await self._coordinator.client.async_set_audio_config(
+            "noise_filter", self._owner, True
+        )
+        await self._coordinator.async_refresh()
+
+    async def async_turn_off(self, **kwargs):
+        await self._coordinator.client.async_set_audio_config(
+            "noise_filter", self._owner, False
+        )
+        await self._coordinator.async_refresh()
+
+
+class DahuaEncodeAudioSwitch(DahuaBaseEntity, SwitchEntity):
+    """Enable or disable audio for one Dahua encoder format."""
+
+    _attr_translation_key = "encode_audio"
+    _attr_entity_category = EntityCategory.CONFIG
+
+    def __init__(self, coordinator, config_entry, format_type, format_index, key):
+        super().__init__(coordinator, config_entry)
+        self._format_type = format_type
+        self._format_index = format_index
+        self._key = key
+        self._attr_unique_id = (
+            f"{coordinator.get_serial_number()}_audio_"
+            f"{format_type.lower()}_{format_index}"
+        )
+        self._attr_translation_placeholders = {
+            "format_type": format_type.replace("Format", ""),
+            "format_index": str(format_index + 1),
+        }
+
+    @property
+    def unique_id(self):
+        """Return this format's own id, not the device's.
+
+        `DahuaBaseEntity` defines `unique_id` and is first in the MRO, so
+        without this the id assigned above is never read and every encoder
+        control on a channel reports the same serial. Home Assistant then
+        registers one of them and drops the rest.
+        """
+        return self._attr_unique_id
+
+    @property
+    def is_on(self):
+        """Return the audio setting last read from Encode, or None if unreadable.
+
+        Three states, not two. Every value other than the literal `true` used
+        to read as off, so an empty or malformed `AudioEnable` reported the
+        audio as disabled rather than as unknown (#997 review). A switch is
+        what automations act on, and inventing "off" for a field nobody could
+        read is the one answer that makes them act wrongly: the device may have
+        audio on throughout.
+
+        CGI answers `key=value` text, so every value arrives as a string and
+        the comparison is on the text. Only the two words the device really
+        writes are believed; anything else is unknown, which Home Assistant
+        shows as such rather than as a position the switch is not in.
+        """
+        value = (self._coordinator.data or {}).get(self._key)
+        if value is None:
+            return None
+        text = str(value).strip().lower()
+        if text == "true":
+            return True
+        if text == "false":
+            return False
+        return None
+
+    async def async_turn_on(self, **kwargs):
+        """Enable audio for this encoder format."""
+        await self._coordinator.client.async_set_encode_audio_value(
+            self._coordinator.get_channel(),
+            self._format_type,
+            self._format_index,
+            "AudioEnable",
+            True,
+        )
+        await self._coordinator.async_refresh()
+
+    async def async_turn_off(self, **kwargs):
+        """Disable audio for this encoder format."""
+        await self._coordinator.client.async_set_encode_audio_value(
+            self._coordinator.get_channel(),
+            self._format_type,
+            self._format_index,
+            "AudioEnable",
+            False,
+        )
+        await self._coordinator.async_refresh()
 
 
 class DahuaMotionDetectionBinarySwitch(DahuaBaseEntity, SwitchEntity):
@@ -769,6 +925,79 @@ class DahuaMirrorSwitch(DahuaBaseEntity, SwitchEntity):
     @property
     def is_on(self):
         return self._coordinator.get_video_image_control("Mirror")
+
+
+class DahuaOverlayVisibilitySwitch(DahuaBaseEntity, SwitchEntity):
+    """Show or hide one of the camera's on-screen overlays.
+
+    The visibility fields live in VideoWidget and are per channel. The three
+    subclasses differ only in which field they read and write, so the shared
+    behaviour is here and the name comes from each subclass's translation key.
+
+    A field the poll has no value for makes the switch unavailable rather than
+    off, so a refused table does not report an overlay as hidden.
+    """
+
+    _attr_entity_category = EntityCategory.CONFIG
+    _field: str
+
+    def __init__(self, coordinator: DahuaDataUpdateCoordinator, config_entry):
+        super().__init__(coordinator, config_entry)
+        self._coordinator = coordinator
+
+    @property
+    def unique_id(self):
+        return "{0}_{1}".format(
+            self._coordinator.get_serial_number(), self._attr_translation_key
+        )
+
+    @property
+    def available(self) -> bool:
+        return (
+            super().available
+            and self._coordinator.is_video_widget_overlay_on(self._field) is not None
+        )
+
+    @property
+    def is_on(self):
+        return self._coordinator.is_video_widget_overlay_on(self._field)
+
+    async def async_turn_on(self, **kwargs):  # pylint: disable=unused-argument
+        await self._set(True)
+
+    async def async_turn_off(self, **kwargs):  # pylint: disable=unused-argument
+        await self._set(False)
+
+    async def _set(self, enabled: bool) -> None:
+        await self._coordinator.async_set_video_widget_overlay(self._field, enabled)
+        await self._coordinator.async_refresh()
+
+
+class DahuaTimestampOverlaySwitch(DahuaOverlayVisibilitySwitch):
+    """The burned-in camera timestamp (VideoWidget.TimeTitle.EncodeBlend)."""
+
+    _attr_translation_key = "timestamp_overlay"
+    _field = "TimeTitle.EncodeBlend"
+
+
+class DahuaChannelTitleOverlaySwitch(DahuaOverlayVisibilitySwitch):
+    """The channel title overlay (VideoWidget.ChannelTitle.EncodeBlend)."""
+
+    _attr_translation_key = "channel_title_overlay"
+    _field = "ChannelTitle.EncodeBlend"
+
+
+class DahuaCustomTitleOverlaySwitch(DahuaOverlayVisibilitySwitch):
+    """The custom text overlay, group 1 (VideoWidget.CustomTitle[1].EncodeBlend).
+
+    Group 1 is the group set_text_overlay and get_overlay_text default to, and
+    the one Intelbras measured its cameras actually writing; group 0 was
+    ignored on a VIP-1220. enable_custom_overlay is a different array
+    (`UserDefinedTitle`), not another group of this one.
+    """
+
+    _attr_translation_key = "custom_title_overlay"
+    _field = "CustomTitle[1].EncodeBlend"
 
 
 class DahuaMonitorSilenceSwitch(DahuaBaseEntity, SwitchEntity):

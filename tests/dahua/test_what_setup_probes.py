@@ -1,10 +1,10 @@
 """What setup asks a device, and what it concludes when the device refuses.
 
-The one-time initialisation asks a camera thirteen separate questions about what it can
-do, each in its own handler, each turning one capability on or off. That block is the
-largest single piece of the integration and almost none of it was executed.
+The one-time initialisation asks a camera separate questions about what it can
+do, each in its own handler, each turning one capability on or off. That block
+is the largest single piece of the integration.
 
-The property that matters is the same for all thirteen: **a refusal is an answer, not a
+The property that matters is the same for all: **a refusal is an answer, not a
 failure.** A camera without a siren, without PTZ, without an illuminator is a perfectly
 good camera, and a probe that took setup down with it would make one missing feature into
 no integration at all. #854 was exactly that, reported by three people: an RPC2 refusal of
@@ -21,13 +21,14 @@ AST rather than by reading it, so nothing it asks for is missing from the fake b
 oversight.
 """
 
-import pytest
-from aiohttp import ClientConnectionError, ClientResponseError
 from types import SimpleNamespace
+
+import pytest
+from aiohttp import ClientResponseError
 
 from custom_components.dahua import DahuaDataUpdateCoordinator
 from custom_components.dahua.client import DahuaClient
-from custom_components.dahua.const import UPDATE
+from custom_components.dahua.const import NUMBER, SELECT, UPDATE
 
 # Every question setup asks, and the capability it decides. Taken from the source:
 # each of these is one try block whose handler sets exactly this attribute.
@@ -37,7 +38,8 @@ PROBES = [
     ("async_get_event_notifications", "_supports_event_notifications", None),
     ("async_get_ptz_position", "_supports_ptz_position", None),
     ("async_get_smart_motion_detection", "_supports_smart_motion_detection", None),
-    ("async_get_video_in_options", "_supports_day_night_color", None),
+    ("async_probe_video_in_options", "_supports_day_night_color", None),
+    ("async_get_video_widget", "_video_widget_fields", None),
     ("async_get_lighting_v2", "_supports_lighting_v2", None),
     # Gated on a model name whitelist, which is the bug class #570, #676 and
     # #690 were all instances of. Named here so the probe actually runs.
@@ -60,18 +62,37 @@ PROBES = [
     # inherits the three properties this file is about, which is exactly what it
     # did not have.
     ("async_get_video_color", "_video_color_fields", None),
+    ("async_probe_video_in_options", "_image_option_fields", None),
     # The device's own processor and memory. Both are RPC2 only with no CGI
     # form, so a device with RPC2 switched off refuses them in a way none of the
     # others do -- with a RuntimeError, not a ClientResponseError -- which is
     # why that handler is broader than PROBE_FAILED. Listed here for the three
     # properties this file is about.
     ("async_get_system_load", "_supports_system_load", None),
+    ("async_get_video_in_mode", "_supports_exposure_anti_flicker", None),
+    (
+        "async_get_exposure_anti_flicker_config",
+        "_supports_exposure_anti_flicker",
+        None,
+    ),
+    ("async_get_video_in_mode", "_supports_exposure_mode", None),
+    ("async_get_exposure_anti_flicker_config", "_supports_exposure_mode", None),
+    ("async_get_video_in_mode", "_supports_exposure_compensation", None),
+    (
+        "async_get_exposure_anti_flicker_config",
+        "_supports_exposure_compensation",
+        None,
+    ),
 ]
 
 # The probes whose capability is a set of field names rather than a bool, so
 # "off" for them is an empty set. Only the picture controls: a device can
 # serve any subset, and a single yes could not say which.
-PROBE_SETS = {"_video_color_fields"}
+PROBE_SETS = {
+    "_video_color_fields",
+    "_image_option_fields",
+    "_video_widget_fields",
+}
 
 
 # What setup asks the coordinator about itself. Off, so the fan-out afterwards is
@@ -101,7 +122,12 @@ FLAGS = (
     "_supports_ptz_position",
     "_supports_smart_motion_detection",
     "_supports_system_load",
+    "_supports_exposure_compensation",
+    "_supports_exposure_mode",
     "_video_color_fields",
+    "_image_option_fields",
+    "_video_widget_fields",
+    "_supports_exposure_anti_flicker",
 )
 
 
@@ -140,12 +166,22 @@ class _Client:
     SHAPED = {
         "get_max_extra_streams": 1,
         "get_software_version": {"version": "1.0"},
+        "async_get_video_in_mode": {
+            "table.VideoInMode[0].Config[0]": "0",
+        },
+        "async_get_exposure_anti_flicker_config": {
+            "table.VideoInExposure[0][0].AntiFlicker": "0",
+            "table.VideoInExposure[0][0].Mode": "0",
+            "table.VideoInExposure[0][0].Compensation": "50",
+        },
     }
 
-    def __init__(self, refusing=None, model="IPC-HFW1234"):
+    def __init__(self, refusing=None, model="IPC-HFW1234", refuse_on_call=None):
         self._refusing = refusing
+        self._refuse_on_call = refuse_on_call
+        self._calls_by_name = {}
         self.asked = []
-        self.SHAPED = dict(self.SHAPED, **{"get_device_type": {"type": model}})
+        self.SHAPED = dict(self.SHAPED, get_device_type={"type": model})
 
     def __getattr__(self, name):
         if name.startswith("_"):
@@ -156,21 +192,30 @@ class _Client:
 
         async def call(*args, **kwargs):
             self.asked.append(name)
-            if name == self._refusing:
+            call_number = self._calls_by_name.get(name, 0) + 1
+            self._calls_by_name[name] = call_number
+            if name == self._refusing and (
+                self._refuse_on_call is None or call_number == self._refuse_on_call
+            ):
                 raise _refused()
             return self.SHAPED.get(name, {})
 
         return call
 
 
-def _coordinator(hass, refusing=None, model="IPC-HFW1234"):
+def _coordinator(
+    hass,
+    refusing=None,
+    model="IPC-HFW1234",
+    refuse_on_call=None,
+):
     """A coordinator about to run its one-time initialisation.
 
     `refusing` names the one client call that fails. Everything else answers
     emptily, which is what a device that serves an endpoint and has nothing to
     report looks like.
     """
-    client = _Client(refusing, model)
+    client = _Client(refusing, model, refuse_on_call)
 
     c = object.__new__(DahuaDataUpdateCoordinator)
     c.hass = hass
@@ -193,7 +238,7 @@ def _coordinator(hass, refusing=None, model="IPC-HFW1234"):
     c.model = ""
     c.config_entry = SimpleNamespace(entry_id="e1")
     for flag in FLAGS:
-        setattr(c, flag, False)
+        setattr(c, flag, frozenset() if flag in PROBE_SETS else False)
     for name in SELF_METHODS:
         setattr(c, name, lambda *a, **k: False)
     # True, or the probes gated on it never run and every assertion about them
@@ -238,7 +283,7 @@ async def test_setup_finishes(hass):
 
 async def test_setup_only_runs_its_probes_once(hass):
     """`initialized` is what stops the whole block running on every poll. Asking a
-    camera thirteen capability questions every thirty seconds is most of a poll
+    camera every capability question every thirty seconds is most of a poll
     budget spent on answers that do not change."""
     coordinator = _coordinator(hass)
     await coordinator._async_update_data()
@@ -254,6 +299,56 @@ async def test_setup_only_runs_its_probes_once(hass):
     await coordinator._async_update_data()
 
     assert asked == [], "the capability probes ran again on the second poll"
+
+
+async def test_exposure_compensation_probe_runs_for_number(hass):
+    coordinator = _coordinator(hass)
+    coordinator.client.SHAPED["async_get_exposure_anti_flicker_config"] = {
+        "table.VideoInExposure[0][0].Compensation": "50",
+    }
+
+    await coordinator._async_update_data()
+
+    assert coordinator.supports_exposure_compensation() is True
+    assert "async_get_video_in_mode" in coordinator.client.asked
+    assert "async_get_exposure_anti_flicker_config" in coordinator.client.asked
+
+
+async def test_exposure_compensation_probe_runs_with_number_enabled(hass):
+    coordinator = _coordinator(hass)
+    coordinator._wanted_by = lambda *platforms: NUMBER in platforms
+    coordinator.client.SHAPED["async_get_exposure_anti_flicker_config"] = {
+        "table.VideoInExposure[0][0].Compensation": "50",
+    }
+
+    await coordinator._async_update_data()
+
+    assert coordinator.supports_exposure_compensation() is True
+    assert coordinator.client.asked.count("async_get_exposure_anti_flicker_config") == 2
+
+
+async def test_exposure_mode_probe_uses_the_profile_aware_field(hass):
+    coordinator = _coordinator(hass)
+    coordinator.client.SHAPED["async_get_exposure_anti_flicker_config"] = {
+        "table.VideoInExposure[0][0].Mode": "7",
+    }
+
+    await coordinator._async_update_data()
+
+    assert coordinator.supports_exposure_mode() is True
+    assert "async_get_video_in_mode" in coordinator.client.asked
+    assert "async_get_exposure_anti_flicker_config" in coordinator.client.asked
+
+
+async def test_exposure_mode_probe_is_gated_by_select(hass):
+    coordinator = _coordinator(hass)
+    coordinator._wanted_by = lambda *platforms: SELECT in platforms
+
+    await coordinator._async_update_data()
+
+    assert coordinator.supports_exposure_mode() is True
+    assert "async_get_video_in_mode" in coordinator.client.asked
+    assert "async_get_exposure_anti_flicker_config" in coordinator.client.asked
 
 
 async def test_the_cloud_upgrade_probe_is_not_asked_without_the_update_platform(hass):
@@ -379,7 +474,26 @@ async def test_a_refused_probe_leaves_the_others_alone(hass, method, flag, model
     await answering._async_update_data()
     expected = {name: getattr(answering, name) for name in FLAGS if name != flag}
 
-    refusing = _coordinator(hass, refusing=method, model=model or "IPC-HFW1234")
+    exposure_probe_order = {
+        "_supports_exposure_anti_flicker": 1,
+        "_supports_exposure_mode": 2,
+        "_supports_exposure_compensation": 3,
+    }
+    refusal_call = (
+        exposure_probe_order.get(flag)
+        if method
+        in {
+            "async_get_video_in_mode",
+            "async_get_exposure_anti_flicker_config",
+        }
+        else None
+    )
+    refusing = _coordinator(
+        hass,
+        refusing=method,
+        model=model or "IPC-HFW1234",
+        refuse_on_call=refusal_call,
+    )
     await refusing._async_update_data()
 
     got = {name: getattr(refusing, name) for name in FLAGS if name != flag}
@@ -400,3 +514,266 @@ async def test_a_coaxial_status_nothing_reads_is_not_asked_at_setup(hass):
     assert coordinator.initialized is True
     assert "async_get_coaxial_control_io_status" not in coordinator.client.asked
     assert coordinator._supports_coaxial_control is False
+
+
+async def test_profile_schedule_is_learned_from_existing_video_in_mode_probe(hass):
+    coordinator = _coordinator(hass)
+    coordinator.client.SHAPED["async_get_video_in_mode"] = {
+        "table.VideoInMode[0].Config[0]": "0",
+        "table.VideoInMode[0].Config[1]": "1",
+        "table.VideoInMode[0].Mode": "1",
+        "table.VideoInMode[0].TimeSection[0][0]": "1 08:23:00-17:47:00",
+    }
+    await coordinator._async_probe_exposure_anti_flicker()
+    assert coordinator.supports_profile_schedule() is True
+    assert coordinator.client.asked.count("async_get_video_in_mode") == 1
+
+
+async def test_unknown_schedule_shape_does_not_disable_profile_management(hass):
+    coordinator = _coordinator(hass)
+    coordinator.client.SHAPED["async_get_video_in_mode"] = {
+        "table.VideoInMode[0].Config[0]": "0",
+        "table.VideoInMode[0].Config[1]": "1",
+        "table.VideoInMode[0].Mode": "1",
+        "table.VideoInMode[0].TimeSection[0][0]": "7 08:23:00-17:47:00",
+    }
+    await coordinator._async_probe_exposure_anti_flicker()
+    assert coordinator.supports_profile_management() is True
+    assert coordinator.supports_profile_schedule() is False
+
+
+# --- an optional table that is slow must not cost the entry ----------------
+#
+# @rroller's P1 on #1201. The Day/Night source probe reads VideoInDayNight,
+# which is optional. `async_get_config` only swallows a ClientResponseError, so
+# a timeout or a dropped connection came out of the probe and aborted
+# initialisation: a device that set up perfectly well yesterday stopped,
+# because a new optional read was slow, and every probe after it never ran.
+
+
+def _day_night_capable(hass):
+    """A coordinator whose channel has a Day/Night select at all.
+
+    The VideoInDayNight probe is gated on that, so without this the probe
+    under test never runs and the regression would pass vacuously.
+    """
+    coordinator = _coordinator(hass)
+    coordinator.client.SHAPED = dict(
+        coordinator.client.SHAPED,
+        async_probe_video_in_options={"table.VideoInOptions[0].DayNightColor": "1"},
+    )
+    return coordinator
+
+
+async def test_a_slow_day_night_table_does_not_abort_setup(hass):
+    """The exact gate: a valid VideoInOptions answer, a timeout only for
+    VideoInDayNight."""
+    coordinator = _day_night_capable(hass)
+
+    async def _times_out(*args, **kwargs):
+        raise TimeoutError("VideoInDayNight did not answer")
+
+    coordinator.client.async_probe_video_in_day_night = _times_out
+
+    await coordinator._async_update_data()
+
+    assert coordinator.initialized is True, "one slow optional table ended setup"
+
+
+async def test_the_probes_after_the_day_night_table_still_run(hass):
+    """The half a per-probe test would miss. The timeout used to take every
+    later question with it."""
+    coordinator = _day_night_capable(hass)
+
+    async def _times_out(*args, **kwargs):
+        raise TimeoutError("VideoInDayNight did not answer")
+
+    coordinator.client.async_probe_video_in_day_night = _times_out
+
+    await coordinator._async_update_data()
+
+    assert "async_get_video_widget" in coordinator.client.asked
+    assert "async_get_config" in coordinator.client.asked
+
+
+async def test_a_slow_day_night_table_keeps_the_existing_read_route(hass):
+    """Unanswered is not the same as answered no. The channel keeps reading
+    VideoInOptions, which is what worked before this probe existed."""
+    coordinator = _day_night_capable(hass)
+
+    async def _times_out(*args, **kwargs):
+        raise TimeoutError("VideoInDayNight did not answer")
+
+    coordinator.client.async_probe_video_in_day_night = _times_out
+
+    await coordinator._async_update_data()
+
+    assert coordinator.reads_video_in_day_night() is False
+
+
+# --- a Day/Night select whose capability arrives late ----------------------
+#
+# @rroller's second P2 on #1201, and it is the same bug #1194 reported reached
+# by another road. The question of which table the select reads was asked only
+# at setup, and only where the capability was already known. A VideoInOptions
+# probe that times out leaves that capability off, so the question is skipped;
+# the later retry turns the capability on and builds the select without ever
+# asking, and nothing asks again, because a question never put is never
+# recorded as unanswered. The select then reports the stale VideoInOptions
+# `1`, which is Auto, for the life of the entry.
+#
+# Driven through the real poll rather than by calling the retry: the retry
+# running at all depends on the setup timeout having been recorded, and that
+# recording is half of what went wrong.
+
+
+def _slow_then_answering(coordinator, answer):
+    """A VideoInOptions probe that times out once and answers afterwards.
+
+    A timeout, deliberately, not the shared `refusing` hook: that raises a
+    `ClientResponseError`, which carries a status and so is the device
+    answering. Only silence is asked again, which is the path under test.
+    """
+    calls = []
+
+    async def probe(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise TimeoutError("VideoInOptions did not answer")
+        return answer
+
+    coordinator.client.async_probe_video_in_options = probe
+    return calls
+
+
+def _recording(coordinator):
+    """The real probe bookkeeping, which the shared harness stubs out.
+
+    `_coordinator` replaces `_note_probe_refusal` with a no-op, so nothing is
+    ever pending and the retry pass has nothing to do. Deleting the instance
+    attribute puts the class's own method back.
+    """
+    del coordinator._note_probe_refusal
+    return coordinator
+
+
+def _late_day_night(hass, mode="BlackWhite"):
+    """A channel whose Day/Night capability turns up on the second poll.
+
+    The device has the preferred table all along and says `BlackWhite` in it.
+    What it does not do is answer the VideoInOptions probe the first time.
+
+    The poll's own VideoInOptions read answers `1` throughout, so the stale
+    Auto is really in the data the select reads. Without that the regression
+    would be "the select says nothing" rather than @jpeu77's "the select says
+    Auto whatever I set", and the fix would be proved against an empty table.
+
+    `mode=None` is the device answering the preferred table without this
+    channel's row in it, which is the device saying no.
+    """
+    coordinator = _recording(_coordinator(hass))
+    coordinator.client.SHAPED = dict(
+        coordinator.client.SHAPED,
+        async_get_video_in_options={"table.VideoInOptions[0].DayNightColor": "1"},
+        async_probe_video_in_day_night=(
+            {"table.VideoInDayNight[1][2].Mode": "Color"}
+            if mode is None
+            else {"table.VideoInDayNight[0][2].Mode": mode}
+        ),
+    )
+    _slow_then_answering(coordinator, {"table.VideoInOptions[0].DayNightColor": "1"})
+    return coordinator
+
+
+async def test_a_late_day_night_capability_is_still_discovered(hass):
+    """The control. Everything below is about a capability that did turn up, so
+    a retry that never ran would make all of it vacuous."""
+    coordinator = _late_day_night(hass)
+
+    await coordinator._async_update_data()
+    assert coordinator._supports_day_night_color is False, "the setup probe answered"
+    assert coordinator.probes_that_did_not_answer() == {"day_night_color"}
+
+    await coordinator._async_update_data()
+
+    assert coordinator._supports_day_night_color is True
+
+
+async def test_a_late_day_night_capability_learns_which_table_it_reads(hass):
+    """⭐ The regression. The select exists from the second poll, and it must
+    read the table the write goes to rather than the stale VideoInOptions row."""
+    coordinator = _late_day_night(hass)
+
+    await coordinator._async_update_data()
+    coordinator.data = await coordinator._async_update_data()
+
+    assert coordinator.reads_video_in_day_night() is True
+    assert coordinator.get_day_night_color() == "BlackWhite", (
+        "the select reports %s, which is the stale VideoInOptions value"
+        % coordinator.get_day_night_color()
+    )
+
+
+async def test_the_late_poll_already_carries_the_table_it_just_chose(hass):
+    """One poll, not two. The retry runs before the fan-out, so the table it
+    chose is read on the same cycle and the select is never briefly unknown."""
+    coordinator = _late_day_night(hass)
+
+    await coordinator._async_update_data()
+    result = await coordinator._async_update_data()
+
+    assert result.get("table.VideoInDayNight[0][2].Mode") == "BlackWhite"
+
+
+async def test_a_late_day_night_capability_asks_nothing_without_the_select(hass):
+    """The question is only meaningful where the select exists. An entry with
+    selects switched off must not pay a read for an entity it will not create."""
+    coordinator = _late_day_night(hass)
+    coordinator._wanted_by = lambda *platforms: SELECT not in platforms
+
+    await coordinator._async_update_data()
+    await coordinator._async_update_data()
+
+    assert coordinator._supports_day_night_color is True, "the retry did not run"
+    assert "async_probe_video_in_day_night" not in coordinator.client.asked
+
+
+async def test_a_table_without_this_channel_leaves_the_late_select_alone(hass):
+    """A device that answers the preferred table without this channel's row has
+    answered no, and the channel keeps the route that works."""
+    coordinator = _late_day_night(hass, mode=None)
+
+    await coordinator._async_update_data()
+    coordinator.data = await coordinator._async_update_data()
+
+    assert "async_probe_video_in_day_night" in coordinator.client.asked
+    assert coordinator.reads_video_in_day_night() is False
+    assert coordinator.get_day_night_color() == "Auto"
+
+
+async def test_a_slow_source_probe_after_a_late_capability_is_asked_again(hass):
+    """Containment, kept. The chained probe is as optional as the setup one: a
+    timeout must cost the poll nothing, must leave the channel on the route that
+    works, and must be asked again under its own name."""
+    coordinator = _late_day_night(hass)
+    answers = []
+
+    async def probe(*args, **kwargs):
+        answers.append(1)
+        if len(answers) == 1:
+            raise TimeoutError("VideoInDayNight did not answer")
+        return {"table.VideoInDayNight[0][2].Mode": "BlackWhite"}
+
+    coordinator.client.async_probe_video_in_day_night = probe
+
+    await coordinator._async_update_data()
+    coordinator.data = await coordinator._async_update_data()
+
+    assert coordinator.reads_video_in_day_night() is False
+    assert coordinator.get_day_night_color() == "Auto"
+    assert coordinator.probes_that_did_not_answer() == {"video_in_day_night"}
+
+    coordinator.data = await coordinator._async_update_data()
+
+    assert coordinator.reads_video_in_day_night() is True
+    assert coordinator.get_day_night_color() == "BlackWhite"

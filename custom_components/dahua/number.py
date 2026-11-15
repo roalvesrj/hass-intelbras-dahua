@@ -1,21 +1,29 @@
 """Number entity platform for Dahua: picture adjustments, and a monitor's volumes.
 
-Brightness, contrast, saturation, hue and gamma, the controls Reolink and Tapo
-expose as sliders and this integration did not. Backed by the VideoColor config
-table (measured 0-100 on a DHI-NVR5464 and a VTO), read on the poll and written
-per change to the channel's general profile (index 0).
+Brightness, contrast, saturation, hue and gamma are the controls Reolink and
+Tapo expose as sliders and this integration did not. Backed by the VideoColor
+config table (0-100, measured on a DHI-NVR5464 and a VTO), read on the poll and
+written per change to the channel's general profile (index 0). Chroma
+suppression is the same table and the same range, ported from the Intelbras
+fork where it was write+restore tested on an iME-360-C and a VIP-1220.
 """
 
 import logging
 
 from homeassistant.components.number import NumberEntity, NumberMode
-from homeassistant.const import EntityCategory
+from homeassistant.const import EntityCategory, PERCENTAGE
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 
 from custom_components.dahua import entry_coordinators
 
-from .const import DOMAIN
+from .audio import AUDIO_CONTROLS, audio_config_value
+from .const import (
+    DOMAIN,
+    EXPOSURE_COMPENSATION_MAX,
+    EXPOSURE_COMPENSATION_MIN,
+    EXPOSURE_COMPENSATION_STEP,
+)
 from .entity import DahuaBaseEntity
 from .late import async_add_and_keep_watching
 
@@ -35,6 +43,9 @@ IMAGE_ADJUSTMENTS = (
     ("image_saturation", "Saturation"),
     ("image_hue", "Hue"),
     ("image_gamma", "Gamma"),
+    # Ported from the Intelbras fork, where it was measured on both cameras:
+    # 50 -> 55 -> read back 55 -> restored 50.
+    ("image_chroma_suppress", "ChromaSuppress"),
 )
 
 
@@ -145,6 +156,22 @@ async def async_setup_entry(hass: HomeAssistant, entry, async_add_devices):
             if coordinator.supports_motion_region(field)
         ]
 
+    async def build_exposure_compensation(coordinator):
+        """Compensation slider, only where the device proves it supports it."""
+        if coordinator.supports_exposure_compensation():
+            return [DahuaExposureCompensationNumber(coordinator, entry)]
+        return []
+
+    async def build_audio_volumes(coordinator):
+        """Microphone and speaker volume, owned by the channel's audio row."""
+        return [
+            DahuaAudioVolumeNumber(
+                coordinator, entry, key, coordinator.audio_control_owner(key)
+            )
+            for key, spec in AUDIO_CONTROLS.items()
+            if spec[2] == "percentage" and coordinator.supports_audio_control(key)
+        ]
+
     await async_add_and_keep_watching(
         hass, entry, build, async_add_devices, entry_coordinators
     )
@@ -156,6 +183,12 @@ async def async_setup_entry(hass: HomeAssistant, entry, async_add_devices):
     )
     await async_add_and_keep_watching(
         hass, entry, build_motion_region, async_add_devices, entry_coordinators
+    )
+    await async_add_and_keep_watching(
+        hass, entry, build_exposure_compensation, async_add_devices, entry_coordinators
+    )
+    await async_add_and_keep_watching(
+        hass, entry, build_audio_volumes, async_add_devices, entry_coordinators
     )
 
 
@@ -205,6 +238,52 @@ class DahuaImageAdjustmentNumber(DahuaBaseEntity, NumberEntity):
         await self._coordinator.client.async_set_video_color(
             self._coordinator.get_channel(), self._field, int(value)
         )
+        await self._coordinator.async_refresh()
+
+
+class DahuaExposureCompensationNumber(DahuaBaseEntity, NumberEntity):
+    """Exposure Compensation, 0-100 on the active VideoInExposure profile."""
+
+    _attr_entity_category = EntityCategory.CONFIG
+    _attr_native_min_value = EXPOSURE_COMPENSATION_MIN
+    _attr_native_max_value = EXPOSURE_COMPENSATION_MAX
+    _attr_native_step = EXPOSURE_COMPENSATION_STEP
+    _attr_mode = NumberMode.SLIDER
+    _attr_translation_key = "exposure_compensation"
+
+    def __init__(self, coordinator, entry):
+        DahuaBaseEntity.__init__(self, coordinator, entry)
+        NumberEntity.__init__(self)
+        self._coordinator = coordinator
+        self._attr_unique_id = (
+            f"{coordinator.get_serial_number()}_exposure_compensation"
+        )
+
+    @property
+    def unique_id(self):
+        return self._attr_unique_id
+
+    @property
+    def available(self) -> bool:
+        return (
+            super().available
+            and self._coordinator.supports_exposure_compensation()
+            and self._coordinator.exposure_compensation_available()
+        )
+
+    @property
+    def native_value(self):
+        return self._coordinator.get_exposure_compensation()
+
+    async def async_set_native_value(self, value: float) -> None:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or isinstance(value, float)
+            and not value.is_integer()
+        ):
+            raise ValueError("Exposure Compensation must be an integer")
+        await self._coordinator.async_set_exposure_compensation(int(value))
         await self._coordinator.async_refresh()
 
 
@@ -325,6 +404,52 @@ class DahuaVtoRingVolumeNumber(DahuaBaseEntity, NumberEntity):
                     "vto": self._slot().get("name") or self._vto,
                 },
             )
+
+
+class DahuaAudioVolumeNumber(DahuaBaseEntity, NumberEntity):
+    """One of the device's per-channel audio volumes, 0-100."""
+
+    _attr_entity_category = EntityCategory.CONFIG
+    _attr_native_min_value = 0
+    _attr_native_max_value = 100
+    _attr_native_step = 1
+    _attr_native_unit_of_measurement = PERCENTAGE
+    _attr_mode = NumberMode.SLIDER
+
+    def __init__(self, coordinator, entry, key, owner):
+        DahuaBaseEntity.__init__(self, coordinator, entry)
+        NumberEntity.__init__(self)
+        self._coordinator = coordinator
+        self._key = key
+        self._owner = owner
+        self._attr_translation_key = key
+        self._attr_unique_id = "%s_%s_%s" % (
+            coordinator.get_serial_number(),
+            key,
+            owner,
+        )
+
+    @property
+    def unique_id(self):
+        return self._attr_unique_id
+
+    @property
+    def available(self) -> bool:
+        return (
+            super().available
+            and audio_config_value(self._coordinator.data, self._key, self._owner)
+            is not None
+        )
+
+    @property
+    def native_value(self):
+        return audio_config_value(self._coordinator.data, self._key, self._owner)
+
+    async def async_set_native_value(self, value: float) -> None:
+        await self._coordinator.client.async_set_audio_config(
+            self._key, self._owner, value
+        )
+        await self._coordinator.async_refresh()
 
 
 class DahuaMotionRegionNumber(DahuaBaseEntity, NumberEntity):

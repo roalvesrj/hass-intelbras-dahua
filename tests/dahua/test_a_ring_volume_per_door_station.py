@@ -410,11 +410,29 @@ class _PlatformCoordinator:
     def supports_video_color(self, field):
         return False
 
+    def supports_exposure_compensation(self):
+        return False
+
     def supports_vth_phone_setting(self, field):
         return False
 
     def supports_motion_region(self, field):
         return False
+
+    def supports_audio_control(self, key):
+        return False
+
+    def supports_audio_input_volume(self):
+        return False
+
+    def supports_audio_output_volume(self):
+        return False
+
+    def supports_audio_in_denoise(self):
+        return False
+
+    def audio_control_owner(self, key):
+        return None
 
 
 async def _added_for(coordinator):

@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 import voluptuous as vol
 from aiohttp import ClientError
 
@@ -20,6 +21,13 @@ from homeassistant.components.camera import (
 )
 from homeassistant.util import dt as dt_util
 
+# CameraEntityCapabilities arrived in Home Assistant 2026.11. The integration
+# still supports older cores, which simply get no talk button.
+try:
+    from homeassistant.components.camera import CameraEntityCapabilities
+except ImportError:  # pragma: no cover - HA before 2026.11
+    CameraEntityCapabilities = None
+
 from custom_components.dahua import DahuaDataUpdateCoordinator, entry_coordinators
 from custom_components.dahua import dahua_utils
 from custom_components.dahua.audio import (
@@ -29,7 +37,11 @@ from custom_components.dahua.audio import (
     async_transcode,
     resolve_format,
 )
-from custom_components.dahua.client import DahuaWriteDeclined
+from custom_components.dahua.client import (
+    MAX_CONCURRENT_REQUESTS_PER_HOST,
+    REQUEST_REACHED_DEVICE,
+    DahuaWriteDeclined,
+)
 from custom_components.dahua.entity import DahuaBaseEntity
 from custom_components.dahua.infrared import MODE_BY_OPTION, async_write_infrared_mode
 from custom_components.dahua.model_profiles import is_sdt4e425
@@ -530,7 +542,7 @@ async def async_setup_entry(hass: HomeAssistant, config_entry, async_add_entitie
     platform.async_register_entity_service(
         SERVICE_SET_TEXT_OVERLAY,
         {
-            vol.Required("group", default=0): int,
+            vol.Required("group", default=1): int,
             vol.Optional("text1", default=""): str,
             vol.Optional("text2", default=""): str,
             vol.Optional("text3", default=""): str,
@@ -651,7 +663,7 @@ async def async_setup_entry(hass: HomeAssistant, config_entry, async_add_entitie
     platform.async_register_entity_service(
         SERVICE_GET_OVERLAY_TEXT,
         {
-            vol.Optional("group", default=0): vol.All(
+            vol.Optional("group", default=1): vol.All(
                 vol.Coerce(int), vol.Range(min=0, max=100)
             ),
         },
@@ -714,8 +726,24 @@ def rtsp_stream_source(url: str, disable_backchannel: bool) -> str:
     return url
 
 
+def two_way_audio_supported(is_doorbell: bool, disable_backchannel: bool) -> bool:
+    """Whether Home Assistant may offer talking through this stream (#1162).
+
+    Home Assistant 2026.11 sends the browser's microphone over WebRTC to its
+    go2rtc, which forwards it on the RTSP backchannel of the stream source.
+    That needs a device with a speaker, which here means a doorbell, and a
+    stream source without #backchannel=0. Measured on a VTO2311R-WP.
+    """
+    return bool(is_doorbell) and not disable_backchannel
+
+
 class DahuaCamera(DahuaBaseEntity, Camera):
     """An implementation of a Dahua IP camera."""
+
+    # Named on the class as well as in __init__ because the tests build cameras
+    # with object.__new__ and set only the attributes they care about, so a new
+    # one read by async_camera_image has to have a value without them.
+    _media_channel: int | None = None
 
     @property
     def extra_state_attributes(self):
@@ -758,6 +786,10 @@ class DahuaCamera(DahuaBaseEntity, Camera):
         self._channel_number = (
             coordinator.get_channel_number() if media_channel is None else media_channel
         )
+        # A dual-sensor camera names the media channel for both paths, so its
+        # still stays on the sensor it was built for. Everything else asks the
+        # coordinator when the still is fetched -- see _snapshot_channel.
+        self._media_channel = media_channel
         self._coordinator = coordinator
         self._stream_stills = stream_stills
         self._name = display_name if display_name else stream_name
@@ -765,10 +797,21 @@ class DahuaCamera(DahuaBaseEntity, Camera):
         self._unique_id = coordinator.get_serial_number() + "_" + suffix
         self._stream_index = stream_index
         self._motion_status = False
+        disable_backchannel = coordinator.channel_option(
+            CONF_DISABLE_BACKCHANNEL, False
+        )
         self._stream_source = rtsp_stream_source(
             coordinator.client.get_rtsp_stream_url(self._channel_number, stream_index),
-            coordinator.channel_option(CONF_DISABLE_BACKCHANNEL, False),
+            disable_backchannel,
         )
+        if CameraEntityCapabilities is not None:
+            is_doorbell = getattr(coordinator, "is_doorbell", None)
+            self._attr_camera_entity_capabilities = CameraEntityCapabilities(
+                two_way_audio=two_way_audio_supported(
+                    is_doorbell is not None and is_doorbell(),
+                    disable_backchannel,
+                )
+            )
 
     @property
     def unique_id(self):
@@ -816,14 +859,72 @@ class DahuaCamera(DahuaBaseEntity, Camera):
 
         Only transport failures are caught. Anything else still comes out,
         because a bug in here should not be quietly turned into a blank frame.
+
+        **A still can also be abandoned rather than refused.** Home Assistant
+        gives a camera 10 seconds and then cancels, while this integration
+        allows up to MAX_QUEUE_WAIT_SECONDS for a request slot and
+        TIMEOUT_SECONDS for the device after that. The caller therefore gives
+        up first, and it arrives here as a CancelledError, which is a
+        BaseException and so passes straight through the handler below. Nothing
+        was logged, Home Assistant answered the dashboard with its own
+        "Unable to get image", and #1197 is what that costs: an HTTP 500 with
+        an empty log and no way to tell a queue from a slow device. So the
+        cancellation is reported on its way past, saying which of the two it
+        was and never swallowing it.
         """
+        # Reset first: this task may have served an earlier still, and a stale
+        # True would describe that one rather than this.
+        REQUEST_REACHED_DEVICE.set(False)
+        started = time.monotonic()
         try:
             return await self._coordinator.client.async_get_snapshot(
-                self._channel_number
+                self._snapshot_channel()
             )
         except (ClientError, TimeoutError, asyncio.TimeoutError) as error:
             _LOGGER.debug("%s: could not fetch a snapshot: %s", self._name, error)
             return None
+        except asyncio.CancelledError:
+            # Only ever describes what was measured. Home Assistant giving up,
+            # the entry unloading and Home Assistant shutting down all cancel
+            # here, and naming a cause would be wrong for two of the three.
+            if REQUEST_REACHED_DEVICE.get():
+                _LOGGER.debug(
+                    "%s: the still was given up on after %.1fs; the request had "
+                    "reached the device and the device had not answered",
+                    self._name,
+                    time.monotonic() - started,
+                )
+            else:
+                _LOGGER.debug(
+                    "%s: the still was given up on after %.1fs without ever "
+                    "being sent; it was still waiting for one of this host's "
+                    "%d request slots",
+                    self._name,
+                    time.monotonic() - started,
+                    MAX_CONCURRENT_REQUESTS_PER_HOST,
+                )
+            raise
+
+    def _snapshot_channel(self) -> int:
+        """The channel number this still is asked for.
+
+        Not `_channel_number`, which numbers the stream. A device can number
+        the two paths differently, and one did: see
+        DahuaDataUpdateCoordinator.get_snapshot_channel and #1151.
+
+        A dual-sensor camera was built with its media channel named for both
+        paths, so that stands.
+
+        getattr because the stand-in coordinators in the tests predate the
+        question, and a camera built around one should still fetch a still
+        rather than raise.
+        """
+        if self._media_channel is not None:
+            return self._media_channel
+        ask = getattr(self._coordinator, "get_snapshot_channel", None)
+        if ask is None:
+            return self._channel_number
+        return ask()
 
     @property
     def use_stream_for_stills(self) -> bool:
@@ -996,9 +1097,12 @@ class DahuaCamera(DahuaBaseEntity, Camera):
     async def async_set_video_in_day_night_mode(self, config_type: str, mode: str):
         """Handles the service call from SERVICE_SET_DAY_NIGHT_MODE to set the day/night color mode"""
         channel = self._logical_channel
-        await self._coordinator.client.async_set_video_in_day_night_mode(
+        # Same as the select: follow the write to whichever table took
+        # it, so the select beside this service does not go stale (#1194).
+        table = await self._coordinator.client.async_set_video_in_day_night_mode(
             channel, config_type, mode
         )
+        self._coordinator.note_day_night_write_table(table)
         await self._coordinator.async_refresh()
 
     async def async_set_time(self, time=None):
@@ -1183,8 +1287,27 @@ class DahuaCamera(DahuaBaseEntity, Camera):
         await self._coordinator.client.async_autofocus()
 
     async def async_set_privacy_masking(self, index: int, enabled: bool):
-        """Handles the service call from SERVICE_SET_PRIVACY_MASKING to control the privacy masking"""
-        await self._coordinator.client.async_setprivacymask(index, enabled)
+        """Handles the service call from SERVICE_SET_PRIVACY_MASKING to control the privacy masking
+
+        The channel goes with it because one of the two tables this can write is
+        channel scoped, and a recorder channel's covers are not channel 0's.
+        """
+        try:
+            await self._coordinator.client.async_setprivacymask(
+                index, enabled, self._coordinator.get_channel()
+            )
+        except ValueError as unknown_mask:
+            # The camera has no mask at that index in either table, or would not
+            # say. Raised rather than swallowed: the service used to answer
+            # successfully while changing nothing (#1184).
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="privacy_mask_not_found",
+                translation_placeholders={
+                    "device": self._coordinator.get_device_name(),
+                    "reason": str(unknown_mask),
+                },
+            ) from unknown_mask
 
     async def async_set_privacy_mode(self, enabled: bool):
         """Handles the service call from SERVICE_SET_PRIVACY_MODE to control the lens privacy mask"""

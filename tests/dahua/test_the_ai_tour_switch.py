@@ -551,6 +551,21 @@ class _PlatformCoordinator:
     def get_serial_number(self):
         return "%s_%d" % (SERIAL, self._channel)
 
+    def supports_audio_control(self, key):
+        return False
+
+    def supports_audio_input_volume(self):
+        return False
+
+    def supports_audio_output_volume(self):
+        return False
+
+    def supports_audio_in_denoise(self):
+        return False
+
+    def audio_control_owner(self, key):
+        return None
+
     def supports_intelli_tour(self):
         return self._tour
 
@@ -592,6 +607,9 @@ class _PlatformCoordinator:
         return False
 
     def supports_video_image_control(self, field):
+        return False
+
+    def supports_video_widget_overlay(self, field):
         return False
 
     def get_ivs_rules(self):

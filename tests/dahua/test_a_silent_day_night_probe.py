@@ -19,9 +19,12 @@ Two things make this worth doing and neither is obvious from the diff:
   this capability a safe one to convert.
 
 The distinction the whole fix rests on is kept: a device that *answers* must
-not be asked twice. An HTTP refusal never reaches the probe at all, because
-`async_get_config` turns a `ClientResponseError` into `{}`, and a 200 carrying
-no row for this channel is equally an answer. Only silence stays open.
+not be asked twice. A 200 carrying no row for this channel is an answer. So is
+an HTTP refusal, which is why the probe reads through
+`async_probe_video_in_options` (strict) rather than `async_get_config`: the
+lenient form turns a 403 into `{}`, which would record a restricted account as
+a model without the table and leave no refusal in the diagnostics dump. Only
+silence stays open.
 
 Six mutations, each applied to the real source and each named with the tests
 that failed, not with the tests that ought to:
@@ -76,13 +79,38 @@ class _Client:
     def __init__(self, *answers):
         self.answers = list(answers)
         self.reads = 0
+        self.day_night_reads = 0
 
-    async def async_get_video_in_options(self):
+    async def async_probe_video_in_options(self):
         self.reads += 1
         answer = self.answers[0] if len(self.answers) == 1 else self.answers.pop(0)
         if isinstance(answer, Exception):
             raise answer
         return dict(answer)
+
+    async def async_probe_video_in_day_night(self):
+        """Which table this channel keeps the setting in, asked once the
+        capability above turns up late.
+
+        A device without the preferred table, which is the case this file is
+        not about: it answers 200 with nothing, so the channel stays on
+        VideoInOptions and every assertion below is unchanged. Modelled rather
+        than left missing because the retry really does ask it now, and a
+        double that does not model a new requirement fails as an AttributeError
+        inside the code under test (#1201)."""
+        self.day_night_reads += 1
+        return {}
+
+
+def _refused(status):
+    from aiohttp import ClientResponseError
+    from types import SimpleNamespace
+
+    return ClientResponseError(
+        request_info=SimpleNamespace(real_url="http://10.0.0.88/cgi-bin/x.cgi"),
+        history=(),
+        status=status,
+    )
 
 
 def _coordinator(*answers):
@@ -99,7 +127,9 @@ def _coordinator(*answers):
     coordinator._probe_refusals = {}
     coordinator._capability_retries = {}
     coordinator.hass = None
-    coordinator.config_entry = type("E", (), {"entry_id": "entry-1"})()
+    # `options` because the late retry now asks which table the select should
+    # read, and that question is gated on the select platform being loaded.
+    coordinator.config_entry = type("E", (), {"entry_id": "entry-1", "options": {}})()
     coordinator.get_serial_number = lambda: SERIAL
     # The accessor the select platform reads is allowed to veto on its own
     # grounds, and does for an indoor monitor with no camera. Not one here.
@@ -146,6 +176,19 @@ async def test_a_table_without_this_channels_row_is_an_answer():
     assert coordinator.probes_that_did_not_answer() == set()
 
 
+async def test_an_http_refusal_is_recorded_and_not_retried():
+    """A 403 is the device answering about permissions, not a model without the
+    table. It must land in `refusals` so diagnostics can tell the two apart,
+    and it must not be retried: asking a restricted account again changes
+    nothing and costs a login."""
+    coordinator = _coordinator(_refused(403))
+
+    assert await coordinator._async_probe_day_night_color() is False
+    assert coordinator.supports_day_night_color() is False
+    assert coordinator._probe_refusals["day_night_color"]["status"] == 403
+    assert coordinator.probes_that_did_not_answer() == set()
+
+
 async def test_an_answer_is_not_asked_for_twice():
     coordinator = _coordinator(ANSWERED)
 
@@ -173,6 +216,10 @@ async def test_the_answer_that_arrives_late_gates_its_select(discoveries):
 
     assert coordinator.supports_day_night_color() is True
     assert coordinator.probes_that_did_not_answer() == set()
+    assert coordinator.client.day_night_reads == 1, (
+        "a capability discovered here arrives with the question of which table "
+        "it reads never asked, and the select reported Auto for ever (#1201)"
+    )
     assert discoveries == [("entry-1", SERIAL)], (
         "the platforms are told which channel answered, so a recorder rebuilds "
         "one channel rather than all nineteen"
@@ -241,9 +288,16 @@ def test_the_day_night_judgment_is_made_in_exactly_one_place():
     """Setup and the retry share `_async_probe_day_night_color`. Inlining the
     probe back into setup is the mutation this catches: the two copies would
     then be free to disagree about whether a 200 with no row is an answer,
-    which is precisely the distinction the fix rests on."""
+    which is precisely the distinction the fix rests on.
+
+    The probe and poll have one reader each. The poll's client reader delegates
+    to the strict reader, so the two strict call sites are that delegation and
+    the coordinator's capability probe. Both share the same request and cache.
+    """
     assert _SOURCE.count('_note_probe_refusal("day_night_color"') == 1
-    assert _SOURCE.count("async_get_video_in_options()") == 2, (
-        "once in the probe and once in the poll's fetch. A third call site "
-        "means a second judgment"
-    )
+    assert (
+        _SOURCE.count(".async_probe_video_in_options(") == 2
+    ), "the strict read belongs to the capability probe and poll-reader delegation"
+    assert (
+        _SOURCE.count("async_get_video_in_options()") == 1
+    ), "the poll read belongs to the poll's fetch, and only the fetch"

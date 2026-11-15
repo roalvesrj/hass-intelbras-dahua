@@ -28,7 +28,50 @@ SENSOR = "sensor"
 EVENT = "event"
 NUMBER = "number"
 UPDATE = "update"
-VIDEO_COLOR_STYLE_OPTIONS = ("Soft", "Standard", "Vivid")
+TIME = "time"
+VIDEO_COLOR_STYLE_VALUE_BY_OPTION = {
+    "Soft": "Gentle",
+    "Standard": "Standard",
+    "Vivid": "Flamboyant",
+}
+VIDEO_COLOR_STYLE_OPTIONS = tuple(VIDEO_COLOR_STYLE_VALUE_BY_OPTION)
+VIDEO_COLOR_STYLE_OPTION_BY_VALUE = {
+    value: option for option, value in VIDEO_COLOR_STYLE_VALUE_BY_OPTION.items()
+}
+EXPOSURE_ANTI_FLICKER_VALUE_BY_OPTION = {"outdoor": 0, "50_hz": 1, "60_hz": 2}
+EXPOSURE_ANTI_FLICKER_OPTIONS = tuple(EXPOSURE_ANTI_FLICKER_VALUE_BY_OPTION)
+EXPOSURE_ANTI_FLICKER_OPTION_BY_VALUE = {
+    value: option for option, value in EXPOSURE_ANTI_FLICKER_VALUE_BY_OPTION.items()
+}
+# This profile Mode mapping is separate from VideoInOptions.ExposureMode. Keep
+# the accepted values explicit; an unrecognized value is never inferred as Manual.
+EXPOSURE_MODE_VALUE_BY_OPTION = {
+    "Auto": 0,
+    "Gain Priority": 7,
+    "Shutter Priority": 8,
+    "Manual": 4,
+}
+EXPOSURE_MODE_OPTION_BY_VALUE = {
+    value: option for option, value in EXPOSURE_MODE_VALUE_BY_OPTION.items()
+}
+EXPOSURE_MODE_OPTIONS = tuple(EXPOSURE_MODE_VALUE_BY_OPTION)
+LEGACY_EXPOSURE_MODE_VALUE_BY_OPTION = {
+    "Auto": 0,
+    "Gain Priority": 1,
+    "Shutter Priority": 2,
+}
+LEGACY_EXPOSURE_MODE_OPTION_BY_VALUE = {
+    value: option for option, value in LEGACY_EXPOSURE_MODE_VALUE_BY_OPTION.items()
+}
+LEGACY_EXPOSURE_MODE_OPTIONS = tuple(LEGACY_EXPOSURE_MODE_VALUE_BY_OPTION)
+EXPOSURE_MODE_OPTIONS_BY_ANTI_FLICKER = {
+    0: EXPOSURE_MODE_OPTIONS,
+    1: ("Auto", "Manual"),
+    2: ("Auto", "Manual"),
+}
+EXPOSURE_COMPENSATION_MIN = 0
+EXPOSURE_COMPENSATION_MAX = 100
+EXPOSURE_COMPENSATION_STEP = 1
 
 # The three image orientation fields, and the tables that carry them.
 #
@@ -55,6 +98,7 @@ PLATFORMS = [
     EVENT,
     NUMBER,
     UPDATE,
+    TIME,
 ]
 
 
@@ -69,6 +113,12 @@ CONF_EVENTS = "events"
 CONF_NAME = "name"
 CONF_CHANNEL = "channel"
 CONF_AUTO_DETECT_CHANNEL = "auto_detect_channel"
+# Numbers the still independently of the stream, for a device that numbers
+# snapshot.cgi and RTSP differently (#1151). Off by default, so the still keeps
+# following the stream's number on every device that has not been measured: the
+# channel-0 probe cannot tell genuine zero-based numbering from channel 0
+# aliasing channel 1, so it must not decide this on its own.
+CONF_SNAPSHOT_CHANNEL_FROM_ZERO = "snapshot_channel_from_zero"
 # Which other channels of a recorder to add alongside the one being set up.
 CONF_EXTRA_CHANNELS = "extra_channels"
 # Take every channel discovery found, without ticking sixteen boxes.
@@ -151,6 +201,7 @@ CHANNEL_OPTION_KEYS = frozenset(
         CONF_MANUAL_SECURITY_LIGHT,
         CONF_MANUAL_SIREN,
         CONF_NVR_ACTIVE_DETERRENCE,
+        CONF_SNAPSHOT_CHANNEL_FROM_ZERO,
     }
 )
 
@@ -212,6 +263,9 @@ If you have any issues with this you need to open an issue here:
 # put back; diagnostics already reports the rest, and the get_config service
 # reads any table at all.
 BACKED_UP_TABLES = (
+    "AudioInDenoise",
+    "AudioInputVolume",
+    "AudioOutputVolume",
     "ChannelTitle",
     "DisableEventNotify",
     "DisableLinkage",
@@ -242,6 +296,7 @@ BACKED_UP_TABLES = (
     "VideoColor",
     "VideoImageControl",
     "VideoInDayNight",
+    "VideoInExposure",
     "VideoInMode",
     "VideoInOptions",
     "VideoWidget",

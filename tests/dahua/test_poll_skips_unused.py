@@ -85,9 +85,12 @@ NOTIFICATIONS = "async_get_event_notifications"
 SMART_MOTION = "async_get_smart_motion_detection"
 PRIVACY = "async_get_privacy_mode"
 DAY_NIGHT = "async_get_video_in_options"
+VIDEO_WIDGET = "async_get_video_widget"
 ALARM_OUT = "async_get_alarm_output_state"
 CLOUD_UPGRADE = "async_get_cloud_upgrade_info"
 VIDEO_IMAGE_CONTROL = "async_get_video_image_control"
+VIDEO_IN_MODE = "async_get_video_in_mode"
+GET_EXPOSURE_CONFIG = "async_get_exposure_anti_flicker_config"
 
 
 async def test_everything_is_fetched_when_every_platform_is_on():
@@ -126,13 +129,57 @@ async def test_the_day_night_read_is_skipped_without_the_select_platform():
 
 
 async def test_the_day_night_read_is_skipped_when_the_device_has_no_mode():
-    """A device that reported no DayNightColor must not be polled for one."""
+    """A device that reported no DayNightColor and no image option must not be
+    polled for a table it does not serve."""
     c = _coordinator()
     c._supports_day_night_color = False
 
     await c._async_update_data()
 
     assert DAY_NIGHT not in c.client.calls
+
+
+async def test_the_day_night_read_is_kept_for_wdr_or_exposure_alone():
+    """The same table carries WDR, so a camera without DayNightColor but
+    with a WDR field still has a select reading it. The
+    gate used to be Day/Night only, which left those selects stale for ever."""
+    c = _coordinator()
+    c._supports_day_night_color = False
+    c._image_option_fields = frozenset({"WideDynamicRangeMode"})
+
+    await c._async_update_data()
+
+    assert DAY_NIGHT in c.client.calls
+
+    c = _coordinator()
+    c._supports_day_night_color = False
+    c._image_option_fields = frozenset({"ExposureMode"})
+    await c._async_update_data()
+    assert DAY_NIGHT in c.client.calls
+
+
+async def test_video_widget_is_polled_only_when_a_supported_overlay_has_a_reader():
+    c = _coordinator()
+    c._video_widget_fields = frozenset({"TimeTitle.EncodeBlend"})
+    await c._async_update_data()
+    assert VIDEO_WIDGET in c.client.calls
+
+    c = _coordinator(switch=False)
+    c._video_widget_fields = frozenset({"TimeTitle.EncodeBlend"})
+    await c._async_update_data()
+    assert VIDEO_WIDGET not in c.client.calls
+
+
+async def test_video_widget_is_not_polled_for_a_monitor_without_a_camera():
+    """The probe can answer for a VTH's screen, but no switch is created there,
+    so reading the table every cycle would feed nothing."""
+    c = _coordinator()
+    c._video_widget_fields = frozenset({"TimeTitle.EncodeBlend"})
+    c.is_indoor_monitor_without_video = lambda: True
+
+    await c._async_update_data()
+
+    assert VIDEO_WIDGET not in c.client.calls
 
 
 async def test_switch_reads_are_skipped_without_the_switch_platform():
@@ -167,6 +214,155 @@ async def test_image_controls_are_polled_only_when_a_supported_control_has_a_rea
     c._video_image_control_fields = frozenset({"Flip", "Rotate90"})
     await c._async_update_data()
     assert VIDEO_IMAGE_CONTROL not in c.client.calls
+
+
+async def test_video_color_style_polls_profile_mode_only_for_its_select():
+    c = _coordinator()
+    c._video_color_fields = frozenset({"Style"})
+
+    await c._async_update_data()
+
+    assert VIDEO_IN_MODE in c.client.calls
+
+    c = _coordinator(select=False)
+    c._video_color_fields = frozenset({"Style"})
+
+    await c._async_update_data()
+
+    assert VIDEO_IN_MODE not in c.client.calls
+
+
+async def test_exposure_anti_flicker_polls_only_for_its_select():
+    c = _coordinator()
+    c._supports_exposure_anti_flicker = True
+    await c._async_update_data()
+    assert VIDEO_IN_MODE in c.client.calls
+    assert GET_EXPOSURE_CONFIG in c.client.calls
+
+    c = _coordinator(select=False)
+    c._supports_exposure_anti_flicker = True
+    await c._async_update_data()
+    assert VIDEO_IN_MODE not in c.client.calls
+    assert GET_EXPOSURE_CONFIG not in c.client.calls
+
+
+async def test_exposure_compensation_polls_only_for_its_number_entity():
+    c = _coordinator()
+    c._supports_exposure_compensation = True
+    await c._async_update_data()
+    assert VIDEO_IN_MODE in c.client.calls
+    assert c.client.calls.count(GET_EXPOSURE_CONFIG) == 1
+
+    c = _coordinator(number=False)
+    c._supports_exposure_compensation = True
+    await c._async_update_data()
+    assert VIDEO_IN_MODE not in c.client.calls
+    assert GET_EXPOSURE_CONFIG not in c.client.calls
+
+
+async def test_exposure_mode_polls_only_for_its_select():
+    c = _coordinator()
+    c._supports_exposure_mode = True
+    await c._async_update_data()
+    assert VIDEO_IN_MODE in c.client.calls
+    assert GET_EXPOSURE_CONFIG in c.client.calls
+
+    c = _coordinator(select=False)
+    c._supports_exposure_mode = True
+    await c._async_update_data()
+    assert VIDEO_IN_MODE not in c.client.calls
+    assert GET_EXPOSURE_CONFIG not in c.client.calls
+
+    c = _coordinator()
+    c._image_option_fields = frozenset({"ExposureMode"})
+    await c._async_update_data()
+    assert DAY_NIGHT in c.client.calls
+    assert VIDEO_IN_MODE not in c.client.calls
+    assert GET_EXPOSURE_CONFIG not in c.client.calls
+
+
+async def test_exposure_table_is_fetched_once_for_select_and_number():
+    c = _coordinator()
+    c._supports_exposure_anti_flicker = True
+    c._supports_exposure_mode = True
+    c._supports_exposure_compensation = True
+
+    await c._async_update_data()
+
+    assert c.client.calls.count(GET_EXPOSURE_CONFIG) == 1
+
+
+async def test_exposure_table_is_fetched_once_for_antiflicker_and_mode():
+    c = _coordinator()
+    c._supports_exposure_anti_flicker = True
+    c._supports_exposure_mode = True
+
+    await c._async_update_data()
+
+    assert c.client.calls.count(GET_EXPOSURE_CONFIG) == 1
+
+
+async def test_failed_profile_read_keeps_config_ex_for_anti_flicker():
+    c = _coordinator()
+    c._supports_exposure_anti_flicker = True
+    c.data = {
+        "table.VideoInMode[0].Config[0]": "0",
+        "table.VideoInMode[0].ConfigEx": "Night",
+        "table.VideoInMode[1].ConfigEx": "Day",
+        "table.VideoInExposure[0][0].AntiFlicker": "1",
+        "table.VideoInExposure[0][0].Mode": "0",
+        "table.VideoInExposure[0][0].Compensation": "45",
+        "table.VideoInExposure[0][1].AntiFlicker": "2",
+    }
+
+    async def failed_mode():
+        raise TimeoutError("profile read timed out")
+
+    async def exposure():
+        return {
+            key: value
+            for key, value in c.data.items()
+            if key.startswith("table.VideoInExposure[")
+        }
+
+    c.client.async_get_video_in_mode = failed_mode
+    c.client.async_get_exposure_anti_flicker_config = exposure
+    c.data = await c._async_update_data()
+
+    assert c.get_exposure_anti_flicker() == "60_hz"
+    assert c.data["table.VideoInMode[0].ConfigEx"] == "Night"
+    assert "table.VideoInMode[1].ConfigEx" not in c.data
+
+
+async def test_failed_profile_read_keeps_config_ex_for_video_color_style():
+    c = _coordinator()
+    c._video_color_fields = frozenset({"Style"})
+    c.data = {
+        "table.VideoInMode[0].Config[0]": "0",
+        "table.VideoInMode[0].ConfigEx": "Night",
+        "table.VideoInMode[1].ConfigEx": "Day",
+        "table.VideoColor[0][0].Style": "Flamboyant",
+        "table.VideoColor[0][1].Style": "Gentle",
+    }
+
+    async def failed_mode():
+        raise TimeoutError("profile read timed out")
+
+    async def video_color():
+        return {
+            key: value
+            for key, value in c.data.items()
+            if key.startswith("table.VideoColor[")
+        }
+
+    c.client.async_get_video_in_mode = failed_mode
+    c.client.async_get_video_color = video_color
+
+    c.data = await c._async_update_data()
+
+    assert c.get_video_color_style() == "Soft"
+    assert c.data["table.VideoInMode[0].ConfigEx"] == "Night"
+    assert "table.VideoInMode[1].ConfigEx" not in c.data
 
 
 # --- a request with two readers survives losing one of them ------------------
@@ -317,3 +513,21 @@ async def test_the_cloud_upgrade_record_is_read_once_and_reused():
     await c._async_update_data()
 
     assert c.client.calls.count(CLOUD_UPGRADE) == 1
+
+
+async def test_profile_schedule_reuses_video_in_mode_when_time_platform_reads_it():
+    coordinator = _coordinator(time=True)
+    coordinator._profile_schedule_times = object()
+
+    await coordinator._async_update_data()
+
+    assert coordinator.client.calls.count(VIDEO_IN_MODE) == 1
+
+
+async def test_profile_schedule_does_not_fetch_when_time_platform_is_off():
+    coordinator = _coordinator(time=False)
+    coordinator._profile_schedule_times = object()
+
+    await coordinator._async_update_data()
+
+    assert VIDEO_IN_MODE not in coordinator.client.calls

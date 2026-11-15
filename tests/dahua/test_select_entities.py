@@ -13,14 +13,18 @@ import pytest
 from homeassistant.exceptions import HomeAssistantError
 
 from custom_components.dahua import select as select_module
-from custom_components.dahua.const import VIDEO_COLOR_STYLE_OPTIONS
+from custom_components.dahua.const import (
+    VIDEO_COLOR_STYLE_OPTIONS,
+)
 from custom_components.dahua.coordinator import DahuaDataUpdateCoordinator
 from custom_components.dahua.select import (
     DahuaCameraPresetPositionSelect,
     DahuaDayNightModeSelect,
     DahuaDoorbellLightSelect,
+    DahuaExposureModeSelect,
     DahuaImageRotationSelect,
     DahuaVideoColorStyleSelect,
+    DahuaWideDynamicRangeSelect,
 )
 
 from . import adds_entities
@@ -50,6 +54,16 @@ class _Coordinator:
     # The real coordinator carries this as a class default, so a double that
     # borrows its methods has to carry it too.
     _video_image_control_table = "VideoImageControl"
+
+    def supports_profile_management(self):
+        return False
+
+    # Borrowed for the same reason: the select tells the coordinator which
+    # table took the Day/Night write, and a hand-written stub here would
+    # assert this file's idea of that rule instead of production's (#1194).
+    _reads_video_in_day_night = False
+    note_day_night_write_table = DahuaDataUpdateCoordinator.note_day_night_write_table
+
     video_image_control_table = DahuaDataUpdateCoordinator.video_image_control_table
     async_set_video_image_control = (
         DahuaDataUpdateCoordinator.async_set_video_image_control
@@ -61,6 +75,8 @@ class _Coordinator:
         self._channel = channel
         self._day_night = day_night
         self.refreshed = 0
+        self.exposure_mode_calls = []
+        self.video_color_style_calls = []
 
     def get_channel(self):
         return self._channel
@@ -76,6 +92,67 @@ class _Coordinator:
 
     def get_video_image_control(self, field):
         return self.data.get(f"table.VideoImageControl[{self._channel}].{field}")
+
+    def get_wide_dynamic_range_option(self):
+        return getattr(self, "wdr_option", None)
+
+    def get_wide_dynamic_range_level(self):
+        return getattr(self, "wdr_level", None)
+
+    def get_exposure_mode_option(self):
+        return getattr(self, "exposure_option", None)
+
+    def get_exposure_mode_options(self):
+        return getattr(
+            self,
+            "exposure_mode_options",
+            ("Auto", "Gain Priority", "Shutter Priority", "Manual"),
+        )
+
+    def supports_exposure_mode(self):
+        return getattr(self, "exposure_mode_supported", True)
+
+    def is_amcrest_doorbell(self):
+        return False
+
+    def is_indoor_monitor(self):
+        return False
+
+    def is_indoor_monitor_without_video(self):
+        return False
+
+    def supports_day_night_color(self):
+        return False
+
+    def supports_exposure_anti_flicker(self):
+        return False
+
+    def supports_image_option(self, field):
+        return False
+
+    def supports_infrared_light(self):
+        return False
+
+    def supports_lighting_schemes(self):
+        return False
+
+    def supports_security_light(self):
+        return False
+
+    def supports_smart_motion_detection(self):
+        return False
+
+    def supports_video_color(self, field):
+        return False
+
+    def supports_video_image_control(self, field):
+        return False
+
+    async def async_set_exposure_mode(self, option):
+        self.exposure_mode_calls.append(option)
+
+    async def async_set_video_color_style(self, option):
+        self.video_color_style_calls.append(option)
 
     async def async_refresh(self):
         self.refreshed += 1
@@ -312,7 +389,8 @@ async def test_selecting_a_style_writes_the_exact_value_and_refreshes(style):
 
     await s.async_select_option(style)
 
-    assert c.client.calls == [("async_set_video_color_style", 3, style)]
+    assert c.video_color_style_calls == [style]
+    assert c.client.calls == []
     assert c.refreshed == 1
 
 
@@ -324,6 +402,145 @@ async def test_an_invalid_style_is_ignored_without_a_write_or_refresh():
 
     assert c.client.calls == []
     assert c.refreshed == 0
+
+
+# --- the two VideoInOptions picture controls ---------------------------------
+
+
+def test_the_wdr_select_reports_the_word_the_coordinator_read():
+    c = _Coordinator()
+    c.wdr_option = "Mode 2"
+    s = _select(DahuaWideDynamicRangeSelect, c)
+
+    assert s.current_option == "Mode 2"
+
+
+def test_the_wdr_select_reports_unknown_rather_than_a_wrong_mode():
+    """A value this mapping does not cover is None, not Off. Reporting Off
+    would look exactly like the camera being off while it stayed on."""
+    c = _Coordinator()
+    c.wdr_option = None
+    s = _select(DahuaWideDynamicRangeSelect, c)
+
+    assert s.current_option is None
+
+
+async def test_wdr_off_writes_level_zero_as_well():
+    """Mode 0 alone is ignored while the level stays at 50, so Off has to clear
+    both. Intelbras measured that on both cameras it validated."""
+    c = _Coordinator(channel=3)
+    s = _select(DahuaWideDynamicRangeSelect, c)
+
+    await s.async_select_option("Off")
+
+    assert c.client.calls == [("async_set_wide_dynamic_range", 3, 0, 0)]
+    assert c.refreshed == 1
+
+
+async def test_wdr_on_keeps_the_level_the_camera_reported():
+    c = _Coordinator(channel=3)
+    c.wdr_level = 70
+    s = _select(DahuaWideDynamicRangeSelect, c)
+
+    await s.async_select_option("On")
+
+    assert c.client.calls == [("async_set_wide_dynamic_range", 3, 1, 70)]
+
+
+@pytest.mark.parametrize("level", [None, 0])
+async def test_wdr_on_without_a_usable_level_uses_the_measured_default(level):
+    """A level of 0 is inert on its own, and None means the field was not read.
+    Both fall back to the same 50 the cameras shipped with."""
+    c = _Coordinator(channel=3)
+    c.wdr_level = level
+    s = _select(DahuaWideDynamicRangeSelect, c)
+
+    await s.async_select_option("On")
+
+    assert c.client.calls == [("async_set_wide_dynamic_range", 3, 1, 50)]
+
+
+async def test_wdr_mode_two_writes_the_measured_number():
+    """Mode 2 was accepted by both cameras but its vendor name was not
+    confirmed. The number is what the test can pin; the label stays "Mode 2"."""
+    c = _Coordinator(channel=3)
+    c.wdr_level = 60
+    s = _select(DahuaWideDynamicRangeSelect, c)
+
+    await s.async_select_option("Mode 2")
+
+    assert c.client.calls == [("async_set_wide_dynamic_range", 3, 2, 60)]
+
+
+async def test_an_invalid_wdr_option_is_ignored_without_a_write():
+    c = _Coordinator(channel=3)
+    s = _select(DahuaWideDynamicRangeSelect, c)
+
+    await s.async_select_option("Auto")
+
+    assert c.client.calls == []
+    assert c.refreshed == 0
+
+
+def test_the_exposure_select_reports_the_word_the_coordinator_read():
+    c = _Coordinator()
+    c.exposure_option = "Shutter Priority"
+    s = _select(DahuaExposureModeSelect, c)
+
+    assert s.current_option == "Shutter Priority"
+
+
+async def test_the_exposure_select_writes_its_number():
+    """Mode selection delegates to the coordinator's fresh Profile-aware path."""
+    c = _Coordinator(channel=3)
+    s = _select(DahuaExposureModeSelect, c)
+
+    await s.async_select_option("Gain Priority")
+
+    assert c.exposure_mode_calls == ["Gain Priority"]
+    assert c.client.calls == []
+    assert c.refreshed == 1
+
+
+async def test_an_invalid_exposure_option_is_ignored_without_a_write():
+    c = _Coordinator(channel=3)
+    s = _select(DahuaExposureModeSelect, c)
+
+    await s.async_select_option("Not a Mode")
+
+    assert c.exposure_mode_calls == []
+    assert c.refreshed == 0
+
+
+async def test_exposure_mode_rejects_an_option_not_currently_advertised():
+    c = _Coordinator(channel=3)
+    c.exposure_mode_options = ("Auto",)
+    s = _select(DahuaExposureModeSelect, c)
+
+    await s.async_select_option("Manual")
+
+    assert c.exposure_mode_calls == []
+    assert c.client.calls == []
+    assert c.refreshed == 0
+
+
+def test_exposure_mode_unique_id_does_not_depend_on_transport():
+    legacy = _Coordinator()
+    profile = _Coordinator()
+    assert (
+        _select(DahuaExposureModeSelect, legacy).unique_id
+        == _select(DahuaExposureModeSelect, profile).unique_id
+        == "SERIAL1_image_exposure_mode"
+    )
+
+
+async def test_exposure_mode_options_follow_the_coordinator_without_recreating_entity():
+    c = _Coordinator(channel=3)
+    s = _select(DahuaExposureModeSelect, c)
+
+    assert s.options == ["Auto", "Gain Priority", "Shutter Priority", "Manual"]
+    c.exposure_mode_options = ("Auto", "Manual")
+    assert s.options == ["Auto", "Manual"]
 
 
 # --- which selects an entry creates ------------------------------------------
@@ -356,8 +573,11 @@ async def _added_for(coordinator, cgi_presets=None):
         DahuaDoorbellLightSelect=lambda *a, **k: "light",
         DahuaCameraPresetPositionSelect=lambda *a, **k: ("preset", k.get("preset_ids")),
         DahuaDayNightModeSelect=lambda *a, **k: "day_night",
+        DahuaExposureAntiFlickerSelect=lambda *a, **k: "exposure_anti_flicker",
         DahuaVideoColorStyleSelect=lambda *a, **k: "style",
         DahuaImageRotationSelect=lambda *a, **k: "rotation",
+        DahuaWideDynamicRangeSelect=lambda *a, **k: "wdr",
+        DahuaExposureModeSelect=lambda *a, **k: "exposure",
         _async_preset_ids=_preset_ids,
     ):
         await select_module.async_setup_entry(
@@ -375,15 +595,23 @@ class _SetupCoordinator(_Coordinator):
         presets=(1, 2),
         preset_error=None,
         day_night_supported=False,
+        exposure_anti_flicker_supported=False,
+        exposure_mode_supported=False,
+        profile_management_supported=False,
         infrared_supported=False,
         style_supported=False,
         image_control_fields=(),
+        image_options=(),
     ):
         super().__init__()
         self._day_night_supported = day_night_supported
+        self._exposure_anti_flicker_supported = exposure_anti_flicker_supported
+        self._exposure_mode_supported = exposure_mode_supported
+        self._profile_management_supported = profile_management_supported
         self._infrared_supported = infrared_supported
         self._style_supported = style_supported
         self._image_control_fields = frozenset(image_control_fields)
+        self._image_options = frozenset(image_options)
         self._amcrest = amcrest
         self._security_light = security_light
         self._model = model
@@ -412,11 +640,23 @@ class _SetupCoordinator(_Coordinator):
     def supports_day_night_color(self):
         return self._day_night_supported
 
+    def supports_exposure_anti_flicker(self):
+        return self._exposure_anti_flicker_supported
+
+    def supports_exposure_mode(self):
+        return self._exposure_mode_supported or "ExposureMode" in self._image_options
+
+    def supports_profile_management(self):
+        return self._profile_management_supported
+
     def supports_video_color(self, field):
         return field == "Style" and self._style_supported
 
     def supports_video_image_control(self, field):
         return field in self._image_control_fields
+
+    def supports_image_option(self, field):
+        return field in self._image_options
 
     def supports_infrared_light(self):
         return self._infrared_supported
@@ -448,6 +688,54 @@ async def test_the_doorbell_light_select_needs_a_doorbell_with_one():
     assert "light" in await _added_for(
         _SetupCoordinator(amcrest=True, security_light=True)
     )
+
+
+async def test_wdr_needs_its_mode_and_level_before_the_select_is_created():
+    """The mode alone is ignored while the level stays at 50, and a write that
+    names a level field the camera does not carry is refused wholesale."""
+    assert "wdr" not in await _added_for(
+        _SetupCoordinator(image_options={"WideDynamicRangeMode"})
+    )
+    assert "wdr" in await _added_for(
+        _SetupCoordinator(image_options={"WideDynamicRangeMode", "WideDynamicRange"})
+    )
+
+
+async def test_exposure_mode_is_offered_independently_of_wdr():
+    only_exposure = await _added_for(_SetupCoordinator(exposure_mode_supported=True))
+    assert "exposure" in only_exposure
+    assert "wdr" not in only_exposure
+
+    legacy_only = await _added_for(_SetupCoordinator(image_options={"ExposureMode"}))
+    assert legacy_only.count("exposure") == 1
+
+    only_wdr = await _added_for(
+        _SetupCoordinator(
+            image_options={
+                "WideDynamicRangeMode",
+                "WideDynamicRange",
+            }
+        )
+    )
+    assert "wdr" in only_wdr
+    assert "exposure" not in only_wdr
+
+
+async def test_exposure_mode_is_not_created_without_either_transport():
+    assert "exposure" not in await _added_for(_SetupCoordinator())
+
+
+async def test_a_camera_with_wdr_and_exposure_mode_gets_both_selects():
+    added = await _added_for(
+        _SetupCoordinator(
+            image_options={"WideDynamicRangeMode", "WideDynamicRange"},
+            exposure_mode_supported=True,
+        )
+    )
+
+    assert "wdr" in added
+    assert "exposure" in added
+    assert added.count("exposure") == 1
 
 
 @pytest.mark.parametrize(
@@ -567,6 +855,13 @@ async def test_the_day_night_select_needs_a_device_that_reports_the_mode():
     would leave a control showing unknown for ever."""
     assert "day_night" not in await _added_for(_SetupCoordinator())
     assert "day_night" in await _added_for(_SetupCoordinator(day_night_supported=True))
+
+
+async def test_exposure_anti_flicker_select_needs_reported_support():
+    assert "exposure_anti_flicker" not in await _added_for(_SetupCoordinator())
+    assert "exposure_anti_flicker" in await _added_for(
+        _SetupCoordinator(exposure_anti_flicker_supported=True)
+    )
 
 
 async def test_style_select_requires_reported_style_support():

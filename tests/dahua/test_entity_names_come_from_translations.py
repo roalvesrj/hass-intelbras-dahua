@@ -38,6 +38,7 @@ PLATFORMS = (
     "select",
     "sensor",
     "switch",
+    "time",
     "update",
 )
 
@@ -55,12 +56,22 @@ WAS = {
     ("number", "vth_vto_ring_volume"): "Ring volume for {vto} calls",
     ("number", "motion_region1_sensitivity"): "Motion region 1 sensitivity",
     ("number", "motion_region1_threshold"): "Motion region 1 threshold",
+    ("number", "microphone_volume"): "Microphone volume",
+    ("number", "speaker_volume"): "Speaker volume",
     ("button", "reboot"): "Reboot",
     ("button", "open_door"): "Open Door",
     ("button", "cancel_call"): "Cancel Call",
     ("select", "security_light"): "Security Light",
     ("select", "preset_position"): "Preset Position",
     ("select", "day_night_mode"): "Day/Night Mode",
+    ("select", "profile_management"): "Profile management",
+    ("time", "profile_day_start"): "Profile day start",
+    ("time", "profile_night_start"): "Profile night start",
+    ("select", "exposure_anti_flicker"): "Image exposure anti-flicker",
+    (
+        "select",
+        "encode_audio_source",
+    ): "{format_type} format {format_index} audio source",
     # New with the infrared mode control, so there is no earlier property for it
     # to match. Listed because this table is asserted as equal to the file, which
     # is what makes a rename fail rather than pass quietly.
@@ -91,21 +102,30 @@ WAS = {
     ("number", "image_saturation"): "Image saturation",
     ("number", "image_hue"): "Image hue",
     ("number", "image_gamma"): "Image gamma",
+    ("number", "image_chroma_suppress"): "Image chroma suppress",
+    ("number", "exposure_compensation"): "Image exposure compensation",
     ("select", "video_color_style"): "Image color style",
+    ("select", "image_wide_dynamic_range"): "Image wide dynamic range",
+    ("select", "image_exposure_mode"): "Image exposure mode",
     ("select", "image_rotation"): "Image rotation",
     ("update", "firmware_update"): "Firmware Update",
     ("switch", "motion_detection"): "Motion Detection",
+    ("switch", "encode_audio"): "{format_type} format {format_index} audio",
     ("switch", "cloud_connection"): "Cloud Connection",
     ("switch", "intelli_tour"): "AI Tour",
     ("switch", "disarming"): "Disarming",
     ("switch", "event_notifications"): "Event Notifications",
     ("switch", "smart_motion_detection"): "Smart Motion Detection",
     ("switch", "alarm_output"): "Alarm Output",
+    ("switch", "noise_filter"): "Noise filter",
     ("switch", "privacy_mode"): "Privacy Mode",
     # Named by the platform until the six below moved; the two pairs are a
     # capability choice, not an index. "Image mirror" rather than "Mirror" to
     # sort with the picture controls above, for the reason given there.
     ("switch", "mirror"): "Image mirror",
+    ("switch", "timestamp_overlay"): "Timestamp Overlay",
+    ("switch", "channel_title_overlay"): "Channel Title Overlay",
+    ("switch", "custom_title_overlay"): "Custom Title Overlay",
     ("light", "infrared"): "Infrared",
     ("light", "illuminator"): "Illuminator",
     ("light", "flood_light"): "Flood Light",
@@ -240,6 +260,23 @@ def _keys_in_code():
     for platform, table in KEY_TABLES:
         for key in _keys_in_a_table(platform, table):
             found.setdefault((platform, key), "%s in %s.py" % (table, platform))
+    audio = ast.parse(io.open(PACKAGE / "audio.py", encoding="utf-8").read())
+    for node in audio.body:
+        if not isinstance(node, ast.Assign) or not any(
+            isinstance(target, ast.Name) and target.id == "AUDIO_CONTROLS"
+            for target in node.targets
+        ):
+            continue
+        for key, spec in zip(node.value.keys, node.value.values):
+            if (
+                isinstance(key, ast.Constant)
+                and isinstance(key.value, str)
+                and isinstance(spec, ast.Tuple)
+                and len(spec.elts) > 2
+                and isinstance(spec.elts[2], ast.Constant)
+                and spec.elts[2].value == "percentage"
+            ):
+                found[("number", key.value)] = "AUDIO_CONTROLS in audio.py"
     return found
 
 

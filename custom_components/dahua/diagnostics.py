@@ -29,6 +29,7 @@ from . import dahua_utils, entry_coordinators
 from .const import (
     CONF_ADDRESS,
     CONF_AUTO_DETECT_CHANNEL,
+    CONF_SNAPSHOT_CHANNEL_FROM_ZERO,
     CONF_CHANNEL,
     CONF_PASSWORD,
     CONF_USERNAME,
@@ -178,9 +179,36 @@ def _device_block(coordinator, config_entry: ConfigEntry) -> dict[str, Any]:
         ),
         "channel_index": _safe(coordinator.get_channel),
         "channel_number": _safe(coordinator.get_channel_number),
-        "auto_detect_channel": config_entry.options.get(CONF_AUTO_DETECT_CHANNEL, True),
-        # What the auto-detect actually concluded, which is what decides
-        # channel_number above. True means the device answered a snapshot on
+        # The stream's number is above; this is the still's. They differ on a
+        # device that numbers snapshot.cgi and RTSP differently (#1151), and
+        # "the thumbnail shows a different camera from the live view" is only
+        # answerable with both of them in front of you.
+        # The lambda matters: the dump is built around whatever coordinator it
+        # is handed, and a stand-in that predates this accessor would raise on
+        # the attribute itself, outside _safe, and take the whole dump with it.
+        "snapshot_channel": _safe(lambda: coordinator.get_snapshot_channel()),
+        # Read the way the coordinator reads it. This option is per channel
+        # since #895, so taking it from the entry's options reports the wrong
+        # value for a merged recorder whose channel sets its own -- next to the
+        # two numbers it is here to explain.
+        "auto_detect_channel": _safe(
+            lambda: coordinator.channel_option(CONF_AUTO_DETECT_CHANNEL, True),
+            config_entry.options.get(CONF_AUTO_DETECT_CHANNEL, True),
+        ),
+        # Whether the owner has said this device numbers its stills from zero
+        # while its stream counts from one. Off means the still follows the
+        # stream, which is what every unmeasured device does (#1151). Read the
+        # way the coordinator reads it, per channel, for the reason above.
+        "snapshot_channel_from_zero": _safe(
+            lambda: coordinator.channel_option(CONF_SNAPSHOT_CHANNEL_FROM_ZERO, False),
+            config_entry.options.get(CONF_SNAPSHOT_CHANNEL_FROM_ZERO, False),
+        ),
+        # What the numbering probe concluded. It decides channel_number where
+        # the auto-detect option above is on. It deliberately does NOT decide
+        # snapshot_channel: a snapshot answering on channel 0 cannot tell
+        # genuine zero-based numbering from channel 0 aliasing channel 1, so
+        # the still is split from the stream only by the option above (#1151).
+        # True means the device answered a snapshot on
         # channel 0, False means it answered with a status saying no, and
         # None means it never answered and the numbering was left alone.
         #
@@ -209,12 +237,12 @@ def _zero_indexed(coordinator):
     value: a device that did not answer the probe leaves the numbering as it
     was rather than guessing.
     """
-    from . import _HOST_CHANNEL_BASE
+    from .host import device_numbers_channels_from_zero
 
     device = _safe(lambda: coordinator.client.device_key)
     if device is None:
         return None
-    return _HOST_CHANNEL_BASE.get(device)
+    return device_numbers_channels_from_zero(device)
 
 
 def _capabilities_block(coordinator) -> dict[str, Any]:
@@ -258,6 +286,17 @@ def _capabilities_block(coordinator) -> dict[str, Any]:
         # my brightness slider go" (#1006).
         "video_color_fields": _safe(
             lambda: sorted(getattr(coordinator, "_video_color_fields", None) or ()), []
+        ),
+        # The same answer for the two families ported from the Intelbras fork.
+        # A refused VideoInOptions read is recorded under `day_night_color`
+        # (the probe that owns the table), and a refused VideoWidget read under
+        # `video_widget`; an empty list here beside one of those entries is the
+        # answer to "where did my WDR/exposure/overlay control go".
+        "image_option_fields": _safe(
+            lambda: sorted(getattr(coordinator, "_image_option_fields", None) or ()), []
+        ),
+        "video_widget_fields": _safe(
+            lambda: sorted(getattr(coordinator, "_video_widget_fields", None) or ()), []
         ),
         # Why each probe that failed did. A status is the device
         # answering, and a 400 for a config table is it saying it does
@@ -401,6 +440,30 @@ def _stream_is_carrying_anything(stream) -> bool:
     return bool(getattr(stream, "_by_channel", None) or {})
 
 
+def _dhip_listener_has_given_up(task) -> bool:
+    """Whether the doorbell listener task has ended rather than being between
+    attempts.
+
+    A doorbell whose port 5000 is refused hands its events to the CGI stream
+    and this task returns (#1187). The task object stays on the coordinator
+    afterwards, so testing that it exists would name the transport the device
+    used to have for the rest of the session, which is what this field was
+    added to stop doing (#813).
+
+    Only an explicit `True` counts as ended. Much of the suite hands this a
+    stand-in whose `done()` answers something truthy that is not a bool, and a
+    listener between two attempts is sleeping rather than finished, so anything
+    short of a clear yes is read as still running.
+    """
+    done = getattr(task, "done", None)
+    if not callable(done):
+        return False
+    try:
+        return done() is True
+    except Exception:  # pylint: disable=broad-except
+        return False
+
+
 def _transport(coordinator, rpc2_poll: Mapping[str, Any]) -> str | None:
     """Which transport is carrying this entry's events.
 
@@ -415,7 +478,7 @@ def _transport(coordinator, rpc2_poll: Mapping[str, Any]) -> str | None:
     a device with no doorbell reads as a bug in the dump rather than as the answer.
     """
     vto_task = getattr(coordinator, "_vto_task", None)
-    if vto_task is not None:
+    if vto_task is not None and not _dhip_listener_has_given_up(vto_task):
         if getattr(coordinator, "_rpc2_over_dhip", False):
             return "dhip_listener"
         return "vto_listener"

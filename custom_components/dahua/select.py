@@ -1,6 +1,7 @@
 """Select entity platform for Dahua."""
 
 import logging
+import re
 from typing import ClassVar
 
 from homeassistant.components.select import SelectEntity
@@ -11,7 +12,13 @@ from homeassistant.exceptions import HomeAssistantError
 from custom_components.dahua import DahuaDataUpdateCoordinator
 
 from . import dahua_utils, entry_coordinators
-from .const import DOMAIN, VIDEO_COLOR_STYLE_OPTIONS
+from .const import (
+    DOMAIN,
+    EXPOSURE_ANTI_FLICKER_OPTIONS,
+    EXPOSURE_ANTI_FLICKER_VALUE_BY_OPTION,
+    VIDEO_COLOR_STYLE_OPTIONS,
+)
+from .coordinator import WIDE_DYNAMIC_RANGE_LEVEL
 from .entity import DahuaBaseEntity
 from .infrared import (
     MODE_BY_OPTION,
@@ -21,8 +28,15 @@ from .infrared import (
 )
 from .late import async_add_and_keep_watching
 from .model_profiles import is_sdt4e425
+from .profile import (
+    PROFILE_MANAGEMENT_OPTIONS,
+    PROFILE_MANAGEMENT_VALUES_BY_OPTION,
+)
 
 _LOGGER = logging.getLogger(__package__)
+_AUDIO_SOURCE_KEY = re.compile(
+    r"table\.Encode\[(\d+)\]\.(MainFormat|ExtraFormat)\[(\d+)\]\.Audio\.AudioSource$"
+)
 
 
 # One at a time, because selecting a preset moves the camera and these devices are measurably intolerant of
@@ -105,6 +119,28 @@ async def async_setup_entry(hass: HomeAssistant, entry, async_add_devices):
         if coordinator.supports_day_night_color():
             devices.append(DahuaDayNightModeSelect(coordinator, entry))
 
+        if coordinator.supports_exposure_anti_flicker():
+            devices.append(DahuaExposureAntiFlickerSelect(coordinator, entry))
+
+        if coordinator.supports_profile_management():
+            devices.append(DahuaProfileManagementSelect(coordinator, entry))
+
+        # WDR lives in VideoInOptions rather than VideoColor. It requires both
+        # fields: the mode alone is ignored while the level stays at 50, and a
+        # write naming a missing level field is refused wholesale.
+        if (
+            not coordinator.is_indoor_monitor_without_video()
+            and coordinator.supports_image_option("WideDynamicRangeMode")
+            and coordinator.supports_image_option("WideDynamicRange")
+        ):
+            devices.append(DahuaWideDynamicRangeSelect(coordinator, entry))
+
+        if (
+            not coordinator.is_indoor_monitor_without_video()
+            and coordinator.supports_exposure_mode()
+        ):
+            devices.append(DahuaExposureModeSelect(coordinator, entry))
+
         if (
             not coordinator.is_indoor_monitor_without_video()
             and coordinator.supports_video_color("Style")
@@ -138,11 +174,73 @@ async def async_setup_entry(hass: HomeAssistant, entry, async_add_devices):
             for vto in links.get("vtos") or {}:
                 devices.append(DahuaVthCameraLinkSelect(coordinator, entry, vto))
 
+        # The initialization probe settles which fields this channel exposes.
+        for key in getattr(coordinator, "_encode_audio_keys", ()):
+            match = _AUDIO_SOURCE_KEY.fullmatch(key)
+            if match and int(match.group(1)) == coordinator.get_channel():
+                devices.append(
+                    DahuaEncodeAudioSourceSelect(
+                        coordinator, entry, match.group(2), int(match.group(3)), key
+                    )
+                )
+
         return devices
 
     await async_add_and_keep_watching(
         hass, entry, build, async_add_devices, entry_coordinators
     )
+
+
+class DahuaEncodeAudioSourceSelect(DahuaBaseEntity, SelectEntity):
+    """Choose the source used by one Dahua encoder format."""
+
+    _attr_translation_key = "encode_audio_source"
+    _attr_entity_category = EntityCategory.CONFIG
+    _attr_options = ["Coaxial", "BNC"]
+
+    def __init__(self, coordinator, config_entry, format_type, format_index, key):
+        super().__init__(coordinator, config_entry)
+        self._format_type = format_type
+        self._format_index = format_index
+        self._key = key
+        self._attr_unique_id = (
+            f"{coordinator.get_serial_number()}_audio_source_"
+            f"{format_type.lower()}_{format_index}"
+        )
+        self._attr_translation_placeholders = {
+            "format_type": format_type.replace("Format", ""),
+            "format_index": str(format_index + 1),
+        }
+
+    @property
+    def unique_id(self):
+        """Return this format's own id, not the device's.
+
+        `DahuaBaseEntity` defines `unique_id` and is first in the MRO, so
+        without this the id assigned above is never read and every encoder
+        control on a channel reports the same serial. Home Assistant then
+        registers one of them and drops the rest.
+        """
+        return self._attr_unique_id
+
+    @property
+    def current_option(self):
+        """Return the source currently reported by Encode."""
+        value = self._coordinator.data.get(self._key)
+        return value if value in self.options else None
+
+    async def async_select_option(self, option):
+        """Set the audio source and refresh its read-back."""
+        if option not in self.options:
+            raise ValueError(f"Unsupported audio source: {option}")
+        await self._coordinator.client.async_set_encode_audio_value(
+            self._coordinator.get_channel(),
+            self._format_type,
+            self._format_index,
+            "Audio.AudioSource",
+            option,
+        )
+        await self._coordinator.async_refresh()
 
 
 async def _async_preset_ids(coordinator):
@@ -455,18 +553,103 @@ class DahuaDayNightModeSelect(DahuaBaseEntity, SelectEntity):
     async def async_select_option(self, option: str) -> None:
         if option not in self._attr_options:
             return
-        await self._coordinator.client.async_set_video_in_day_night_mode(
+        # The table the write landed in is the one to read back, and a
+        # device can serve VideoInDayNight and still refuse the write to
+        # it (#1194).
+        table = await self._coordinator.client.async_set_video_in_day_night_mode(
             self._coordinator.get_channel(), "general", option
+        )
+        self._coordinator.note_day_night_write_table(table)
+        await self._coordinator.async_refresh()
+
+
+class DahuaWideDynamicRangeSelect(DahuaBaseEntity, SelectEntity):
+    """Wide Dynamic Range: Off, On or mode 2.
+
+    Ported from the Intelbras fork. Off and On were validated there on two
+    cameras; mode 2 was accepted but the vendor's name for it was not
+    confirmed, which is why it stays "Mode 2" rather than "Auto". Off writes the
+    level to 0 as well: mode 0 alone was ignored while the level stayed at 50
+    on both of them.
+    """
+
+    _attr_translation_key = "image_wide_dynamic_range"
+    _attr_entity_category = EntityCategory.CONFIG
+    _attr_options = ["Off", "On", "Mode 2"]
+
+    def __init__(self, coordinator: DahuaDataUpdateCoordinator, config_entry):
+        super().__init__(coordinator, config_entry)
+        self._coordinator = coordinator
+
+    @property
+    def unique_id(self):
+        return self._coordinator.get_serial_number() + "_image_wide_dynamic_range"
+
+    @property
+    def current_option(self):
+        return self._coordinator.get_wide_dynamic_range_option()
+
+    async def async_select_option(self, option: str) -> None:
+        if option not in self._attr_options:
+            return
+        mode = {"Off": 0, "On": 1, "Mode 2": 2}[option]
+        level = 0
+        if mode:
+            level = self._coordinator.get_wide_dynamic_range_level() or 0
+            if level <= 0:
+                level = WIDE_DYNAMIC_RANGE_LEVEL
+        await self._coordinator.client.async_set_wide_dynamic_range(
+            self._coordinator.get_channel(), mode, level
         )
         await self._coordinator.async_refresh()
 
 
+class DahuaExposureModeSelect(DahuaBaseEntity, SelectEntity):
+    """Exposure Mode on the coordinator's selected device transport."""
+
+    _attr_translation_key = "image_exposure_mode"
+    _attr_entity_category = EntityCategory.CONFIG
+
+    def __init__(self, coordinator: DahuaDataUpdateCoordinator, config_entry):
+        super().__init__(coordinator, config_entry)
+        self._coordinator = coordinator
+
+    @property
+    def options(self):
+        return list(self._coordinator.get_exposure_mode_options())
+
+    @property
+    def available(self):
+        """Require a mapped current value in this transport's current options."""
+        current = self.current_option
+        return (
+            super().available
+            and self._coordinator.supports_exposure_mode()
+            and current is not None
+            and current in self.options
+        )
+
+    @property
+    def unique_id(self):
+        return self._coordinator.get_serial_number() + "_image_exposure_mode"
+
+    @property
+    def current_option(self):
+        return self._coordinator.get_exposure_mode_option()
+
+    async def async_select_option(self, option: str) -> None:
+        if option not in self.options:
+            return
+        await self._coordinator.async_set_exposure_mode(option)
+        await self._coordinator.async_refresh()
+
+
 class DahuaVideoColorStyleSelect(DahuaBaseEntity, SelectEntity):
-    """Select the camera's picture style on its general VideoColor profile."""
+    """Select the camera's picture style on its active VideoColor profile."""
 
     _attr_translation_key = "video_color_style"
     _attr_entity_category = EntityCategory.CONFIG
-    _attr_options = list(VIDEO_COLOR_STYLE_OPTIONS)
+    _attr_options: ClassVar[list[str]] = list(VIDEO_COLOR_STYLE_OPTIONS)
 
     def __init__(self, coordinator: DahuaDataUpdateCoordinator, config_entry):
         super().__init__(coordinator, config_entry)
@@ -484,9 +667,67 @@ class DahuaVideoColorStyleSelect(DahuaBaseEntity, SelectEntity):
     async def async_select_option(self, option: str) -> None:
         if option not in VIDEO_COLOR_STYLE_OPTIONS:
             return
-        await self._coordinator.client.async_set_video_color_style(
-            self._coordinator.get_channel(), option
-        )
+        await self._coordinator.async_set_video_color_style(option)
+        await self._coordinator.async_refresh()
+
+
+class DahuaProfileManagementSelect(DahuaBaseEntity, SelectEntity):
+    """Select how the camera manages its Day, Night and Normal profiles."""
+
+    _attr_translation_key = "profile_management"
+    _attr_entity_category = EntityCategory.CONFIG
+    _attr_options: ClassVar[list[str]] = list(PROFILE_MANAGEMENT_OPTIONS)
+
+    def __init__(self, coordinator: DahuaDataUpdateCoordinator, config_entry):
+        super().__init__(coordinator, config_entry)
+        self._coordinator = coordinator
+
+    @property
+    def unique_id(self):
+        return self._coordinator.get_serial_number() + "_profile_management"
+
+    @property
+    def current_option(self):
+        option = self._coordinator.get_profile_management_mode()
+        return option if option in PROFILE_MANAGEMENT_VALUES_BY_OPTION else None
+
+    async def async_select_option(self, option: str) -> None:
+        if option not in PROFILE_MANAGEMENT_VALUES_BY_OPTION:
+            return
+        try:
+            await self._coordinator.async_set_profile_management_mode(option)
+        except (ConnectionError, RuntimeError, ValueError) as err:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="profile_management_write_failed",
+                translation_placeholders={"reason": str(err)},
+            ) from err
+        await self._coordinator.async_refresh()
+
+
+class DahuaExposureAntiFlickerSelect(DahuaBaseEntity, SelectEntity):
+    """Select the AntiFlicker value on Dahua's active exposure profile."""
+
+    _attr_translation_key = "exposure_anti_flicker"
+    _attr_entity_category = EntityCategory.CONFIG
+    _attr_options: ClassVar[list[str]] = list(EXPOSURE_ANTI_FLICKER_OPTIONS)
+
+    def __init__(self, coordinator: DahuaDataUpdateCoordinator, config_entry):
+        super().__init__(coordinator, config_entry)
+        self._coordinator = coordinator
+
+    @property
+    def unique_id(self):
+        return self._coordinator.get_serial_number() + "_exposure_anti_flicker"
+
+    @property
+    def current_option(self):
+        return self._coordinator.get_exposure_anti_flicker()
+
+    async def async_select_option(self, option: str) -> None:
+        if option not in EXPOSURE_ANTI_FLICKER_VALUE_BY_OPTION:
+            return
+        await self._coordinator.async_set_exposure_anti_flicker(option)
         await self._coordinator.async_refresh()
 
 

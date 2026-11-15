@@ -1,4 +1,10 @@
 # Home Assistant Dahua Integration
+
+[![GitHub Release](https://img.shields.io/github/v/release/rroller/dahua)](https://github.com/rroller/dahua/releases)
+[![Downloads](https://img.shields.io/github/downloads/rroller/dahua/total.svg)](https://github.com/rroller/dahua/releases)
+[![Coverage Status](https://coveralls.io/repos/github/rroller/dahua/badge.svg?branch=main)](https://coveralls.io/github/rroller/dahua?branch=main)
+[![Active installs](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fanalytics.home-assistant.io%2Fcustom_integrations.json&query=%24.dahua.total&label=active%20installs&color=41BDF5&logo=home-assistant&logoColor=white)](https://analytics.home-assistant.io/custom_integrations.json)
+
 The `Dahua` [Home Assistant](https://www.home-assistant.io) integration allows you to integrate your [Dahua](https://www.dahuasecurity.com/) cameras, doorbells, NVRs, DVRs in Home Assistant. It's also confirmed to work with some Lorex cameras and Amcrest devices.
 
 Supports motion events, alarm events (and others), enabling/disabling motion detection, switches for infrared, illuminator (white light), security lights (red/blue flashers), sirens, doorbell button press events, and more.
@@ -468,6 +474,30 @@ Brand | 2 Megapixels | 4 Megapixels | 5 Megapixels | 8 Megapixels
 | *IMOU* |
 | | IMOU C26EP-V2 | IMOU IPC-K46 | IMOU DB61i
 
+### Talking from Home Assistant
+
+From Home Assistant 2026.11 a doorbell's camera entities declare two-way audio, so
+the live view shows a talk button once **Settings > System > Labs > Two-way audio**
+is turned on. The browser's microphone goes over WebRTC to the go2rtc inside Home
+Assistant, which sends it to the doorbell on the RTSP backchannel of the stream.
+Measured on a DHI-VTO2311R-WP with Home Assistant 2026.11.0 (#1162).
+
+- **The browser needs HTTPS** to open the microphone. Over plain `http://` the
+  button is there, but talking does not start. The companion app on a plain HTTP
+  internal URL is the same.
+- **Set the main stream's audio to G.711A at 8 kHz** (`Encode[0].MainFormat[0].Audio`,
+  set over `configManager.cgi`). The doorbell offers the
+  backchannel in the format of the stream's own audio, and go2rtc does not
+  transcode to it. With PCM (L16) at 16 kHz the call connected and nothing was
+  heard at the door; after switching to G.711A it worked.
+- **The doorbell does not cancel echo on this path**, so with the speaker loud
+  the person talking hears themselves back through the doorbell's microphone.
+  A headset, or muting the incoming audio while talking, avoids it.
+- **The option *Don't open the two-way audio channel when streaming*** removes the
+  talk button, because go2rtc is then told not to open the backchannel.
+- Only doorbells declare it. Cameras with a speaker are not included, because the
+  backchannel has only been measured on a doorbell.
+
 ## Indoor monitors (VTH)
 
 Model | Firmware
@@ -617,9 +647,9 @@ What this integration cannot do, as distinct from the bugs and firmware quirks u
 
   and a clip pushed into a go2rtc stream whose source ends in `#backchannel=1` was
   heard at the door, twice, without interrupting anyone watching the camera. That was
-  go2rtc 1.9.14 driven through its own API, not through Home Assistant, and whether
-  the copy of go2rtc inside Home Assistant can be used the same way has not been
-  tried. Note the rate: these speakers want **PCMA at 8 kHz**, and a device that is
+  go2rtc 1.9.14 driven through its own API, not through Home Assistant. Talking
+  through the go2rtc inside Home Assistant has since been measured on a VTO2311R-WP;
+  see [Talking from Home Assistant](#talking-from-home-assistant). Note the rate: these speakers want **PCMA at 8 kHz**, and a device that is
   sent 16 kHz plays noise or nothing.
 - **A large configuration write can be refused on a recorder.** RPC2 answers
   `Request length error!` to a big `setConfig`, and a recorder's IVS rule table can be
@@ -1010,7 +1040,11 @@ Smart Motion Detection | If the device supports it, enables or disables smart mo
 IVS Rule | One switch per IVS rule the camera reports (tripwire, intrusion and so on), each keyed on the rule's own stable Dahua ID, so it is named after the rule as the device names it. Configuration entities
 Alarm Output | A physical alarm or relay output on the device, switched directly. A recorder with several relays gets one switch per relay, on the recorder's own device rather than on a camera, named by the recorder where it names them distinctly and numbered where it does not. The state is read back from the device rather than assumed from the last write
 Privacy Mode | Covers the lens on cameras with a motorised cover. See `dahua.set_privacy_mode`
+Audio | For each encoder format reported by the device, enables or disables audio. The state is polled with the other configuration entities, so changes made in the Dahua UI appear in Home Assistant and can trigger automations
 Disarming Linkage | Newer firmwares introduce a "disarming" feature, accessible from the camera web UI under Event → One-click disarm / Disarming. When enabled, the disarm toggle suppresses the linkage actions configured in the Disarming section specifically, while leaving all other alarm linkage actions untouched. Detection remains fully active throughout. This allows one to turn it on/off.
+Timestamp Overlay | Shows or hides the timestamp burned into the video. This is the same field as `dahua.enable_time_overlay`, exposed as a switch so the state can be read as well as set
+Channel Title Overlay | Shows or hides the channel title overlay. The same field as `dahua.enable_channel_title`, with its state read back from the camera
+Custom Title Overlay | Shows or hides the custom text overlay (group 1, which `set_text_overlay` and `get_overlay_text` now default to). The text itself is still set with `dahua.set_text_overlay`
 
 ## Lights
 Light |  Description |
@@ -1025,6 +1059,7 @@ Sensor |  Description |
 Motion | A sensor that turns on when the camera detects motion
 Button Pressed | A sensor that turns on when a doorbell button is pressed
 Authorized Vehicle | Turns on when the camera's ANPR recognises a plate you have listed as authorized, and stays on for the hold time you set. Attributes carry the plate that matched and what the camera reported about the vehicle. Created on every camera and every channel of a recorder, so it existing does not mean that camera can read plates: it stays off unless the camera reports one and it is on your list
+Call No Answered | Turns on when a call starts ringing, on a doorbell or door station. Despite the name the device sends it when the call begins rather than when it goes unanswered, so it fires on answered and rejected calls too. On a station with more than one call button its attributes say which one rang: `call_button_index` is the number the device sends and `call_button` is the button, 1 or 2. `call_button` is absent on an index that has not been measured, so if your station has three or more buttons you will see the raw index and no button number — please [open an issue](https://github.com/rroller/dahua/issues) with the values, since two buttons on one model is all anyone has reported. `call_id` is the SIP call slot, which is what pairs this event with the `Invite` that follows it. The Doorbell event entity still reports an identical `ring` for every button, because the press event itself does not carry the identity
 Alarm-in Port&lt;n&gt; | One per physical alarm input terminal on a recorder's back panel, on the recorder's own device rather than on a camera. Named by the recorder, so a terminal you renamed keeps that name. The attributes carry both numbers: `alarm_input_number` is the one printed on the chassis and `alarm_input_index` is the zero-based one the device sends, which is one lower. Only created on a recorder that reports the terminals. On such a recorder the per-channel Alarm Local sensors are not created, because the only thing that ever fed them was the terminal number being read as a camera channel
 Others | A binary senor is created for evey event type selected when setting up the camera (Such as cross line, and face detection)
 
@@ -1045,7 +1080,45 @@ Select |  Description |
 Security Light | On a doorbell, sets the light to off, on, or strobe. A doorbell's light has three states rather than two, which is why it is a select and not a switch
 Preset Position | Moves a PTZ camera to one of its stored preset positions, and reports the one it is at. Only created on cameras that report presets
 Day/Night Mode | The camera's colour mode: Color, BlackWhite, or Auto (which Dahua also calls Brightness). Readable as well as settable, which is what makes it possible to notice a camera that changed mode by itself, such as one reverting to Auto after a power cut and then rendering black and white at night
+Profile Management | Normal, Full Time Day, Full Time Night or Schedule, on channels that report a supported profile-management configuration. Uses the camera's stored schedule; compatible channels expose the time controls described below
+Image Wide Dynamic Range | Off, On or mode 2. The camera ignores mode 0 on its own while the level is still 50, so choosing Off clears both; choosing On or mode 2 keeps the camera's level or restores 50. Mode 2 is named rather than called Auto because the vendor's name for it has not been confirmed
+Image Exposure Mode | Auto, Gain Priority or Shutter Priority. Manual exposure is deliberately not offered: it needs shutter and gain values this integration does not expose
 Camera for &lt;VTO&gt; calls | On an indoor monitor (VTH), which camera its screen opens on when that VTO calls it, or `none` for the VTO's own picture. See [Indoor monitors](#indoor-monitors-vth)
+Audio Source | Selects the source reported by each encoder format (Coaxial or BNC). Only shown when the device exposes that setting
+Illumination mode | Selects the fill-light modes reported by the camera, such as infrared, white or smart dual light. Applies the chosen mode to every lighting scene
+
+The **Illumination mode** selector is detected independently from the
+**Illuminator** light's white-light override. Cameras can expose the mode selector
+even when their lighting tables have different scene/profile counts and the
+override cannot safely control them. The selector offers only modes reported by
+the camera.
+
+**Profile Management and the Profile sensor describe different settings.** The
+selector controls how profiles are chosen. Under Schedule, the Profile sensor
+may report Day while Night is active, and profile-specific lighting and exposure
+controls may therefore address the Day settings. Use the camera's interface for
+those adjustments while using Schedule. Schedule transition times are preserved
+when changing Profile Management.
+
+**Profile day start** and **Profile night start** time controls appear when the
+channel reports one unambiguous enabled schedule interval. They show the stored
+times in every management mode; switch Profile Management to **Schedule** before
+editing them. Changes use whole-minute precision and preserve the other endpoint
+from a fresh camera read. An unsupported or ambiguous schedule keeps the time
+controls hidden; edit it in the camera's interface instead.
+
+The audio entities read the device's `Encode` table and write only the selected
+field. This makes audio changes visible to Home Assistant automations after the
+normal configuration cache expires (up to five minutes), while preserving the
+recorder's other encoding settings. Changes made through these entities clear
+that cache immediately.
+
+## Picture sliders
+
+**Image brightness**, **contrast**, **saturation**, **hue**, **gamma** and **chroma
+suppression** appear on channels that report the corresponding `VideoColor` fields.
+Each is a 0–100 slider that writes the channel's general picture profile and reads the
+value the camera reports back.
 
 ## Motion region sliders
 
@@ -1262,6 +1335,7 @@ Name | the channel's name | What this channel is called
 Area | unset | Moves this channel into an area. A channel does not inherit the recorder's area, so channels can be filed by room
 Events to subscribe to | motion and the common smart-detection events | Which of the device's events become binary sensors. Most of the rest do nothing on most cameras, and each one selected adds an entity. An empty selection is honoured, which turns the event connection off for this channel. If you want an event that is not listed, open an issue
 Auto-detect channel index | on | Some firmwares number channels from 0 and others from 1. Turn this off if the detection gets it wrong on your camera
+Number stills from zero | off | For a device that numbers its stills from 0 while its streams are numbered from 1, so every camera's picture is one channel out while its live view is right. **Check it in a browser before ticking this**, against two cameras you can tell apart: open `http://<device>/cgi-bin/snapshot.cgi?channel=0` and then `channel=1`. Tick it only if 0 shows the first camera **and 1 shows the second**. Leave it off if 0 and 1 both show the first camera: that is a device where channel 0 is another name for channel 1 rather than one numbered from zero, and ticking it would move every still one camera backwards. Channel 0 answering with the first camera is true of both kinds and is not on its own a reason to tick it
 Poll ordinary motion state | off | Some recorders and XVRs keep sending smart-detection events normally while never pushing ordinary `VideoMotion`, so the motion sensors never turn on. This reads the motion state from the device instead of waiting to be told. Off by default because it is one extra request per device every two seconds, which buys nothing on a device that does push them. The integration raises a repair card suggesting this when it catches a device detecting motion it is not reporting
 Enable NVR active deterrence controls | off | Adds Warning Light and Alarm entities for a camera behind an NVR. Off by default because whether the NVR relays these commands varies by model: on some it accepts them and does nothing
 Manually enable Siren entity | off | Turn this on if the camera has a working siren and the integration did not create the Siren entity

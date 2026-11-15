@@ -108,6 +108,7 @@
             "user": {
                 "data": {
                     "auto_detect_channel": "Auto-detect channel index (disable if HTTP snapshot at channel=0 works but RTSP only streams on channel=1)",
+                    "snapshot_channel_from_zero": "Number stills from zero (tick only if snapshot.cgi?channel=0 shows the FIRST camera and channel=1 shows the SECOND; leave off if both show the first camera)",
                     "use_rpc2": "Read configuration over one RPC2 session per device (fewer logins in the device's log; leave off if unsure)",
                     "poll_video_motion": "Poll ordinary motion state when the recorder does not push VideoMotion events (one request per recorder)",
                     "events": "Events to subscribe to",
@@ -141,6 +142,7 @@
                             "select": "Select enabled",
                             "sensor": "Sensor enabled",
                             "switch": "Switch enabled",
+                            "time": "Time enabled",
                             "update": "Update enabled"
                         }
                     }
@@ -149,6 +151,14 @@
         }
     },
     "entity": {
+        "time": {
+            "profile_day_start": {
+                "name": "Profile day start"
+            },
+            "profile_night_start": {
+                "name": "Profile night start"
+            }
+        },
         "binary_sensor": {
             "alarm_local": {
                 "name": "Alarm Local"
@@ -326,6 +336,12 @@
             }
         },
         "number": {
+            "microphone_volume": {
+                "name": "Microphone volume"
+            },
+            "speaker_volume": {
+                "name": "Speaker volume"
+            },
             "image_brightness": {
                 "name": "Image brightness"
             },
@@ -340,6 +356,12 @@
             },
             "image_gamma": {
                 "name": "Image gamma"
+            },
+            "image_chroma_suppress": {
+                "name": "Image chroma suppress"
+            },
+            "exposure_compensation": {
+                "name": "Image exposure compensation"
             },
             "vth_ring_volume": {
                 "name": "Door station ring volume"
@@ -364,6 +386,9 @@
             }
         },
         "select": {
+            "encode_audio_source": {
+                "name": "{format_type} format {format_index} audio source"
+            },
             "security_light": {
                 "name": "Security Light"
             },
@@ -373,8 +398,31 @@
             "day_night_mode": {
                 "name": "Day/Night Mode"
             },
+            "exposure_anti_flicker": {
+                "name": "Image exposure anti-flicker",
+                "state": {
+                    "outdoor": "Outdoor",
+                    "50_hz": "50 Hz",
+                    "60_hz": "60 Hz"
+                }
+            },
             "video_color_style": {
                 "name": "Image color style"
+            },
+            "image_wide_dynamic_range": {
+                "name": "Image wide dynamic range"
+            },
+            "profile_management": {
+                "name": "Profile management",
+                "state": {
+                    "normal": "Normal",
+                    "full_time_day": "Full time day",
+                    "full_time_night": "Full time night",
+                    "schedule": "Schedule"
+                }
+            },
+            "image_exposure_mode": {
+                "name": "Image exposure mode"
             },
             "image_rotation": {
                 "name": "Image rotation"
@@ -429,6 +477,12 @@
             }
         },
         "switch": {
+            "noise_filter": {
+                "name": "Noise filter"
+            },
+            "encode_audio": {
+                "name": "{format_type} format {format_index} audio"
+            },
             "motion_detection": {
                 "name": "Motion Detection"
             },
@@ -456,6 +510,15 @@
             "mirror": {
                 "name": "Image mirror"
             },
+            "timestamp_overlay": {
+                "name": "Timestamp Overlay"
+            },
+            "channel_title_overlay": {
+                "name": "Channel Title Overlay"
+            },
+            "custom_title_overlay": {
+                "name": "Custom Title Overlay"
+            },
             "siren": {
                 "name": "Siren"
             },
@@ -473,8 +536,20 @@
         }
     },
     "exceptions": {
+        "profile_schedule_requires_schedule_mode": {
+            "message": "Requires Schedule mode"
+        },
+        "profile_schedule_unavailable": {
+            "message": "The camera did not report a usable Profile Schedule."
+        },
+        "profile_schedule_write_failed": {
+            "message": "Could not change Profile Schedule: {reason}"
+        },
         "image_rotation_unsupported": {
             "message": "Image rotation cannot be changed because Rotate90 is unsupported or unknown."
+        },
+        "profile_management_write_failed": {
+            "message": "Could not change Profile Management: {reason}"
         },
         "lighting_scheme_held_by_illuminator": {
             "message": "The illumination mode cannot be changed while the Illuminator is holding this channel. Turn the Illuminator off first, which puts the camera back to the mode it was in, then choose the mode you want."
@@ -502,6 +577,9 @@
         },
         "audio_needs_ffmpeg": {
             "message": "Playing audio needs the ffmpeg integration, which is not set up. Add `ffmpeg:` to configuration.yaml and restart Home Assistant"
+        },
+        "privacy_mask_not_found": {
+            "message": "{device} has no privacy mask to show or hide there: {reason}"
         },
         "audio_declined": {
             "message": "{device} refused the clip: {reason}"
@@ -726,6 +804,7 @@
                         "area": "Area (moves this device to it)",
                         "events": "Events to subscribe to",
                         "auto_detect_channel": "Auto-detect channel index (disable if HTTP snapshot at channel=0 works but RTSP only streams on channel=1)",
+                        "snapshot_channel_from_zero": "Number stills from zero (tick only if snapshot.cgi?channel=0 shows the FIRST camera and channel=1 shows the SECOND; leave off if both show the first camera)",
                         "nvr_active_deterrence": "Enable NVR active deterrence controls",
                         "manual_siren": "Manually enable Siren entity",
                         "manual_security_light": "Manually enable Security Light entity",
